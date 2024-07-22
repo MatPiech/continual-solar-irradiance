@@ -1,0 +1,31 @@
+# --------- pytorch --------- #
+torch==2.3.0
+torchvision==0.18.0
+lightning==2.3.3
+torchmetrics==1.4.0
+
+# --------- dvc --------- #
+dvc[s3]==3.51.3
+
+# --------- loggers --------- #
+neptune==1.10.4
+
+# --------- image processing --------- #
+albumentations==1.4.11
+opencv-contrib-python==4.10.0.84
+
+# --------- other ML libraries --------- #
+timm==1.0.7
+transformers==4.42.4
+
+# --------- misc --------- #
+click==8.1.7
+matplotlib==3.9.1
+pandas==2.2.2
+pvlib==0.11.0
+python-dotenv==1.0.1
+tqdm==4.66.4
+
+# --------- tests, linters --------- #
+flake8==7.1.0
+pytest==8.3.1

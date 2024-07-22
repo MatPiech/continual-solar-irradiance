@@ -1,2 +1,3 @@
-# continual-solar-irradiance
-Solar irradiance forecasting with continual learning
+# Continual Solar Irradiance Forecasting
+
+The continual learning approach for adaptive solar irradiance forecasting.
