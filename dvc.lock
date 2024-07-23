@@ -1,0 +1,54 @@
+schema: '2.0'
+stages:
+  get_data:
+    cmd: bash scripts/get_data.sh
+    outs:
+    - path: data/Raw/Folsom_irradiance.csv
+      hash: md5
+      md5: f7deba7ccd089dbd3f52a46405a7dfc2
+      size: 76536976
+    - path: data/Raw/images/
+      hash: md5
+      md5: de689666f9b1cf3c403f9de20e84e378.dir
+      size: 64056845701
+      nfiles: 775918
+  convert_timestamps:
+    cmd: python scripts/convert_timestamps.py --data-raw data/Raw --output-path data/Prepared/images
+    deps:
+    - path: data/Raw/images/
+      hash: md5
+      md5: 234b68378a387383601e76c4800ec5b7.dir
+      size: 63496
+      nfiles: 2
+    - path: scripts/convert_timestamps.py
+      hash: md5
+      md5: f38bbee75b58b0acb9dcb88ce5f3a601
+      size: 920
+    outs:
+    - path: data/Prepared/images
+      hash: md5
+      md5: dd6cd7f293eaf3dfb5178f5bd19c0097.dir
+      size: 63904746427
+      nfiles: 773978
+  clean_dataframe:
+    cmd: python scripts/clean_dataframe.py --data-raw data/Raw --images-path data/Prepared/images
+      --output-path data/Prepared/cleaned_irradiance.csv
+    deps:
+    - path: data/Prepared/images
+      hash: md5
+      md5: dd6cd7f293eaf3dfb5178f5bd19c0097.dir
+      size: 63904746427
+      nfiles: 773978
+    - path: data/Raw/Folsom_irradiance.csv
+      hash: md5
+      md5: f7deba7ccd089dbd3f52a46405a7dfc2
+      size: 76536976
+    - path: scripts/clean_dataframe.py
+      hash: md5
+      md5: 496c3732d2858e429230b0cbac4510b0
+      size: 1579
+    outs:
+    - path: data/Prepared/cleaned_irradiance.csv
+      hash: md5
+      md5: 04425339057a4d994421b7b02a7b97f5
+      size: 48285445
