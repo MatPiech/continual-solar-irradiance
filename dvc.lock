@@ -52,3 +52,25 @@ stages:
       hash: md5
       md5: 04425339057a4d994421b7b02a7b97f5
       size: 48285445
+  export_periods:
+    cmd: python scripts/export_periods.py --cleaned-dataframe-path data/Prepared/cleaned_irradiance.csv
+      --time-window 15 --time-shift 5 --history-size 4 --output-path data/Prepared/periods.pickle
+    deps:
+    - path: data/Prepared/cleaned_irradiance.csv
+      hash: md5
+      md5: 04425339057a4d994421b7b02a7b97f5
+      size: 48285445
+    - path: scripts/export_periods.py
+      hash: md5
+      md5: 23166c121bc3cc982f916c33c7e63294
+      size: 1871
+    params:
+      params.yaml:
+        export_periods.history_size: 4
+        export_periods.time_shift: 5
+        export_periods.time_window: 15
+    outs:
+    - path: data/Prepared/periods.pickle
+      hash: md5
+      md5: 9c700ecfb772e166291f52f0e95fb51a
+      size: 127096187

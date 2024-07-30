@@ -5,3 +5,10 @@ convert_timestamps:
 clean_dataframe:
   script_path: scripts/clean_dataframe.py
   output_path: data/Prepared/cleaned_irradiance.csv
+
+export_periods:
+  script_path: scripts/export_periods.py
+  time_window: 15   # target forecasting horizon in minutes
+  time_shift: 5     # minutes between history samples
+  history_size: 4   # used history samples
+  output_path: data/Prepared/periods.pickle
