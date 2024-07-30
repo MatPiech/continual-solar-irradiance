@@ -12,3 +12,56 @@ export_periods:
   time_shift: 5     # minutes between history samples
   history_size: 4   # used history samples
   output_path: data/Prepared/periods.pickle
+
+train_forecaster:
+  script_path: scripts/train_forecaster.py
+  seed: 42
+
+  #### MODE ####
+  debug: True
+  test_only: False
+
+  restore_from_ckpt:
+
+  #### TRAINER ####
+  trainer:
+    devices: 1
+    precision: bf16-mixed
+    min_epochs: 5
+    max_epochs: 20
+
+  #### MODEL ####
+  model:
+    model_name: timm-resnet50
+    channels: 3
+    pretrained: True
+    compile: False
+    loss_function: MAE
+    lr: 3e-4
+    lr_patience: 2
+
+  #### CALLBACKS ####
+  callbacks:
+    model_checkpoint:
+      monitor: "val_loss" # name of the logged metric which determines when model is improving
+      mode: "min" # can be "max" or "min"
+      save_top_k: 1 # save k best models (determined by above metric)
+      save_last: False # additionally, always save model from last epoch
+      verbose: True
+      dirpath: "checkpoints/"
+      filename: "epoch_{epoch:03d}"
+      auto_insert_metric_name: False
+    early_stopping:
+      monitor: "val_loss" # name of the logged metric which determines when model is improving
+      mode: "min" # can be "max" or "min"
+      patience: 5 # how many validation epochs of not improving until training stops
+      min_delta: 0 # minimum change in the monitored metric needed to qualify as an improvement
+
+  #### DATA ####
+  datamodule:
+    augment: True
+    image_size: [ 128, 128 ]
+    image_mean: [ 0.485, 0.456, 0.406 ]
+    image_std: [ 0.229, 0.224, 0.225 ]
+    batch_size: 64
+    workers: 16
