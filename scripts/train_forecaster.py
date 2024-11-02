@@ -64,7 +64,7 @@ def train_forecaster(data_root: Path):
         logger = NeptuneLogger(
             api_key=os.environ['NEPTUNE_API_TOKEN'],
             project=os.environ['NEPTUNE_PROJECT'],
-            log_model_checkpoints=True,
+            log_model_checkpoints=False,
         )
         callbacks.append(lr_monitor)
 

@@ -18,7 +18,7 @@ train_forecaster:
   seed: 42
 
   #### MODE ####
-  debug: True
+  debug: False
   test_only: False
 
   restore_from_ckpt:
