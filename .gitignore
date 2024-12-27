@@ -169,3 +169,10 @@ checkpoints/
 
 # Neptune logger folder
 .neptune/
+
+# Data folders
+data/
+notebooks/data/
+
+# MISC
+*.gif
