@@ -38,7 +38,7 @@ def export_periods(
         t_target = t + pd.Timedelta(minutes=time_window)
 
         if all(map(lambda x: x in df.index, [*t_history, t_target])):
-            if df.loc[t_target]['ghi'] > 0.0:
+            if df.loc[t_target]['ghi'] >= 0.0:
                 periods.append({
                     'history': [
                         {
