@@ -62,8 +62,8 @@ stages:
       size: 48285445
     - path: scripts/export_periods.py
       hash: md5
-      md5: 23166c121bc3cc982f916c33c7e63294
-      size: 1871
+      md5: 30b67639a637697019e89420cc015e0e
+      size: 1872
     params:
       params.yaml:
         export_periods.history_size: 4
@@ -72,5 +72,5 @@ stages:
     outs:
     - path: data/Prepared/periods.pickle
       hash: md5
-      md5: 9c700ecfb772e166291f52f0e95fb51a
-      size: 127096187
+      md5: 69485f800ce7b1a3c4e1ab00f957c566
+      size: 127099759
