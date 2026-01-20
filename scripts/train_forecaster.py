@@ -12,9 +12,9 @@ from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import OmegaConf
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 
-from continual_solar_irradiance.datamodules.forecasting import ForecastingDataModule
-from continual_solar_irradiance.models.forecaster import Forecaster
-from continual_solar_irradiance.utils import utils
+from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.models.forecaster import Forecaster
+from cirr.utils import utils
 
 log = utils.get_logger(__name__)
 

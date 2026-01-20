@@ -6,7 +6,7 @@ import pandas as pd
 import torch.utils.data
 from lightning import LightningDataModule
 
-from continual_solar_irradiance.datamodules.datasets import FolsomDataset
+from cirr.datamodules.datasets import FolsomDataset
 
 
 class ForecastingDataModule(LightningDataModule):
