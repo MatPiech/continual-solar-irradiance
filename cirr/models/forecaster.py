@@ -106,7 +106,11 @@ class Forecaster(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self._lr)
         reduce_lr_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=self._lr_patience, min_lr=1e-6, verbose=True
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=self._lr_patience,
+            min_lr=1e-6,
         )
 
         return {"optimizer": optimizer, "lr_scheduler": reduce_lr_on_plateau, "monitor": "train_loss_epoch"}
