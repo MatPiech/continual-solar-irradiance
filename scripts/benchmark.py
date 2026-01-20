@@ -2,7 +2,7 @@ from pathlib import Path
 from time import perf_counter
 
 import click
-from continual_solar_irradiance.models.forecaster import Forecaster
+from cirr.models.forecaster import Forecaster
 import numpy as np
 import torch
 import torch.nn as nn
