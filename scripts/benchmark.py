@@ -2,11 +2,12 @@ from pathlib import Path
 from time import perf_counter
 
 import click
-from cirr.models.forecaster import Forecaster
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+
+from cirr.models.forecaster import Forecaster
 
 
 @click.command()
