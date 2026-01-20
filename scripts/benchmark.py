@@ -1,20 +1,19 @@
-from time import perf_counter
 from pathlib import Path
+from time import perf_counter
 
 import click
+from continual_solar_irradiance.models.forecaster import Forecaster
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from continual_solar_irradiance.models.forecaster import Forecaster
-
 
 @click.command()
-@click.option('--checkpoint-path', type=click.Path(exists=True, path_type=Path), required=True)
-@click.option('--iterations', type=int, default=1000)
+@click.option("--checkpoint-path", type=click.Path(exists=True, path_type=Path), required=True)
+@click.option("--iterations", type=int, default=1000)
 def main(checkpoint_path: Path, iterations: int):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print("###################################")
     print(f"Device: {device}")
     print("###################################")
@@ -78,7 +77,7 @@ def main(checkpoint_path: Path, iterations: int):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     for param in model.named_parameters():
-        if 'image_encoder' in param[0]:
+        if "image_encoder" in param[0]:
             param[1].requires_grad = False
 
     head_fine_tuning_times = []
@@ -100,5 +99,5 @@ def main(checkpoint_path: Path, iterations: int):
     print("###################################")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
