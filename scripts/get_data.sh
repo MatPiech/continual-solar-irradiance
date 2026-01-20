@@ -1,8 +1,8 @@
 #!/bin/sh
 
-mkdir -p ./data/Raw/images
-mkdir -p ./data/Prepared/images
-cd data/Raw
+mkdir -p ./data/folsom_raw/images
+mkdir -p ./data/folsom_prepared/images
+cd data/folsom_raw
 
 # download irradiance measurements
 echo "Downloading Folsom_irradiance.csv ..." && \
