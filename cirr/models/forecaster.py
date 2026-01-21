@@ -70,7 +70,7 @@ class Forecaster(pl.LightningModule):
         return x
 
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor | None:
-        source_images, source_irradiances, target_irradiances = batch
+        source_images, source_irradiances, target_irradiances, __ = batch
         predicted_irradiances = self.forward(source_images, source_irradiances)
 
         loss = self.loss(predicted_irradiances, target_irradiances)
@@ -84,7 +84,7 @@ class Forecaster(pl.LightningModule):
         return loss
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> None:
-        source_images, source_irradiances, target_irradiances = batch
+        source_images, source_irradiances, target_irradiances, __ = batch
         predicted_irradiances = self.forward(source_images, source_irradiances)
 
         loss = self.loss(predicted_irradiances, target_irradiances)
@@ -94,7 +94,7 @@ class Forecaster(pl.LightningModule):
         self.log_dict(self.val_metrics, sync_dist=True)
 
     def test_step(self, batch: torch.Tensor, batch_idx: int):
-        source_images, source_irradiances, target_irradiances = batch
+        source_images, source_irradiances, target_irradiances, __ = batch
         predicted_irradiances = self.forward(source_images, source_irradiances)
 
         loss = self.loss(predicted_irradiances, target_irradiances)
@@ -107,7 +107,7 @@ class Forecaster(pl.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self._lr)
         reduce_lr_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode="min",
             factor=0.5,
             patience=self._lr_patience,
             min_lr=1e-6,

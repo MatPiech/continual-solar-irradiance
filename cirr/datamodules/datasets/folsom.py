@@ -50,7 +50,12 @@ class FolsomDataset(Dataset):
 
         target_irradiance = period["target_irradiance"]
 
-        return (image_input, torch.Tensor(source_irradiances), torch.Tensor([target_irradiance]))
+        return (
+            image_input,
+            torch.Tensor(source_irradiances),
+            torch.Tensor([target_irradiance]),
+            period["history"][-1]["image_name"][:-4],
+        )
 
     def __len__(self) -> int:
         return len(self._periods)

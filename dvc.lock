@@ -13,7 +13,7 @@ stages:
       size: 64056845701
       nfiles: 775918
   convert_timestamps:
-    cmd: python scripts/convert_timestamps.py --data-raw data/folsom_raw 
+    cmd: python scripts/convert_timestamps.py --data-raw data/folsom_raw
       --output-path data/folsom_prepared/images
     deps:
     - path: data/folsom_raw/images/
@@ -32,8 +32,8 @@ stages:
       size: 63904746427
       nfiles: 773978
   clean_dataframe:
-    cmd: python scripts/clean_dataframe.py --data-raw data/folsom_raw 
-      --images-path data/folsom_prepared/images --output-path 
+    cmd: python scripts/clean_dataframe.py --data-raw data/folsom_raw
+      --images-path data/folsom_prepared/images --output-path
       data/folsom_prepared/cleaned_irradiance.csv
     deps:
     - path: data/folsom_prepared/images
@@ -55,8 +55,8 @@ stages:
       md5: 04425339057a4d994421b7b02a7b97f5
       size: 48285445
   export_periods:
-    cmd: python scripts/export_periods.py --cleaned-dataframe-path 
-      data/folsom_prepared/cleaned_irradiance.csv --time-window 15 --time-shift 5 
+    cmd: python scripts/export_periods.py --cleaned-dataframe-path
+      data/folsom_prepared/cleaned_irradiance.csv --time-window 15 --time-shift 5
       --history-size 4 --output-path data/folsom_prepared/periods.pickle
     deps:
     - path: data/folsom_prepared/cleaned_irradiance.csv
