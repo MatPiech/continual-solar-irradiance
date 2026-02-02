@@ -185,7 +185,7 @@ def evaluate_dataset(
 @click.option("--dataset-name", type=str, default="dataset", help="Name of dataset for display")
 @click.option(
     "--save-results",
-    type=click.Path(),
+    type=click.Path(path_type=Path),
     default=None,
     help="Path to save evaluation results as text file",
 )
