@@ -93,6 +93,7 @@ def run_fl_round(
     clients: list[Client],
     global_weights: dict[str, Any],
     site_data: list[tuple[Any, dict[str, list[int]]]],
+    threshold_percentile: float = 75.0,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Execute one federated learning round for a day."""
     client_updates = []
@@ -126,7 +127,9 @@ def run_fl_round(
                 num_workers=0,
             )
 
-        update, trained, samples_processed, samples_trained, weight_change = client.process_day(global_weights, day_loader)
+        update, trained, samples_processed, samples_trained, weight_change = client.process_day(
+            global_weights, day_loader, threshold_percentile
+        )
         client_updates.append(update)
         if trained:
             trained_count += 1

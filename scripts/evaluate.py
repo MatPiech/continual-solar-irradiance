@@ -14,6 +14,28 @@ from cirr.datamodules.forecasting import ForecastingDataModule
 from cirr.models.forecaster import Forecaster
 
 
+def robust_wape(targets, predictions):
+    # Avoid division by zero if all targets are 0
+    denominator = np.sum(np.abs(targets))
+    if denominator == 0:
+        return 0.0  # Or np.inf, depending on how you want to treat it
+
+    wape = np.sum(np.abs(targets - predictions)) / denominator * 100
+    return wape
+
+
+def robust_smape(targets, predictions):
+    # Calculate numerator and denominator
+    numerator = 2 * np.abs(targets - predictions)
+    denominator = np.abs(targets) + np.abs(predictions)
+
+    # Divide safely: Where denominator is 0, return 0 (0 error for 0 actual vs 0 pred)
+    # np.divide with 'where' handles the condition, 'out' sets the default
+    smape_array = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)
+
+    return 100 * np.mean(smape_array)
+
+
 def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, float]:
     """Compute evaluation metrics.
 
@@ -27,16 +49,22 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, f
     Returns
     -------
     dict[str, float]
-        Dictionary containing MAE, RMSE, MAPE metrics.
+        Dictionary containing MAE, RMSE, MAPE, WAPE, SMAPE metrics.
     """
     mae = mean_absolute_error(targets, predictions)
     rmse = root_mean_squared_error(targets, predictions)
     mape = mean_absolute_percentage_error(targets, predictions)
+    # Compute WAPE (Weighted Absolute Percentage Error)
+    wape = robust_wape(targets, predictions)
+    # Compute SMAPE (Symmetric Mean Absolute Percentage Error)
+    smape = robust_smape(targets, predictions)
 
     return {
         "mae": float(mae),
         "rmse": float(rmse),
         "mape": float(mape),
+        "wape": float(wape),
+        "smape": float(smape),
         "count": len(predictions),
     }
 
@@ -81,8 +109,8 @@ def evaluate_dataset(
     current_day_preds = []
     current_day_targets = []
 
-    print("Day    MAE        RMSE       MAPE       Samples ")
-    print("--------------------------------------------------")
+    print("Day    MAE        RMSE       MAPE       WAPE       SMAPE      Samples ")
+    print("------------------------------------------------------------------------")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
@@ -137,6 +165,7 @@ def evaluate_dataset(
                     print(
                         f"{current_day:<6} {day_metrics['mae']:<10.4f} "
                         f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
+                        f"{day_metrics['wape']:<10.2f} {day_metrics['smape']:<10.2f} "
                         f"{day_metrics['count']:<8}"
                     )
                     current_day = day_key
@@ -154,6 +183,7 @@ def evaluate_dataset(
         print(
             f"{current_day:<6} {day_metrics['mae']:<10.4f} "
             f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
+            f"{day_metrics['wape']:<10.2f} {day_metrics['smape']:<10.2f} "
             f"{day_metrics['count']:<8}"
         )
 
@@ -182,7 +212,6 @@ def evaluate_dataset(
     required=True,
     help="Path to prepared dataset directory",
 )
-@click.option("--dataset-name", type=str, default="dataset", help="Name of dataset for display")
 @click.option(
     "--save-results",
     type=click.Path(path_type=Path),
@@ -198,11 +227,11 @@ def evaluate_dataset(
 def main(
     checkpoint: str,
     dataset_path: Path,
-    dataset_name: str,
     save_results: str | None,
     limit: int,
 ) -> None:
     """Evaluate solar irradiance forecasting model."""
+    dataset_name = dataset_path.name.split("_")[0]
     # Load model
     print("Loading model...")
     model = Forecaster(
@@ -265,6 +294,8 @@ def main(
     print(f"  MAE:   {overall_metrics['mae']:.4f}")
     print(f"  RMSE:  {overall_metrics['rmse']:.4f}")
     print(f"  MAPE:  {overall_metrics['mape']:.2%}")
+    print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
+    print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
     print(f"  Samples: {overall_metrics['count']}")
 
     # Save results if requested
@@ -279,7 +310,19 @@ def main(
             f.write(f"  MAE:   {overall_metrics['mae']:.4f}\n")
             f.write(f"  RMSE:  {overall_metrics['rmse']:.4f}\n")
             f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
+            f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
+            f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
             f.write(f"  Samples: {overall_metrics['count']}\n\n")
+            f.write("Per-Day Metrics:\n")
+            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+            f.write("-" * 78 + "\n")
+            for day_key, metrics in per_day_metrics.items():
+                f.write(
+                    f"{day_key:<6} {metrics['mae']:<10.4f} "
+                    f"{metrics['rmse']:<10.4f} {metrics['mape']:<10.2%} "
+                    f"{metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
+                    f"{metrics['count']:<8}\n"
+                )
 
         print(f"\nResults saved to {save_results}")
 
