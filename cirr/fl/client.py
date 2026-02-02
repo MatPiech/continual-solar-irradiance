@@ -31,10 +31,7 @@ class Client:
         self.warmup_samples = 10
 
     def process_day(self, global_weights, day_loader, threshold_percentile: float = 75.0):
-        """Run inference sample-by-sample for a day; train on high-uncertainty samples.
-
-        Returns (state_dict, trained, samples_processed, samples_trained, weight_change_mb)
-        """
+        """Run inference sample-by-sample for a day; train on high-uncertainty samples."""
         # Store initial weights to compute change
         initial_weights = copy.deepcopy(global_weights)
         self.model.load_state_dict(global_weights)
