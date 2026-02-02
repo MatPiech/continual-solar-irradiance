@@ -1,1 +1,1 @@
-from .folsom import FolsomDataset
+from .sky_image import SkyImageDataset
