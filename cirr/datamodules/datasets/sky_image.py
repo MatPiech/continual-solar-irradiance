@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-class FolsomDataset(Dataset):
+class SkyImageDataset(Dataset):
     def __init__(
         self,
         data_root: Path,
@@ -45,10 +45,10 @@ class FolsomDataset(Dataset):
 
         source_irradiances = []
         for history_item in period["history"]:
-            irradiance = history_item["irradiance"]
+            irradiance = history_item["irradiance"] / 1000.0  # Scale to [0, 1]
             source_irradiances.append(irradiance)
 
-        target_irradiance = period["target_irradiance"]
+        target_irradiance = period["target_irradiance"] / 1000.0  # Scale to [0, 1]
 
         return (
             image_input,
