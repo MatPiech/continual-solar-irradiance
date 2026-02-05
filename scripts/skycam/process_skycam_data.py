@@ -13,17 +13,10 @@ from tqdm import tqdm
     "--data-dir", type=click.Path(path_type=Path), default="skycam_data", help="Directory containing skycam zip files"
 )
 @click.option("--location", type=str, required=True, help="Location name (e.g., Alpnach)")
-@click.option(
-    "--output-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Output directory for images (default: <location>/images)",
-)
-def process_skycam_data(data_dir: Path, location: str, output_dir: Path | None) -> None:
+def process_skycam_data(data_dir: Path, location: str) -> None:
     """Process skycam zip files: extract images, rename them, and create irradiance CSV."""
     # Set default output directories
-    if output_dir is None:
-        output_dir = Path(location.lower()) / "images"
+    output_dir = Path(location.lower()) / "images"
 
     csv_output = output_dir.parent / f"{location.lower()}_irradiance.csv"
 
