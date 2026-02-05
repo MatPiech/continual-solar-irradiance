@@ -13,8 +13,15 @@ from tqdm import tqdm
 @click.option("--timezone", type=str, default="US/Pacific")
 @click.option("--date-col", type=str, default="timeStamp")
 @click.option("--date-format", type=str, default="%Y-%m-%d %H:%M:%S")
+@click.option("--image-format", type=str, default="jpg")
 def clean_dataframe(
-    images_path: Path, irradiance_path: Path, output_path: Path, timezone: str, date_col: str, date_format: str
+    images_path: Path,
+    irradiance_path: Path,
+    output_path: Path,
+    timezone: str,
+    date_col: str,
+    date_format: str,
+    image_format: str,
 ):
     df = pd.read_csv(irradiance_path)
     df[date_col] = pd.to_datetime(df[date_col], format=date_format)
@@ -23,14 +30,14 @@ def clean_dataframe(
     df.index = df.index.tz_localize("UTC").tz_convert(timezone)
     existing_images = {
         pd.to_datetime(image_path.stem, format="%Y%m%d_%H%M%S").tz_localize(timezone, ambiguous="NaT")
-        for image_path in images_path.rglob("*.jpg")
+        for image_path in images_path.rglob(f"*.{image_format}")
     }
     existing_images.discard(pd.NaT)  # Remove NaT values from ambiguous DST times
     print(f"Existing images: {len(existing_images)}")
 
     filtered_images = set()
     for image_name in tqdm(existing_images):
-        image_path = Path(images_path, image_name.strftime("%Y%m%d_%H%M%S") + ".jpg")
+        image_path = Path(images_path, image_name.strftime("%Y%m%d_%H%M%S") + f".{image_format}")
         try:
             with Image.open(image_path) as img:
                 img.verify()
@@ -42,7 +49,7 @@ def clean_dataframe(
 
     print(f"Filtered images: {len(filtered_images)}")
     df = df.loc[df.index.isin(filtered_images)]
-    df["image_name"] = df.index.strftime("%Y%m%d_%H%M%S") + ".jpg"
+    df["image_name"] = df.index.strftime("%Y%m%d_%H%M%S") + f".{image_format}"
     print(f"Data samples: {len(df)}")
     df.to_csv(output_path)
 
