@@ -61,30 +61,28 @@ class ForecastingDataModule(LightningDataModule):
         with self._periods_path.open("rb") as f:
             periods = pickle.load(f)
 
-        # Determine split year: use 2016 if available, otherwise use median year
-        years = set()
-        for period in periods:
-            year = period["history"][-1]["image_name"][:4]
-            years.add(year)
-
-        split_year = "2016" if "2016" in years else sorted(years)[len(years) // 2]
-
-        test_periods = list(filter(lambda p: p["history"][-1]["image_name"].startswith(split_year), periods))
-        train_val_periods = list(filter(lambda p: not p["history"][-1]["image_name"].startswith(split_year), periods))
-        # number of days for validatation dataset to get 80-20 ratio of train-val datasets
-        val_size = 146
-        np.random.seed(self._seed)
-        val_dates = [
-            str(y) + str(m).zfill(2) + str(d).zfill(2)
-            for y, m, d in zip(
-                np.random.randint(2014, 2016, size=val_size),
-                np.random.randint(1, 13, size=val_size),
-                np.random.randint(1, 29, size=val_size),
-                strict=False,
-            )
-        ]
-        val_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] in val_dates, train_val_periods))
-        train_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] not in val_dates, train_val_periods))
+        if "folsom" in self._dataset_name.lower():
+            test_year = "2016"
+            test_periods = list(filter(lambda p: p["history"][-1]["image_name"].startswith(test_year), periods))
+            train_val_periods = list(filter(lambda p: not p["history"][-1]["image_name"].startswith(test_year), periods))
+            # number of days for validatation dataset to get 80-20 ratio of train-val datasets
+            val_size = 146
+            np.random.seed(self._seed)
+            val_dates = [
+                str(y) + str(m).zfill(2) + str(d).zfill(2)
+                for y, m, d in zip(
+                    np.random.randint(2014, 2016, size=val_size),
+                    np.random.randint(1, 13, size=val_size),
+                    np.random.randint(1, 29, size=val_size),
+                    strict=False,
+                )
+            ]
+            val_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] in val_dates, train_val_periods))
+            train_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] not in val_dates, train_val_periods))
+        else:
+            test_periods = periods
+            val_periods = []
+            train_periods = []
 
         self._train_dataset = SkyImageDataset(
             data_root=self._data_root,
