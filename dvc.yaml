@@ -5,7 +5,7 @@ vars:
 
 stages:
   get_data:
-    cmd: bash scripts/get_data.sh
+    cmd: bash scripts/dvc/get_data.sh
     outs:
       - ${data_raw}/Folsom_irradiance.csv
       - ${data_raw}/images/:
@@ -15,6 +15,7 @@ stages:
     cmd: python ${convert_timestamps.script_path}
          --data-raw ${data_raw}
          --output-path ${convert_timestamps.output_path}
+         --timezone US/Pacific
     deps:
       - ${data_raw}/images/
       - ${convert_timestamps.script_path}
@@ -23,11 +24,14 @@ stages:
 
   clean_dataframe:
     cmd: python ${clean_dataframe.script_path}
-         --data-raw ${data_raw}
          --images-path ${convert_timestamps.output_path}
+         --irradiance-path ${clean_dataframe.irradiance_path}
          --output-path ${clean_dataframe.output_path}
+         --timezone US/Pacific
+         --date-col timeStamp
+         --date-format '%Y-%m-%d %H:%M:%S'
     deps:
-      - ${data_raw}/Folsom_irradiance.csv
+      - ${clean_dataframe.irradiance_path}
       - ${convert_timestamps.output_path}
       - ${clean_dataframe.script_path}
     outs:
@@ -36,6 +40,7 @@ stages:
   export_periods:
     cmd: python ${export_periods.script_path}
          --cleaned-dataframe-path ${clean_dataframe.output_path}
+         --irradiance-col ghi
          --time-window ${export_periods.time_window}
          --time-shift ${export_periods.time_shift}
          --history-size ${export_periods.history_size}

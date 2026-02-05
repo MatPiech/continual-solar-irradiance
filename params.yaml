@@ -1,20 +1,21 @@
 convert_timestamps:
-  script_path: scripts/convert_timestamps.py
+  script_path: scripts/dvc/convert_timestamps.py
   output_path: data/folsom_prepared/images
 
 clean_dataframe:
-  script_path: scripts/clean_dataframe.py
+  script_path: scripts/dvc/clean_dataframe.py
+  irradiance_path: data/folsom_raw/Folsom_irradiance.csv
   output_path: data/folsom_prepared/cleaned_irradiance.csv
 
 export_periods:
-  script_path: scripts/export_periods.py
+  script_path: scripts/dvc/export_periods.py
   time_window: 15   # target forecasting horizon in minutes
   time_shift: 5     # minutes between history samples
   history_size: 4   # used history samples
   output_path: data/folsom_prepared/periods.pickle
 
 train_forecaster:
-  script_path: scripts/train_forecaster.py
+  script_path: scripts/dvc/train_forecaster.py
   seed: 42
 
   #### MODE ####
