@@ -8,6 +8,28 @@ from torchmetrics.functional.regression import mean_absolute_error, mean_absolut
 from tqdm import tqdm
 
 
+def robust_wape(targets, predictions):
+    # Avoid division by zero if all targets are 0
+    denominator = np.sum(np.abs(targets))
+    if denominator == 0:
+        return 0.0  # Or np.inf, depending on how you want to treat it
+
+    wape = np.sum(np.abs(targets - predictions)) / denominator * 100
+    return wape
+
+
+def robust_smape(targets, predictions):
+    # Calculate numerator and denominator
+    numerator = 2 * np.abs(targets - predictions)
+    denominator = np.abs(targets) + np.abs(predictions)
+
+    # Divide safely: Where denominator is 0, return 0 (0 error for 0 actual vs 0 pred)
+    # np.divide with 'where' handles the condition, 'out' sets the default
+    smape_array = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)
+
+    return 100 * np.mean(smape_array)
+
+
 @click.command()
 @click.option(
     "--periods-path",
@@ -87,13 +109,16 @@ def evaluate_smart_persistence_model(periods_path: Path, clear_sky_path: Path, f
     mae = mean_absolute_error(preds, target)
     mse = mean_squared_error(preds, target)
     rmse = mean_squared_error(preds, target, squared=False)
+    wape = robust_wape(target.numpy(), preds.numpy())
+    smape = robust_smape(target.numpy(), preds.numpy())
     print("--- Smart Persistence Model evaluation ---")
     print(f"Forecasting horizon: {forecasting_horizon} minutes")
     print(f"MAPE [%]: {mape*100:.2f}")
     print(f"MAE [W/m^2]: {mae}")
     print(f"MSE (normalized): {mse}")
     print(f"RMSE [W/m^2]: {rmse}")
-
+    print(f"WAPE [%]: {wape:.2f}")
+    print(f"SMAPE [%]: {smape:.2f}")
     if save:
         output_path = Path(f"./smart_persistence_{forecasting_horizon}min.npy")
         with output_path.open("wb") as f:

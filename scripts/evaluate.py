@@ -6,6 +6,7 @@ from typing import Any
 
 import click
 import numpy as np
+import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, root_mean_squared_error
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -75,7 +76,7 @@ def evaluate_dataset(
     periods: list[dict[str, Any]],
     indices: list[int] | None = None,
     device: str = "cuda",
-) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Evaluate model on dataset and compute per-day metrics.
 
     Parameters
@@ -97,12 +98,15 @@ def evaluate_dataset(
         Overall metrics (MAE, RMSE, MAPE, count).
     per_day_metrics : dict[str, dict[str, float]]
         Per-day metrics with MMDD as keys.
+    predictions_data : list[dict[str, Any]]
+        List of dictionaries with predictions, targets, and timestamps.
     """
     model.eval()
     model = model.to(device)
 
     all_predictions = []
     all_targets = []
+    predictions_data = []
     day_predictions = defaultdict(list)
     day_targets = defaultdict(list)
     current_day = None
@@ -143,12 +147,27 @@ def evaluate_dataset(
                 image_name = image_name.decode("utf-8")
 
             day_key = None
+            timestamp = None
             if isinstance(image_name, str) and len(image_name) >= 8:
                 day_key = image_name[4:8]  # MMDD format
+                timestamp = image_name  # Use full image name as timestamp
             elif indices is not None and batch_idx < len(indices):
                 period = periods[indices[batch_idx]]
                 period_image = period["history"][-1]["image_name"]
                 day_key = period_image[4:8]
+                timestamp = period_image
+
+            # Store prediction data with timestamp
+            predictions_data.append(
+                {
+                    "timestamp": timestamp,
+                    "day": day_key,
+                    "prediction": pred_np[0] if len(pred_np) == 1 else pred_np,
+                    "target": target_np[0] if len(target_np) == 1 else target_np,
+                    "error": pred_np - target_np,
+                    "absolute_error": np.abs(pred_np - target_np),
+                }
+            )
 
             if day_key is not None:
                 day_predictions[day_key].extend(pred_np)
@@ -199,7 +218,7 @@ def evaluate_dataset(
         day_targets_arr = np.array(day_targets[day_key])
         per_day_metrics[day_key] = compute_metrics(day_preds, day_targets_arr)
 
-    return overall_metrics, per_day_metrics
+    return overall_metrics, per_day_metrics, predictions_data
 
 
 @click.command()
@@ -214,9 +233,9 @@ def evaluate_dataset(
 )
 @click.option(
     "--save-results",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Path to save evaluation results as text file",
+    is_flag=True,
+    default=False,
+    help="Save evaluation results to files with dataset-based names",
 )
 @click.option(
     "--limit",
@@ -227,7 +246,7 @@ def evaluate_dataset(
 def main(
     checkpoint: str,
     dataset_path: Path,
-    save_results: str | None,
+    save_results: bool,
     limit: int,
 ) -> None:
     """Evaluate solar irradiance forecasting model."""
@@ -278,7 +297,7 @@ def main(
         )
         print(f"Evaluating on {min(limit, len(test_dataset))} samples (limited)\n")
 
-    overall_metrics, per_day_metrics = evaluate_dataset(
+    overall_metrics, per_day_metrics, predictions_data = evaluate_dataset(
         model,
         test_loader,
         test_dataset._periods,
@@ -300,7 +319,13 @@ def main(
 
     # Save results if requested
     if save_results:
-        with save_results.open("w") as f:
+        results_file = f"{dataset_name}_results.txt"
+        predictions_file = f"{dataset_name}_predictions.csv"
+        df_predictions = pd.DataFrame(predictions_data)
+        df_predictions.to_csv(predictions_file, index=False)
+        print(f"Predictions saved to {predictions_file}")
+
+        with Path(results_file).open("w") as f:
             f.write(f"Evaluation Results: {dataset_name}\n")
             f.write(f"Checkpoint: {checkpoint}\n")
             f.write(f"Dataset: {dataset_path}\n")
@@ -324,7 +349,7 @@ def main(
                     f"{metrics['count']:<8}\n"
                 )
 
-        print(f"\nResults saved to {save_results}")
+        print(f"\nResults saved to {results_file}")
 
 
 if __name__ == "__main__":
