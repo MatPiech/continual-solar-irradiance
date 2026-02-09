@@ -104,12 +104,14 @@ class Forecaster(pl.LightningModule):
         if self.is_probabilistic:
             # Split: [Batch, 2] -> Mean [Batch, 1], Variance [Batch, 1]
             mean = out[:, 0].unsqueeze(1)
+            mean = F.softplus(mean)
             # Softplus + epsilon ensures variance > 0
             log_var = out[:, 1].unsqueeze(1)
             variance = F.softplus(log_var) + 1e-6
             return mean, variance
         else:
             # Standard Regression: [Batch, 1]
+            out = F.softplus(out)
             return out, None
 
     def _shared_step(self, batch, stage):

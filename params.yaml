@@ -12,7 +12,7 @@ export_periods:
   time_window: 15   # target forecasting horizon in minutes
   time_shift: 5     # minutes between history samples
   history_size: 4   # used history samples
-  output_path: data/folsom_prepared/periods.pickle
+  output_path: data/folsom_prepared/train_periods.pickle
 
 train_forecaster:
   script_path: scripts/dvc/train_forecaster.py
@@ -28,7 +28,7 @@ train_forecaster:
   trainer:
     devices: 1
     precision: bf16-mixed
-    min_epochs: 5
+    min_epochs: 10
     max_epochs: 30
 
   #### MODEL ####
@@ -37,7 +37,7 @@ train_forecaster:
     channels: 3
     pretrained: True
     compile: False
-    loss_function: MSE
+    loss_function: GNLL
     lr: 3e-4
     lr_patience: 2
 

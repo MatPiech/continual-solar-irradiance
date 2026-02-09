@@ -184,7 +184,7 @@ def evaluate_dataset(
                     print(
                         f"{current_day:<6} {day_metrics['mae']:<10.4f} "
                         f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
-                        f"{day_metrics['wape']:<10.2f} {day_metrics['smape']:<10.2f} "
+                        f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
                         f"{day_metrics['count']:<8}"
                     )
                     current_day = day_key
@@ -202,7 +202,7 @@ def evaluate_dataset(
         print(
             f"{current_day:<6} {day_metrics['mae']:<10.4f} "
             f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
-            f"{day_metrics['wape']:<10.2f} {day_metrics['smape']:<10.2f} "
+            f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
             f"{day_metrics['count']:<8}"
         )
 
@@ -345,7 +345,7 @@ def main(
                 f.write(
                     f"{day_key:<6} {metrics['mae']:<10.4f} "
                     f"{metrics['rmse']:<10.4f} {metrics['mape']:<10.2%} "
-                    f"{metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
+                    f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
                     f"{metrics['count']:<8}\n"
                 )
 
