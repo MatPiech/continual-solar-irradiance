@@ -30,7 +30,7 @@ def train_forecaster(data_root: Path):
 
     datamodule = ForecastingDataModule(
         root_data_path=data_root,
-        periods_path=data_root / "periods.pickle",
+        periods_path=data_root / "train_periods.pickle",
         augment=cfg.datamodule.augment,
         image_size=cfg.datamodule.image_size,
         image_mean=cfg.datamodule.image_mean,
