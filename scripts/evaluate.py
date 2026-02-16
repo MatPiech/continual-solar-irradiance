@@ -7,67 +7,13 @@ from typing import Any
 import click
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, root_mean_squared_error
 import torch
 from torch.utils.data import DataLoader, Subset
 
 from cirr.datamodules.forecasting import ForecastingDataModule
 from cirr.models.forecaster import Forecaster
-
-
-def robust_wape(targets, predictions):
-    # Avoid division by zero if all targets are 0
-    denominator = np.sum(np.abs(targets))
-    if denominator == 0:
-        return 0.0  # Or np.inf, depending on how you want to treat it
-
-    wape = np.sum(np.abs(targets - predictions)) / denominator * 100
-    return wape
-
-
-def robust_smape(targets, predictions):
-    # Calculate numerator and denominator
-    numerator = 2 * np.abs(targets - predictions)
-    denominator = np.abs(targets) + np.abs(predictions)
-
-    # Divide safely: Where denominator is 0, return 0 (0 error for 0 actual vs 0 pred)
-    # np.divide with 'where' handles the condition, 'out' sets the default
-    smape_array = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)
-
-    return 100 * np.mean(smape_array)
-
-
-def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, float]:
-    """Compute evaluation metrics.
-
-    Parameters
-    ----------
-    predictions : np.ndarray
-        Model predictions (N,).
-    targets : np.ndarray
-        Ground truth values (N,).
-
-    Returns
-    -------
-    dict[str, float]
-        Dictionary containing MAE, RMSE, MAPE, WAPE, SMAPE metrics.
-    """
-    mae = mean_absolute_error(targets, predictions)
-    rmse = root_mean_squared_error(targets, predictions)
-    mape = mean_absolute_percentage_error(targets, predictions)
-    # Compute WAPE (Weighted Absolute Percentage Error)
-    wape = robust_wape(targets, predictions)
-    # Compute SMAPE (Symmetric Mean Absolute Percentage Error)
-    smape = robust_smape(targets, predictions)
-
-    return {
-        "mae": float(mae),
-        "rmse": float(rmse),
-        "mape": float(mape),
-        "wape": float(wape),
-        "smape": float(smape),
-        "count": len(predictions),
-    }
+from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
+from cirr.utils.metrics import compute_metrics
 
 
 def evaluate_dataset(
@@ -233,21 +179,29 @@ def evaluate_dataset(
 )
 @click.option(
     "--save-results",
+    "--save-result",
     is_flag=True,
     default=False,
     help="Save evaluation results to files with dataset-based names",
 )
 @click.option(
-    "--limit",
+    "--num-days",
     type=int,
     default=-1,
-    help="Limit number of samples to evaluate. -1 means all samples.",
+    help="Number of days to evaluate. -1 means all days.",
+)
+@click.option(
+    "--start-day",
+    type=str,
+    default="0101",
+    help="Starting day in MMDD format (e.g., 0101)",
 )
 def main(
     checkpoint: str,
     dataset_path: Path,
     save_results: bool,
-    limit: int,
+    num_days: int,
+    start_day: str,
 ) -> None:
     """Evaluate solar irradiance forecasting model."""
     dataset_name = dataset_path.name.split("_")[0]
@@ -278,25 +232,47 @@ def main(
         seed=42,
     )
     datamodule.setup(None)
-    test_loader = datamodule.test_dataloader()
     test_dataset = datamodule._test_dataset
 
     print(f"Test set size: {len(test_dataset)} samples\n")
 
-    # Evaluate
-    print("Evaluating model...")
+    # Group indices by day
+    day_index_map = group_indices_by_day(test_dataset._periods)
+    print(f"Number of unique days: {len(day_index_map)}\n")
+
+    # Determine which days to evaluate
     indices = None
-    # Limit dataset if requested
-    if limit > 0:
-        indices = list(range(min(limit, len(test_dataset))))
+    if num_days > 0:
+        all_days = generate_year_days()
+        if start_day not in all_days:
+            raise ValueError(f"Invalid start_day '{start_day}'. Must be in MMDD format (0101-1231)")
+        start_idx = all_days.index(start_day)
+        selected_days = all_days[start_idx : start_idx + num_days]
+
+        # Collect indices for selected days
+        indices = []
+        for day_key in selected_days:
+            if day_key in day_index_map:
+                indices.extend(day_index_map[day_key])
+
+        print(f"Evaluating {len(selected_days)} days starting from {start_day}")
+        print(f"Total samples: {len(indices)}\n")
+    else:
+        print("Evaluating all days\n")
+
+    # Create test loader
+    if indices is not None:
         test_loader = DataLoader(
             Subset(test_dataset, indices),
             batch_size=1,
             shuffle=False,
             num_workers=0,
         )
-        print(f"Evaluating on {min(limit, len(test_dataset))} samples (limited)\n")
+    else:
+        test_loader = datamodule.test_dataloader()
 
+    # Evaluate
+    print("Evaluating model...")
     overall_metrics, per_day_metrics, predictions_data = evaluate_dataset(
         model,
         test_loader,
