@@ -42,7 +42,7 @@ def _load_dataset(dataset_path: Path, split: str = "test") -> Any:
     """Load selected dataset split from prepared directory path."""
     datamodule = ForecastingDataModule(
         root_data_path=dataset_path,
-        periods_path=dataset_path / "periods.pickle" if split == "test" else dataset_path.parent / "train_periods.pickle",
+        periods_path=dataset_path / "periods.pickle" if split == "test" else dataset_path / "train_periods.pickle",
         augment=False,
         image_size=[128, 128],
         image_mean=[0.485, 0.456, 0.406],
@@ -436,8 +436,8 @@ def run_local_training(
     else:
         all_days = all_days[start_idx:]
         print(f"Processing all days starting from {all_days[0]} ({len(all_days)} days)\n")
-    print(f"{'Day':<6} {'Samples':<10} {'MAE':<10} {'RMSE':<10} {'Train Loss':<12}")
-    print("-" * 60)
+    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<8} {'WAPE':<4} {'SMAPE':<4} {'Samples':<8} {'Train Loss':<12}")
+    print("-" * 120)
 
     results = []
     all_predictions_data = []
@@ -515,7 +515,12 @@ def run_local_training(
             }
         )
 
-        print(f"{day_key:<6} {n_samples:<10} {metrics['mae']:<10.4f} {metrics['rmse']:<10.4f} " f"{train_loss:<12.6f}")
+        print(
+            f"{day_key:<6} {metrics['mae']:<10.4f} "
+            f"{metrics['rmse']:<10.4f} {metrics['mape']:<8.2%} "
+            f"{metrics['wape']:<4.2f}% {metrics['smape']:<4.2f}% "
+            f"{metrics['count']:<8} {train_loss:.4f}"
+        )
 
     # Compute overall metrics
     all_predictions = np.array([p["prediction"] for p in all_predictions_data])
