@@ -436,8 +436,6 @@ def run_local_training(
     else:
         all_days = all_days[start_idx:]
         print(f"Processing all days starting from {all_days[0]} ({len(all_days)} days)\n")
-    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<8} {'WAPE':<4} {'SMAPE':<4} {'Samples':<8} {'Train Loss':<12}")
-    print("-" * 120)
 
     results = []
     all_predictions_data = []
@@ -452,6 +450,9 @@ def run_local_training(
     )
     if len(replay_buffer) > 0:
         print(f"Initialized replay buffer from Folsom with {len(replay_buffer)} samples")
+
+    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<4} {'SMAPE':<4} {'Samples':<8} {'Train Loss':<12}")
+    print("-" * 100)
 
     for day_key in all_days:
         day_indices = day_index_map.get(day_key, [])
@@ -517,8 +518,8 @@ def run_local_training(
 
         print(
             f"{day_key:<6} {metrics['mae']:<10.4f} "
-            f"{metrics['rmse']:<10.4f} {metrics['mape']:<8.2%} "
-            f"{metrics['wape']:<4.2f}% {metrics['smape']:<4.2f}% "
+            f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
+            f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
             f"{metrics['count']:<8} {train_loss:.4f}"
         )
 
@@ -648,12 +649,12 @@ def main(
     print(f"  Samples: {overall_metrics['count']}\n")
 
     print("Per-Day Metrics:")
-    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}")
+    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}")
     print("-" * 78)
     for day_key, metrics in per_day_metrics.items():
         print(
             f"{day_key:<6} {metrics['mae']:<10.4f} {metrics['rmse']:<10.4f} "
-            f"{metrics['mape']:<10.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
+            f"{metrics['mape']:<16.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
             f"{metrics['count']:<8}"
         )
 
@@ -683,12 +684,12 @@ def main(
             f.write(f"  Samples: {overall_metrics['count']}\n\n")
 
             f.write("Per-Day Metrics:\n")
-            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
             f.write("-" * 78 + "\n")
             for day_key, metrics in per_day_metrics.items():
                 f.write(
                     f"{day_key:<6} {metrics['mae']:<10.4f} {metrics['rmse']:<10.4f} "
-                    f"{metrics['mape']:<10.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
+                    f"{metrics['mape']:<16.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
                     f"{metrics['count']:<8}\n"
                 )
 
