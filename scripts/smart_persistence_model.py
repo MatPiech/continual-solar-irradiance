@@ -71,9 +71,9 @@ def evaluate_smart_persistence_model(periods_path: Path, clear_sky_path: Path, f
         # Get the last observed irradiance and its clear sky value
         last_history = p["history"][-1]
         last_irradiance = last_history["irradiance"]
-        # Extract timestamp from image_name (format: yyyymmdd_HHMMSS.jpg)
+        # Extract timestamp from image_name (format: yyyymmdd_HHMMSS.ext)
         image_name = last_history["image_name"]
-        date_time_str = image_name.replace(".jpg", "")
+        date_time_str = Path(image_name).stem
         last_timestamp = pd.to_datetime(date_time_str, format="%Y%m%d_%H%M%S", utc=False)
 
         # Get clear sky irradiance for last observation

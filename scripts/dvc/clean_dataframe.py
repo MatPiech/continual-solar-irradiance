@@ -28,11 +28,16 @@ def clean_dataframe(
     df = df.set_index(date_col)
     df.index.name = "datetime"
     df.index = df.index.tz_localize("UTC").tz_convert(timezone)
-    existing_images = {
-        pd.to_datetime(image_path.stem, format="%Y%m%d_%H%M%S").tz_localize(timezone, ambiguous="NaT")
-        for image_path in images_path.rglob(f"*.{image_format}")
-    }
-    existing_images.discard(pd.NaT)  # Remove NaT values from ambiguous DST times
+    existing_images = set()
+    for image_path in images_path.rglob(f"*.{image_format}"):
+        try:
+            timestamp = pd.to_datetime(image_path.stem, format="%Y%m%d_%H%M%S").tz_localize(timezone, ambiguous="NaT")
+            if timestamp is not pd.NaT:
+                existing_images.add(timestamp)
+        except (ValueError, TypeError):
+            # Skip files that don't match the expected timestamp format
+            print(f"Skipping file with invalid name format: {image_path}")
+            continue
     print(f"Existing images: {len(existing_images)}")
 
     filtered_images = set()
