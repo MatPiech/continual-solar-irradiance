@@ -38,11 +38,11 @@ def _regime_label(target_value: float, low_threshold: float, mid_threshold: floa
     return "high"
 
 
-def _load_dataset(dataset_path: Path) -> Any:
-    """Load dataset from prepared directory path."""
+def _load_dataset(dataset_path: Path, split: str = "test") -> Any:
+    """Load selected dataset split from prepared directory path."""
     datamodule = ForecastingDataModule(
         root_data_path=dataset_path,
-        periods_path=dataset_path / "periods.pickle",
+        periods_path=dataset_path / "periods.pickle" if split == "test" else dataset_path.parent / "train_periods.pickle",
         augment=False,
         image_size=[128, 128],
         image_mean=[0.485, 0.456, 0.406],
@@ -52,7 +52,11 @@ def _load_dataset(dataset_path: Path) -> Any:
         seed=42,
     )
     datamodule.setup(None)
-    return datamodule._test_dataset
+    if split == "test":
+        return datamodule._test_dataset
+    if split == "training":
+        return datamodule._train_dataset
+    raise ValueError(f"Invalid split '{split}'. Expected 'test' or 'training'.")
 
 
 def _build_initial_replay_buffer(
@@ -72,7 +76,7 @@ def _build_initial_replay_buffer(
     if not folsom_dataset_path.exists():
         return []
 
-    folsom_dataset = _load_dataset(folsom_dataset_path)
+    folsom_dataset = _load_dataset(folsom_dataset_path, split="training")
 
     regime_pools: dict[str, list[tuple[Any, int]]] = {"low": [], "mid": [], "high": []}
     for idx, period in enumerate(folsom_dataset._periods):
@@ -141,7 +145,7 @@ def load_model_and_data(
     model = model.to(device)
 
     # Load dataset
-    test_dataset = _load_dataset(dataset_path)
+    test_dataset = _load_dataset(dataset_path, split="test")
     day_index_map = group_indices_by_day(test_dataset._periods)
 
     return model, day_index_map, test_dataset
