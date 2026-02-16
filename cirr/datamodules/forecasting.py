@@ -35,16 +35,28 @@ class ForecastingDataModule(LightningDataModule):
         self._workers = workers
         self._seed = seed
 
+        dataset_name_lower = self._dataset_name.lower()
+        if any(name in dataset_name_lower for name in ("folsom", "modena", "poznan", "karpicko")):
+            crop_size = 1520
+        elif any(name in dataset_name_lower for name in ("bern", "alpnach", "ne")):
+            crop_size = 1200
+        else:
+            raise ValueError(
+                "Unsupported dataset name for crop size selection: "
+                f"{self._dataset_name}. Expected name containing one of: "
+                "folsom, modena, poznan, karpicko, bern, alpnach, ne."
+            )
+
         self._transforms = A.ReplayCompose(
             [
-                A.CenterCrop(height=1520, width=1520),
+                A.CenterCrop(height=crop_size, width=crop_size),
                 A.Resize(image_size[1], image_size[0]),
             ]
         )
         self._augmentations = A.ReplayCompose(
             [
                 # transforms
-                A.CenterCrop(height=1520, width=1520),
+                A.CenterCrop(height=crop_size, width=crop_size),
                 A.Resize(image_size[1], image_size[0]),
                 # geometry augmentations
                 A.Affine(rotate=(-10, 10), translate_percent=(-10, 10), scale=(0.9, 1.1)),

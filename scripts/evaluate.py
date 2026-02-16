@@ -129,8 +129,8 @@ def evaluate_dataset(
                     )
                     print(
                         f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-                        f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
-                        f"{day_metrics['wape']:<4.2f}% {day_metrics['smape']:<4.2f}% "
+                        f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
+                        f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
                         f"{day_metrics['count']:<8}"
                     )
                     current_day = day_key
@@ -147,8 +147,8 @@ def evaluate_dataset(
         )
         print(
             f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-            f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<8.2%} "
-            f"{day_metrics['wape']:<4.2f}% {day_metrics['smape']:<4.2f}% "
+            f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
+            f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
             f"{day_metrics['count']:<8}"
         )
 
@@ -315,12 +315,12 @@ def main(
             f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
             f.write(f"  Samples: {overall_metrics['count']}\n\n")
             f.write("Per-Day Metrics:\n")
-            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
             f.write("-" * 78 + "\n")
             for day_key, metrics in per_day_metrics.items():
                 f.write(
                     f"{day_key:<6} {metrics['mae']:<10.4f} "
-                    f"{metrics['rmse']:<10.4f} {metrics['mape']:<10.2%} "
+                    f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
                     f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
                     f"{metrics['count']:<8}\n"
                 )
