@@ -29,15 +29,6 @@ def _period_target_value(period: dict[str, Any]) -> float:
     return float(period["target_irradiance"]) / 1000.0
 
 
-def _regime_label(target_value: float, low_threshold: float, mid_threshold: float) -> str:
-    """Assign sample to low/mid/high regime based on target value."""
-    if target_value < low_threshold:
-        return "low"
-    if target_value < mid_threshold:
-        return "mid"
-    return "high"
-
-
 def _load_dataset(dataset_path: Path, split: str = "test") -> Any:
     """Load selected dataset split from prepared directory path."""
     datamodule = ForecastingDataModule(
@@ -62,54 +53,95 @@ def _load_dataset(dataset_path: Path, split: str = "test") -> Any:
 def _build_initial_replay_buffer(
     dataset_path: Path,
     replay_size: int,
-    nonzero_threshold: float,
-    low_threshold: float,
-    mid_threshold: float,
-    low_ratio: float,
-    mid_ratio: float,
-) -> list[tuple[Any, int]]:
-    """Create initial replay samples from Folsom prepared dataset."""
+    nonzero_threshold: float = 0.001,
+) -> tuple[list[tuple[Any, int]], dict[str, float]]:
+    """Create initial replay samples from Folsom prepared dataset using normal distribution.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to dataset directory.
+    replay_size : int
+        Number of samples to include in replay buffer.
+    nonzero_threshold : float, optional
+        Minimum target value for replay eligibility, by default 0.001.
+
+    Returns
+    -------
+    replay_buffer : list[tuple[Any, int]]
+        List of (dataset, sample_index) tuples for replay.
+    distribution_stats : dict[str, float]
+        Dictionary with 'mean' and 'std' computed from Folsom irradiance values.
+    """
     if replay_size <= 0:
-        return []
+        return [], {"mean": 0.0, "std": 0.0}
 
     folsom_dataset_path = dataset_path.parent / "folsom_prepared"
     if not folsom_dataset_path.exists():
-        return []
+        return [], {"mean": 0.0, "std": 0.0}
 
     folsom_dataset = _load_dataset(folsom_dataset_path, split="training")
 
-    regime_pools: dict[str, list[tuple[Any, int]]] = {"low": [], "mid": [], "high": []}
+    # Collect eligible samples and their irradiance values
+    irradiance_values = []
+    eligible_samples: list[tuple[Any, int]] = []
+
     for idx, period in enumerate(folsom_dataset._periods):
         target_value = _period_target_value(period)
         if target_value < nonzero_threshold:
             continue
-        regime = _regime_label(target_value, low_threshold=low_threshold, mid_threshold=mid_threshold)
-        regime_pools[regime].append((folsom_dataset, idx))
+        irradiance_values.append(target_value)
+        eligible_samples.append((folsom_dataset, idx))
 
-    if sum(len(values) for values in regime_pools.values()) == 0:
-        return []
+    if len(eligible_samples) == 0:
+        return [], {"mean": 0.0, "std": 0.0}
 
-    low_quota = max(0, int(round(replay_size * low_ratio)))
-    mid_quota = max(0, int(round(replay_size * mid_ratio)))
-    high_quota = max(0, replay_size - low_quota - mid_quota)
+    # Compute distribution statistics from Folsom
+    irradiance_array = np.array(irradiance_values)
+    mean_irr = float(np.mean(irradiance_array))
+    std_irr = float(np.std(irradiance_array))
+    max_irr = float(np.max(irradiance_array))
 
+    # Create irradiance bins (e.g., 10 bins) for stratified sampling
+    # to match normal distribution while covering the full range
+    n_bins = min(10, max(2, replay_size // 20))
+    bin_edges = np.linspace(0, max_irr, n_bins + 1)
+    bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
+
+    for sample, irr_val in zip(eligible_samples, irradiance_values, strict=False):
+        bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
+        bins[bin_idx].append(sample)
+
+    # Compute normal distribution weights for each bin center
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    normal_weights = np.exp(-0.5 * ((bin_centers - mean_irr) / (std_irr + 1e-6)) ** 2)
+    normal_weights /= np.sum(normal_weights)  # Normalize to sum to 1
+
+    # Allocate replay samples proportionally to normal distribution
     replay_buffer: list[tuple[Any, int]] = []
-    replay_buffer.extend(regime_pools["low"][:low_quota])
-    replay_buffer.extend(regime_pools["mid"][:mid_quota])
-    replay_buffer.extend(regime_pools["high"][:high_quota])
+    for bin_idx in range(n_bins):
+        quota = max(0, int(round(replay_size * normal_weights[bin_idx])))
+        if quota > 0 and bins[bin_idx]:
+            replay_buffer.extend(bins[bin_idx][:quota])
 
+    # Fill remaining slots with any available samples
     if len(replay_buffer) < replay_size:
-        leftovers = regime_pools["low"][low_quota:] + regime_pools["mid"][mid_quota:] + regime_pools["high"][high_quota:]
-        replay_buffer.extend(leftovers[: replay_size - len(replay_buffer)])
+        all_remaining = [
+            sample
+            for bin_idx in range(n_bins)
+            for sample in bins[bin_idx][len([s for s in replay_buffer if s in bins[bin_idx]]) :]
+        ]
+        replay_buffer.extend(all_remaining[: replay_size - len(replay_buffer)])
 
     random.Random(42).shuffle(replay_buffer)
-    return replay_buffer[:replay_size]
+    distribution_stats = {"mean": mean_irr, "std": std_irr, "max": max_irr}
+    return replay_buffer[:replay_size], distribution_stats
 
 
 def load_model_and_data(
     checkpoint_path: Path,
     dataset_path: Path,
-    device: str = "cuda",
+    device: str,
 ) -> tuple[Forecaster, dict[str, list[int]], Any]:
     """Load pretrained model and dataset.
 
@@ -119,8 +151,8 @@ def load_model_and_data(
         Path to model checkpoint file.
     dataset_path : Path
         Path to prepared dataset directory containing periods.pickle.
-    device : str, optional
-        Device to use ('cuda' or 'cpu'), by default "cuda".
+    device : str
+        Device to use ('cuda' or 'cpu').
 
     Returns
     -------
@@ -155,7 +187,7 @@ def predict_on_day(
     model: Forecaster,
     dataset: Any,
     day_indices: list[int],
-    device: str = "cuda",
+    device: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Generate predictions for all samples on a given day.
 
@@ -167,8 +199,8 @@ def predict_on_day(
         Dataset containing the periods.
     day_indices : list[int]
         Indices of samples to predict on.
-    device : str, optional
-        Device to use for inference, by default "cuda".
+    device : str
+        Device to use for inference.
 
     Returns
     -------
@@ -201,20 +233,17 @@ def train_on_day(
     dataset: Any,
     day_indices: list[int],
     replay_buffer: list[tuple[Any, int]],
-    learning_rate: float = 0.0001,
-    weight_decay: float = 0.001,
-    max_grad_norm: float = 1.0,
-    l2sp_lambda: float = 1e-2,
-    batch_size: int = 10,
-    low_threshold: float = 0.001,
-    mid_threshold: float = 0.1,
-    replay_samples: int = 300,
-    nonzero_threshold: float = 0.001,
-    device: str = "cuda",
+    learning_rate: float,
+    weight_decay: float,
+    max_grad_norm: float,
+    l2sp_lambda: float,
+    batch_size: int,
+    replay_samples: int,
+    device: str,
 ) -> float:
     """Retrain model on all samples from a given day.
 
-    Implements early stopping and gradient clipping to prevent overfitting.
+    Combines current-day samples with distribution-matched replay samples.
 
     Parameters
     ----------
@@ -226,69 +255,81 @@ def train_on_day(
         Indices of samples to train on.
     replay_buffer : list[tuple[Any, int]]
         Candidate replay samples as (dataset_ref, sample_index) pairs.
-    learning_rate : float, optional
-        Learning rate for optimizer, by default 0.0001.
-    weight_decay : float, optional
-        AdamW weight decay, by default 0.001.
-    max_grad_norm : float, optional
-        Gradient clipping max norm, by default 1.0.
-    l2sp_lambda : float, optional
-        L2-SP anti-drift regularization coefficient, by default 1e-2.
-    batch_size : int, optional
-        Mini-batch size for adaptation, by default 10.
-    low_threshold : float, optional
-        Threshold separating low regime, by default 0.001.
-    mid_threshold : float, optional
-        Threshold separating mid and high regime, by default 0.1.
-    replay_samples : int, optional
-        Number of replay samples to draw per day, by default 300.
-    nonzero_threshold : float, optional
-        Minimum target value for replay eligibility, by default 0.001.
-    device : str, optional
-        Device to use for training, by default "cuda".
+    learning_rate : float
+        Learning rate for optimizer.
+    weight_decay : float
+        AdamW weight decay.
+    max_grad_norm : float
+        Gradient clipping max norm.
+    l2sp_lambda : float
+        L2-SP anti-drift regularization coefficient.
+    batch_size : int
+        Mini-batch size for adaptation.
+    replay_samples : int
+        Number of replay samples to draw per day.
+    device : str
+        Device to use for training.
 
     Returns
     -------
-    float
+    loss : float
         Final training loss.
+    replay_stats : dict[str, Any]
+        Statistics about replay samples used (count, mean, std irradiance).
     """
     if len(day_indices) == 0:
-        return 0.0
+        return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
 
-    # Build regime pools for current day
-    current_pools: dict[str, list[tuple[Any, int]]] = {"low": [], "mid": [], "high": []}
-    for idx in day_indices:
-        target_value = _period_target_value(dataset._periods[idx])
-        regime = _regime_label(target_value, low_threshold=low_threshold, mid_threshold=mid_threshold)
-        current_pools[regime].append((dataset, idx))
+    # Collect current day samples
+    current_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
 
-    # Build replay pools from non-zero historical samples
-    replay_candidates = replay_buffer[:replay_samples] if replay_samples > 0 else []
-    replay_pools: dict[str, list[tuple[Any, int]]] = {"low": [], "mid": [], "high": []}
-    for replay_dataset, replay_idx in replay_candidates:
-        target_value = _period_target_value(replay_dataset._periods[replay_idx])
-        if target_value < nonzero_threshold:
-            continue
-        regime = _regime_label(target_value, low_threshold=low_threshold, mid_threshold=mid_threshold)
-        replay_pools[regime].append((replay_dataset, replay_idx))
+    # Select replay samples to maintain distribution
+    if replay_samples > 0 and len(replay_buffer) > 0:
+        # Compute irradiance distribution from replay buffer
+        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_buffer]
+        replay_array = np.array(replay_irradiances)
 
-    pooled_samples = (
-        current_pools["low"]
-        + current_pools["mid"]
-        + current_pools["high"]
-        + replay_pools["low"]
-        + replay_pools["mid"]
-        + replay_pools["high"]
-    )
+        # Create bins for distribution matching
+        n_bins = min(10, max(2, len(replay_buffer) // 20))
+        bin_edges = np.linspace(0, np.max(replay_array) + 1e-6, n_bins + 1)
+
+        # Partition replay buffer into bins
+        replay_bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
+        for sample, irr_val in zip(replay_buffer, replay_irradiances, strict=False):
+            bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
+            replay_bins[bin_idx].append(sample)
+
+        # Allocate replay samples according to replay buffer bin distribution
+        selected_replay: list[tuple[Any, int]] = []
+        total_replay_buffer = len(replay_buffer)
+        for bin_idx in range(n_bins):
+            bin_proportion = len(replay_bins[bin_idx]) / total_replay_buffer if total_replay_buffer > 0 else 0
+            target_quota = max(0, int(round(replay_samples * bin_proportion)))
+            if target_quota > 0 and replay_bins[bin_idx]:
+                selected_replay.extend(replay_bins[bin_idx][:target_quota])
+
+        # Fill remaining slots if needed
+        if len(selected_replay) < replay_samples:
+            remaining = [
+                s
+                for b_idx in range(n_bins)
+                for s in replay_bins[b_idx][len([x for x in selected_replay if x in replay_bins[b_idx]]) :]
+            ]
+            selected_replay.extend(remaining[: replay_samples - len(selected_replay)])
+
+        pooled_samples = current_samples + selected_replay[:replay_samples]
+    else:
+        pooled_samples = current_samples
+        selected_replay = []
 
     if len(pooled_samples) == 0:
-        return 0.0
+        return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
 
     random.shuffle(pooled_samples)
     mini_batches = [pooled_samples[idx : idx + batch_size] for idx in range(0, len(pooled_samples), batch_size)]
 
     if len(mini_batches) == 0:
-        return 0.0
+        return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
 
     model.train()
 
@@ -337,27 +378,37 @@ def train_on_day(
         total_loss += loss.item()
         batch_count += 1
 
-    return total_loss / batch_count if batch_count > 0 else 0.0
+    # Compute replay sample distribution statistics
+    replay_stats: dict[str, Any] = {"count": len(selected_replay)}
+    if len(selected_replay) > 0:
+        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in selected_replay]
+        replay_irr_array = np.array(replay_irradiances)
+        replay_stats["mean_irradiance"] = float(np.mean(replay_irr_array))
+        replay_stats["std_irradiance"] = float(np.std(replay_irr_array))
+        replay_stats["min_irradiance"] = float(np.min(replay_irr_array))
+        replay_stats["max_irradiance"] = float(np.max(replay_irr_array))
+    else:
+        replay_stats["mean_irradiance"] = 0.0
+        replay_stats["std_irradiance"] = 0.0
+        replay_stats["min_irradiance"] = 0.0
+        replay_stats["max_irradiance"] = 0.0
+
+    return total_loss / batch_count if batch_count > 0 else 0.0, replay_stats
 
 
 def run_local_training(
     checkpoint_path: Path,
     dataset_path: Path,
-    num_days: int = 10,
-    start_day: str = "0101",
-    adapt_lr: float = 1e-6,
-    adapt_weight_decay: float = 0.001,
-    adapt_max_grad_norm: float = 1.0,
-    adapt_l2sp_lambda: float = 1e-2,
-    adapt_batch_size: int = 10,
-    adapt_low_ratio: float = 0.3,
-    adapt_mid_ratio: float = 0.4,
-    adapt_low_threshold: float = 0.01,
-    adapt_mid_threshold: float = 0.1,
-    adapt_replay_size: int = 2000,
-    adapt_replay_samples: int = 300,
-    adapt_nonzero_threshold: float = 0.001,
-    device: str = "cuda",
+    num_days: int,
+    start_day: str,
+    adapt_lr: float,
+    adapt_weight_decay: float,
+    adapt_max_grad_norm: float,
+    adapt_l2sp_lambda: float,
+    adapt_batch_size: int,
+    adapt_replay_size: int,
+    adapt_replay_samples: int,
+    device: str,
 ) -> dict[str, Any]:
     """Run continual local training simulation.
 
@@ -374,36 +425,26 @@ def run_local_training(
         Path to initial model checkpoint.
     dataset_path : Path
         Path to prepared dataset directory.
-    num_days : int, optional
-        Number of days to process, by default -1 (all days).
-    start_day : str, optional
-        Starting day in MMDD format, by default "0101".
-    adapt_lr : float, optional
-        Learning rate for day adaptation, by default 1e-6.
-    adapt_weight_decay : float, optional
-        Weight decay for day adaptation optimizer, by default 0.001.
-    adapt_max_grad_norm : float, optional
-        Gradient clipping max norm, by default 1.0.
-    adapt_l2sp_lambda : float, optional
-        L2-SP anti-drift regularization coefficient, by default 1e-2.
-    adapt_batch_size : int, optional
-        Adaptation mini-batch size, by default 10.
-    adapt_low_ratio : float, optional
-        Low regime ratio per mini-batch, by default 0.3.
-    adapt_mid_ratio : float, optional
-        Mid regime ratio per mini-batch, by default 0.4.
-    adapt_low_threshold : float, optional
-        Low regime target threshold, by default 0.01.
-    adapt_mid_threshold : float, optional
-        Mid regime target threshold, by default 0.1.
-    adapt_replay_size : int, optional
-        Maximum replay buffer size, by default 2000.
-    adapt_replay_samples : int, optional
-        Replay samples drawn per day adaptation, by default 300.
-    adapt_nonzero_threshold : float, optional
-        Replay eligibility threshold for non-zero targets, by default 0.001.
-    device : str, optional
-        Device to use, by default "cuda".
+    num_days : int
+        Number of days to process.
+    start_day : str
+        Starting day in MMDD format.
+    adapt_lr : float
+        Learning rate for day adaptation.
+    adapt_weight_decay : float
+        Weight decay for day adaptation optimizer.
+    adapt_max_grad_norm : float
+        Gradient clipping max norm.
+    adapt_l2sp_lambda : float
+        L2-SP anti-drift regularization coefficient.
+    adapt_batch_size : int
+        Adaptation mini-batch size.
+    adapt_replay_size : int
+        Maximum replay buffer size.
+    adapt_replay_samples : int
+        Replay samples drawn per day adaptation.
+    device : str
+        Device to use.
 
     Returns
     -------
@@ -435,21 +476,19 @@ def run_local_training(
         print(f"Processing {len(all_days)} days starting from {all_days[0]}\n")
     else:
         all_days = all_days[start_idx:]
-        print(f"Processing all days starting from {all_days[0]} ({len(all_days)} days)\n")
+        print(f"Processing all days starting from {all_days[0]}\n")
 
     results = []
     all_predictions_data = []
-    replay_buffer = _build_initial_replay_buffer(
+    replay_buffer, replay_dist_stats = _build_initial_replay_buffer(
         dataset_path=dataset_path,
         replay_size=adapt_replay_size,
-        nonzero_threshold=adapt_nonzero_threshold,
-        low_threshold=adapt_low_threshold,
-        mid_threshold=adapt_mid_threshold,
-        low_ratio=adapt_low_ratio,
-        mid_ratio=adapt_mid_ratio,
     )
     if len(replay_buffer) > 0:
         print(f"Initialized replay buffer from Folsom with {len(replay_buffer)} samples")
+        print(
+            f"  Irradiance distribution: μ={replay_dist_stats['mean']:.2f}, σ={replay_dist_stats['std']:.2f}, max={replay_dist_stats['max']:.2f}\n"  # noqa: RUF001
+        )
 
     print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<4} {'SMAPE':<4} {'Samples':<8} {'Train Loss':<12}")
     print("-" * 100)
@@ -482,7 +521,7 @@ def run_local_training(
             )
 
         # Step 2: Train on current day to adapt the model
-        train_loss = train_on_day(
+        train_loss, replay_stats = train_on_day(
             model,
             dataset,
             day_indices,
@@ -492,20 +531,9 @@ def run_local_training(
             max_grad_norm=adapt_max_grad_norm,
             l2sp_lambda=adapt_l2sp_lambda,
             batch_size=adapt_batch_size,
-            low_threshold=adapt_low_threshold,
-            mid_threshold=adapt_mid_threshold,
             replay_samples=adapt_replay_samples,
-            nonzero_threshold=adapt_nonzero_threshold,
             device=device,
         )
-
-        # Update replay buffer with non-zero samples from current day
-        nonzero_day_samples = [
-            (dataset, idx) for idx in day_indices if _period_target_value(dataset._periods[idx]) >= adapt_nonzero_threshold
-        ]
-        replay_buffer.extend(nonzero_day_samples)
-        if adapt_replay_size > 0 and len(replay_buffer) > adapt_replay_size:
-            replay_buffer = replay_buffer[-adapt_replay_size:]
 
         results.append(
             {
@@ -513,6 +541,7 @@ def run_local_training(
                 "n_samples": n_samples,
                 "metrics": metrics,
                 "training_loss": float(train_loss),
+                "replay_stats": replay_stats,
             }
         )
 
@@ -521,6 +550,12 @@ def run_local_training(
             f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
             f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
             f"{metrics['count']:<8} {train_loss:.4f}"
+        )
+        print(
+            f"  Replay: n={replay_stats['count']:<4} "
+            f"μ_irr={replay_stats['mean_irradiance']:<7.2f} "
+            f"σ_irr={replay_stats['std_irradiance']:<7.2f} "  # noqa: RUF001
+            f"[{replay_stats['min_irradiance']:.2f}, {replay_stats['max_irradiance']:.2f}]"
         )
 
     # Compute overall metrics
@@ -569,24 +604,13 @@ def run_local_training(
     default="0101",
     help="Starting day in MMDD format (e.g., 0101)",
 )
-@click.option(
-    "--device",
-    type=str,
-    default="cuda",
-    help="Device to use (cuda or cpu)",
-)
 @click.option("--adapt-lr", type=float, default=1e-6, help="Learning rate for day adaptation")
 @click.option("--adapt-weight-decay", type=float, default=0.001, help="Weight decay for day adaptation")
 @click.option("--adapt-max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
 @click.option("--adapt-l2sp-lambda", type=float, default=1e-2, help="L2-SP anti-drift regularization coefficient")
-@click.option("--adapt-batch-size", type=int, default=10, help="Adaptation mini-batch size")
-@click.option("--adapt-low-ratio", type=float, default=0.3, help="Low regime ratio per mini-batch")
-@click.option("--adapt-mid-ratio", type=float, default=0.4, help="Mid regime ratio per mini-batch")
-@click.option("--adapt-low-threshold", type=float, default=0.01, help="Low regime target threshold")
-@click.option("--adapt-mid-threshold", type=float, default=0.1, help="Mid regime target threshold")
-@click.option("--adapt-replay-size", type=int, default=2000, help="Maximum replay buffer size")
-@click.option("--adapt-replay-samples", type=int, default=300, help="Replay samples drawn per day")
-@click.option("--adapt-nonzero-threshold", type=float, default=0.001, help="Replay non-zero target threshold")
+@click.option("--adapt-batch-size", type=int, default=32, help="Adaptation mini-batch size")
+@click.option("--adapt-replay-size", type=int, default=7000, help="Maximum replay buffer size")
+@click.option("--adapt-replay-samples", type=int, default=200, help="Replay samples drawn per day")
 @click.option(
     "--save-results",
     is_flag=True,
@@ -598,23 +622,18 @@ def main(
     dataset_path: Path,
     num_days: int,
     start_day: str,
-    device: str,
     adapt_lr: float,
     adapt_weight_decay: float,
     adapt_max_grad_norm: float,
     adapt_l2sp_lambda: float,
     adapt_batch_size: int,
-    adapt_low_ratio: float,
-    adapt_mid_ratio: float,
-    adapt_low_threshold: float,
-    adapt_mid_threshold: float,
     adapt_replay_size: int,
     adapt_replay_samples: int,
-    adapt_nonzero_threshold: float,
     save_results: bool,
 ) -> None:
     """Run local continual training simulation for solar irradiance forecasting."""
     dataset_name = dataset_path.name.split("_")[0]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     results, predictions_data, overall_metrics, per_day_metrics = run_local_training(
         checkpoint_path=checkpoint,
@@ -626,13 +645,8 @@ def main(
         adapt_max_grad_norm=adapt_max_grad_norm,
         adapt_l2sp_lambda=adapt_l2sp_lambda,
         adapt_batch_size=adapt_batch_size,
-        adapt_low_ratio=adapt_low_ratio,
-        adapt_mid_ratio=adapt_mid_ratio,
-        adapt_low_threshold=adapt_low_threshold,
-        adapt_mid_threshold=adapt_mid_threshold,
         adapt_replay_size=adapt_replay_size,
         adapt_replay_samples=adapt_replay_samples,
-        adapt_nonzero_threshold=adapt_nonzero_threshold,
         device=device,
     )
 
