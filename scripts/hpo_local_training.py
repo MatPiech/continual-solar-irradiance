@@ -67,7 +67,7 @@ def _build_sampler() -> optuna.samplers.BaseSampler:
 @click.option(
     "--output-csv",
     type=click.Path(dir_okay=False, path_type=Path),
-    default=Path("scripts/hpo_results.csv"),
+    default=Path("./hpo_results.csv"),
     show_default=True,
 )
 def main(
@@ -91,11 +91,11 @@ def main(
 
     def objective(trial: optuna.Trial) -> float:
         params: dict[str, Any] = {
-            "adapt_lr": trial.suggest_float("adapt_lr", 1e-5, 1e-2, log=True),
-            "adapt_weight_decay": trial.suggest_float("adapt_weight_decay", 1e-5, 1e-2, log=True),
+            "adapt_lr": trial.suggest_float("adapt_lr", 1e-6, 1e-4, log=True),
+            "adapt_weight_decay": trial.suggest_float("adapt_weight_decay", 1e-5, 0.3, log=True),
             "adapt_epochs": trial.suggest_int("adapt_epochs", 1, 5),
             "adapt_replay_buffer_size": trial.suggest_int("adapt_replay_buffer_size", 1000, 10000),
-            "adapt_replay_ratio": trial.suggest_float("adapt_replay_ratio", 0.25, 0.75),
+            "adapt_replay_ratio": trial.suggest_float("adapt_replay_ratio", 0.0, 4.0),
             "adapt_max_grad_norm": trial.suggest_float("adapt_max_grad_norm", 0.5, 5.0),
             "adapt_l2sp_lambda": trial.suggest_float("adapt_l2sp_lambda", 1e-6, 1e-1, log=True),
         }
