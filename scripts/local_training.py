@@ -9,6 +9,7 @@ Prevents overfitting through early stopping and gradient clipping.
 """
 
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 import random
 from typing import Any
@@ -138,6 +139,66 @@ def _build_initial_replay_buffer(
     return replay_buffer[:replay_size], distribution_stats
 
 
+def _sample_replay_for_day(
+    replay_buffer: list[tuple[Any, int]],
+    num_samples: int,
+    seed: int | None = None,
+) -> list[tuple[Any, int]]:
+    """Sample replay instances for a single day from the replay buffer.
+
+    Maintains the distribution of the replay buffer while providing different
+    samples for each day.
+
+    Parameters
+    ----------
+    replay_buffer : list[tuple[Any, int]]
+        Full replay buffer containing all candidate samples.
+    num_samples : int
+        Number of samples to draw for this day.
+    seed : int, optional
+        Random seed for reproducibility. If None, uses system randomness.
+
+    Returns
+    -------
+    sampled_replay : list[tuple[Any, int]]
+        Subset of replay samples for this day.
+    """
+    if num_samples <= 0 or len(replay_buffer) == 0:
+        return []
+
+    # Sample without replacement to ensure diversity across days
+    rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
+    selected_indices = rng.choice(len(replay_buffer), size=min(num_samples, len(replay_buffer)), replace=False)
+    return [replay_buffer[idx] for idx in selected_indices]
+
+
+def _compute_sample_distribution(samples: list[tuple[Any, int]]) -> dict[str, float]:
+    """Compute irradiance distribution statistics for a set of samples.
+
+    Parameters
+    ----------
+    samples : list[tuple[Any, int]]
+        List of (dataset_ref, sample_index) tuples.
+
+    Returns
+    -------
+    stats : dict[str, float]
+        Dictionary with mean, std, min, max irradiance values.
+    """
+    if len(samples) == 0:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+    irradiances = [_period_target_value(dataset._periods[idx]) for dataset, idx in samples]
+    irr_array = np.array(irradiances)
+
+    return {
+        "mean": float(np.mean(irr_array)),
+        "std": float(np.std(irr_array)),
+        "min": float(np.min(irr_array)),
+        "max": float(np.max(irr_array)),
+    }
+
+
 def load_model_and_data(
     checkpoint_path: Path,
     dataset_path: Path,
@@ -232,18 +293,19 @@ def train_on_day(
     model: Forecaster,
     dataset: Any,
     day_indices: list[int],
-    replay_buffer: list[tuple[Any, int]],
+    replay_samples: list[tuple[Any, int]],
     learning_rate: float,
     weight_decay: float,
     max_grad_norm: float,
     l2sp_lambda: float,
     batch_size: int,
-    replay_samples: int,
+    epochs: int,
     device: str,
-) -> float:
+    freeze_image_encoder: bool = False,
+) -> tuple[float, dict[str, Any]]:
     """Retrain model on all samples from a given day.
 
-    Combines current-day samples with distribution-matched replay samples.
+    Combines current-day samples with pre-sampled replay samples.
 
     Parameters
     ----------
@@ -253,8 +315,8 @@ def train_on_day(
         Dataset containing the periods.
     day_indices : list[int]
         Indices of samples to train on.
-    replay_buffer : list[tuple[Any, int]]
-        Candidate replay samples as (dataset_ref, sample_index) pairs.
+    replay_samples : list[tuple[Any, int]]
+        Pre-sampled replay samples as (dataset_ref, sample_index) pairs.
     learning_rate : float
         Learning rate for optimizer.
     weight_decay : float
@@ -265,10 +327,12 @@ def train_on_day(
         L2-SP anti-drift regularization coefficient.
     batch_size : int
         Mini-batch size for adaptation.
-    replay_samples : int
-        Number of replay samples to draw per day.
+    epochs : int
+        Number of training epochs to perform on the day's data.
     device : str
         Device to use for training.
+    freeze_image_encoder : bool, optional
+        If True, freeze the image encoder and only train the network head, by default False.
 
     Returns
     -------
@@ -283,44 +347,8 @@ def train_on_day(
     # Collect current day samples
     current_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
 
-    # Select replay samples to maintain distribution
-    if replay_samples > 0 and len(replay_buffer) > 0:
-        # Compute irradiance distribution from replay buffer
-        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_buffer]
-        replay_array = np.array(replay_irradiances)
-
-        # Create bins for distribution matching
-        n_bins = min(10, max(2, len(replay_buffer) // 20))
-        bin_edges = np.linspace(0, np.max(replay_array) + 1e-6, n_bins + 1)
-
-        # Partition replay buffer into bins
-        replay_bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
-        for sample, irr_val in zip(replay_buffer, replay_irradiances, strict=False):
-            bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
-            replay_bins[bin_idx].append(sample)
-
-        # Allocate replay samples according to replay buffer bin distribution
-        selected_replay: list[tuple[Any, int]] = []
-        total_replay_buffer = len(replay_buffer)
-        for bin_idx in range(n_bins):
-            bin_proportion = len(replay_bins[bin_idx]) / total_replay_buffer if total_replay_buffer > 0 else 0
-            target_quota = max(0, int(round(replay_samples * bin_proportion)))
-            if target_quota > 0 and replay_bins[bin_idx]:
-                selected_replay.extend(replay_bins[bin_idx][:target_quota])
-
-        # Fill remaining slots if needed
-        if len(selected_replay) < replay_samples:
-            remaining = [
-                s
-                for b_idx in range(n_bins)
-                for s in replay_bins[b_idx][len([x for x in selected_replay if x in replay_bins[b_idx]]) :]
-            ]
-            selected_replay.extend(remaining[: replay_samples - len(selected_replay)])
-
-        pooled_samples = current_samples + selected_replay[:replay_samples]
-    else:
-        pooled_samples = current_samples
-        selected_replay = []
+    # Combine current day samples with pre-sampled replay samples
+    pooled_samples = current_samples + replay_samples
 
     if len(pooled_samples) == 0:
         return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
@@ -333,6 +361,10 @@ def train_on_day(
 
     model.train()
 
+    # Freeze image encoder if requested
+    if freeze_image_encoder:
+        model.freeze_image_encoder()
+
     # Create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -344,44 +376,49 @@ def train_on_day(
     total_loss = 0.0
     batch_count = 0
 
-    # One pass over stratified mini-batches
-    for batch_indices in mini_batches:
-        samples = [sample_dataset[sample_idx] for sample_dataset, sample_idx in batch_indices]
-        images = torch.stack([sample[0] for sample in samples]).to(device)
-        irradiance_history = torch.stack([sample[1] for sample in samples]).to(device)
-        target = torch.stack([sample[2] for sample in samples]).to(device)
+    # Training loop over epochs
+    for __ in range(epochs):
+        # One pass over stratified mini-batches per epoch
+        for batch_indices in mini_batches:
+            samples = [sample_dataset[sample_idx] for sample_dataset, sample_idx in batch_indices]
+            images = torch.stack([sample[0] for sample in samples]).to(device)
+            irradiance_history = torch.stack([sample[1] for sample in samples]).to(device)
+            target = torch.stack([sample[2] for sample in samples]).to(device)
 
-        optimizer.zero_grad()
+            optimizer.zero_grad()
 
-        # Forward pass
-        pred_mean, pred_var = model(images, irradiance_history)
+            # Forward pass
+            pred_mean, pred_var = model(images, irradiance_history)
 
-        # Compute base loss
-        base_loss = model.loss_fn(pred_mean, target, pred_var) if pred_var is not None else model.loss_fn(pred_mean, target)
+            # Compute base loss
+            base_loss = (
+                model.loss_fn(pred_mean, target, pred_var) if pred_var is not None else model.loss_fn(pred_mean, target)
+            )
 
-        # L2-SP anti-drift penalty (distance to pre-adaptation weights)
-        l2sp_terms = []
-        for name, parameter in model.named_parameters():
-            if not parameter.requires_grad:
-                continue
-            reference_parameter = reference_parameters[name]
-            l2sp_terms.append(torch.mean((parameter - reference_parameter) ** 2))
+            # L2-SP anti-drift penalty (distance to pre-adaptation weights)
+            l2sp_terms = []
+            for name, parameter in model.named_parameters():
+                if not parameter.requires_grad:
+                    continue
+                reference_parameter = reference_parameters[name]
+                l2sp_terms.append(torch.mean((parameter - reference_parameter) ** 2))
 
-        l2sp_penalty = torch.stack(l2sp_terms).mean() if l2sp_terms else torch.tensor(0.0, device=device)
-        loss = base_loss + l2sp_lambda * l2sp_penalty
+            l2sp_penalty = torch.stack(l2sp_terms).mean() if l2sp_terms else torch.tensor(0.0, device=device)
+            loss = base_loss + l2sp_lambda * l2sp_penalty
 
-        # Backward pass with gradient clipping
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-        optimizer.step()
+            # Backward pass with gradient clipping
+            loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
 
-        total_loss += loss.item()
-        batch_count += 1
+            total_loss += loss.item()
+            batch_count += 1
 
     # Compute replay sample distribution statistics
-    replay_stats: dict[str, Any] = {"count": len(selected_replay)}
-    if len(selected_replay) > 0:
-        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in selected_replay]
+    replay_stats: dict[str, Any] = {"count": len(replay_samples)}
+    if len(replay_samples) > 0:
+        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_samples]
         replay_irr_array = np.array(replay_irradiances)
         replay_stats["mean_irradiance"] = float(np.mean(replay_irr_array))
         replay_stats["std_irradiance"] = float(np.std(replay_irr_array))
@@ -406,9 +443,13 @@ def run_local_training(
     adapt_max_grad_norm: float,
     adapt_l2sp_lambda: float,
     adapt_batch_size: int,
-    adapt_replay_size: int,
-    adapt_replay_samples: int,
+    adapt_epochs: int,
+    adapt_replay_buffer_size: int,
+    adapt_replay_ratio: float,
     device: str,
+    seed: int,
+    freeze_image_encoder: bool = False,
+    progress_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> dict[str, Any]:
     """Run continual local training simulation.
 
@@ -439,12 +480,18 @@ def run_local_training(
         L2-SP anti-drift regularization coefficient.
     adapt_batch_size : int
         Adaptation mini-batch size.
-    adapt_replay_size : int
+    adapt_epochs : int
+        Number of epochs to train on each day.
+    adapt_replay_buffer_size : int
         Maximum replay buffer size.
-    adapt_replay_samples : int
-        Replay samples drawn per day adaptation.
+    adapt_replay_ratio : float
+        Ratio of replay samples to current day samples (e.g., 0.1 means 10% of current day samples will be added from the replay buffer).
     device : str
         Device to use.
+    seed : int
+        Random seed for reproducibility.
+    freeze_image_encoder : bool, optional
+        If True, freeze the image encoder and only train the network head, by default False.
 
     Returns
     -------
@@ -482,18 +529,24 @@ def run_local_training(
     all_predictions_data = []
     replay_buffer, replay_dist_stats = _build_initial_replay_buffer(
         dataset_path=dataset_path,
-        replay_size=adapt_replay_size,
+        replay_size=adapt_replay_buffer_size,
     )
     if len(replay_buffer) > 0:
         print(f"Initialized replay buffer from Folsom with {len(replay_buffer)} samples")
         print(
             f"  Irradiance distribution: μ={replay_dist_stats['mean']:.2f}, σ={replay_dist_stats['std']:.2f}, max={replay_dist_stats['max']:.2f}\n"  # noqa: RUF001
         )
+        # Compute full replay buffer distribution for later comparison
+        full_buffer_dist = _compute_sample_distribution(replay_buffer)
+    else:
+        full_buffer_dist = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
-    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<4} {'SMAPE':<4} {'Samples':<8} {'Train Loss':<12}")
-    print("-" * 100)
+    print(
+        f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8} {'Train Loss':<12} {'Replay Dist Match':<18}"
+    )
+    print("-" * 130)
 
-    for day_key in all_days:
+    for day_idx, day_key in enumerate(all_days):
         day_indices = day_index_map.get(day_key, [])
 
         if len(day_indices) == 0:
@@ -520,19 +573,35 @@ def run_local_training(
                 }
             )
 
-        # Step 2: Train on current day to adapt the model
+        # Step 2: Sample replay for this day and train on current day to adapt the model
+        # Use a day-specific seed based on global seed and day index
+        day_seed = seed + day_idx if seed is not None else None
+
+        # Calculate number of replay samples based on ratio of current day samples
+        num_replay_samples = max(0, int(round(len(day_indices) * adapt_replay_ratio)))
+
+        day_replay_samples = _sample_replay_for_day(
+            replay_buffer,
+            num_replay_samples,
+            seed=day_seed,
+        )
+
+        # Compute sampled replay distribution
+        sampled_replay_dist = _compute_sample_distribution(day_replay_samples)
+
         train_loss, replay_stats = train_on_day(
             model,
             dataset,
             day_indices,
-            replay_buffer=replay_buffer,
+            replay_samples=day_replay_samples,
             learning_rate=adapt_lr,
             weight_decay=adapt_weight_decay,
             max_grad_norm=adapt_max_grad_norm,
             l2sp_lambda=adapt_l2sp_lambda,
             batch_size=adapt_batch_size,
-            replay_samples=adapt_replay_samples,
+            epochs=adapt_epochs,
             device=device,
+            freeze_image_encoder=freeze_image_encoder,
         )
 
         results.append(
@@ -545,18 +614,34 @@ def run_local_training(
             }
         )
 
+        # Calculate distribution match metrics
+        if len(full_buffer_dist) > 0 and full_buffer_dist["std"] > 0:
+            mean_diff_pct = (
+                100 * abs(sampled_replay_dist["mean"] - full_buffer_dist["mean"]) / (full_buffer_dist["mean"] + 1e-6)
+            )
+            std_diff_pct = 100 * abs(sampled_replay_dist["std"] - full_buffer_dist["std"]) / (full_buffer_dist["std"] + 1e-6)
+            dist_match_str = f"Δμ={mean_diff_pct:.1f}% Δσ={std_diff_pct:.1f}%"
+        else:
+            dist_match_str = "N/A"
+
         print(
             f"{day_key:<6} {metrics['mae']:<10.4f} "
             f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
             f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
-            f"{metrics['count']:<8} {train_loss:.4f}"
+            f"{metrics['count']:<8} {train_loss:<12.4f}  {dist_match_str:<16}"
         )
         print(
             f"  Replay: n={replay_stats['count']:<4} "
-            f"μ_irr={replay_stats['mean_irradiance']:<7.2f} "
-            f"σ_irr={replay_stats['std_irradiance']:<7.2f} "  # noqa: RUF001
+            f"μ={replay_stats['mean_irradiance']:<7.2f} "
+            f"σ={replay_stats['std_irradiance']:<7.2f} "  # noqa: RUF001
             f"[{replay_stats['min_irradiance']:.2f}, {replay_stats['max_irradiance']:.2f}]"
         )
+
+        if progress_callback is not None:
+            current_predictions = np.array([p["prediction"] for p in all_predictions_data])
+            current_targets = np.array([p["target"] for p in all_predictions_data])
+            current_metrics = compute_metrics(current_predictions, current_targets)
+            progress_callback(day_idx, current_metrics)
 
     # Compute overall metrics
     all_predictions = np.array([p["prediction"] for p in all_predictions_data])
@@ -606,11 +691,19 @@ def run_local_training(
 )
 @click.option("--adapt-lr", type=float, default=1e-6, help="Learning rate for day adaptation")
 @click.option("--adapt-weight-decay", type=float, default=0.001, help="Weight decay for day adaptation")
-@click.option("--adapt-max-grad-norm", type=float, default=1.0, help="Gradient clipping max norm")
+@click.option("--adapt-max-grad-norm", type=float, default=-1.0, help="Gradient clipping max norm, -1 means no clipping")
 @click.option("--adapt-l2sp-lambda", type=float, default=1e-2, help="L2-SP anti-drift regularization coefficient")
 @click.option("--adapt-batch-size", type=int, default=32, help="Adaptation mini-batch size")
-@click.option("--adapt-replay-size", type=int, default=7000, help="Maximum replay buffer size")
-@click.option("--adapt-replay-samples", type=int, default=200, help="Replay samples drawn per day")
+@click.option("--adapt-epochs", type=int, default=1, help="Number of epochs to train on each day")
+@click.option("--adapt-replay-buffer-size", type=int, default=7000, help="Maximum replay buffer size")
+@click.option("--adapt-replay-ratio", type=float, default=0.1, help="Ratio of replay samples relative to current day samples")
+@click.option("--seed", type=int, default=42, help="Random seed for reproducibility")
+@click.option(
+    "--freeze-image-encoder",
+    is_flag=True,
+    default=False,
+    help="Freeze image encoder and only train network head",
+)
 @click.option(
     "--save-results",
     is_flag=True,
@@ -627,11 +720,22 @@ def main(
     adapt_max_grad_norm: float,
     adapt_l2sp_lambda: float,
     adapt_batch_size: int,
-    adapt_replay_size: int,
-    adapt_replay_samples: int,
+    adapt_epochs: int,
+    adapt_replay_buffer_size: int,
+    adapt_replay_ratio: float,
+    seed: int,
+    freeze_image_encoder: bool,
     save_results: bool,
 ) -> None:
     """Run local continual training simulation for solar irradiance forecasting."""
+    # Set all random seeds for reproducibility
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
     dataset_name = dataset_path.name.split("_")[0]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -645,9 +749,12 @@ def main(
         adapt_max_grad_norm=adapt_max_grad_norm,
         adapt_l2sp_lambda=adapt_l2sp_lambda,
         adapt_batch_size=adapt_batch_size,
-        adapt_replay_size=adapt_replay_size,
-        adapt_replay_samples=adapt_replay_samples,
+        adapt_epochs=adapt_epochs,
+        adapt_replay_buffer_size=adapt_replay_buffer_size,
+        adapt_replay_ratio=adapt_replay_ratio,
         device=device,
+        seed=seed,
+        freeze_image_encoder=freeze_image_encoder,
     )
 
     print(f"\n{'='*78}")
@@ -655,22 +762,12 @@ def main(
     print(f"{'='*78}\n")
 
     print("Overall Metrics:")
-    print(f"  MAE:   {overall_metrics['mae']:.4f}")
-    print(f"  RMSE:  {overall_metrics['rmse']:.4f}")
+    print(f"  MAE:   {overall_metrics['mae']:.7f}")
+    print(f"  RMSE:  {overall_metrics['rmse']:.7f}")
     print(f"  MAPE:  {overall_metrics['mape']:.2%}")
     print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
     print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
     print(f"  Samples: {overall_metrics['count']}\n")
-
-    print("Per-Day Metrics:")
-    print(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}")
-    print("-" * 78)
-    for day_key, metrics in per_day_metrics.items():
-        print(
-            f"{day_key:<6} {metrics['mae']:<10.4f} {metrics['rmse']:<10.4f} "
-            f"{metrics['mape']:<16.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
-            f"{metrics['count']:<8}"
-        )
 
     # Save results if requested
     if save_results:
@@ -690,9 +787,9 @@ def main(
             f.write("=" * 78 + "\n\n")
 
             f.write("Overall Metrics:\n")
-            f.write(f"  MAE:   {overall_metrics['mae']:.4f}\n")
-            f.write(f"  RMSE:  {overall_metrics['rmse']:.4f}\n")
-            f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
+            f.write(f"  MAE:   {overall_metrics['mae']:.7f}\n")
+            f.write(f"  RMSE:  {overall_metrics['rmse']:.7f}\n")
+            f.write(f"  MAPE:  {overall_metrics['mape']:.2f}%\n")
             f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
             f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
             f.write(f"  Samples: {overall_metrics['count']}\n\n")

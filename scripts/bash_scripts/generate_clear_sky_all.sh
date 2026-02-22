@@ -31,8 +31,8 @@ python scripts/clear_sky.py \
 
 echo -e "\n[3/8] Poznan, Poland"
 python scripts/clear_sky.py \
-    --latitude 52.4064 \
-    --longitude 16.9252 \
+    --latitude 52.4031 \
+    --longitude 16.9539 \
     --timezone "Europe/Warsaw" \
     --start "2024-10-18 00:00:00" \
     --end "2025-07-12 23:59:00" \
@@ -40,8 +40,8 @@ python scripts/clear_sky.py \
 
 echo -e "\n[4/8] Karpicko, Poland"
 python scripts/clear_sky.py \
-    --latitude 52.7500 \
-    --longitude 16.3333 \
+    --latitude 52.1294 \
+    --longitude 16.1231 \
     --timezone "Europe/Warsaw" \
     --start "2024-09-01 00:00:00" \
     --end "2025-11-08 23:59:00" \

@@ -71,6 +71,16 @@ class Forecaster(pl.LightningModule):
 
         self.save_hyperparameters()
 
+    def freeze_image_encoder(self) -> None:
+        """Freeze all parameters in the image encoder."""
+        for param in self.image_encoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_image_encoder(self) -> None:
+        """Unfreeze all parameters in the image encoder."""
+        for param in self.image_encoder.parameters():
+            param.requires_grad = True
+
     def _configure_loss(self, loss_name):
         """Factory method to get the correct loss function."""
         if loss_name == "GNLL":
