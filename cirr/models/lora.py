@@ -120,13 +120,164 @@ class LoRALinear(nn.Module):
         return total
 
 
+class LoRAConv2d(nn.Module):
+    """Conv2d layer with Low-Rank Adaptation.
+
+    For convolutional layers, LoRA decomposes the weight update as:
+        h = W_0 * x + (B * A) * x
+    where:
+        - W_0 ∈ R^{out_ch x in_ch x k x k} is frozen (original conv weights)
+        - A ∈ R^{r x in_ch x 1 x 1} (pointwise convolution for dimensionality reduction)
+        - B ∈ R^{out_ch x r x 1 x 1} (pointwise convolution for dimensionality expansion)
+        - r is the rank (r << min(in_ch, out_ch))
+
+    This allows efficient adaptation of convolutional feature extractors.
+
+    Parameters
+    ----------
+    original_layer : nn.Conv2d
+        The original convolutional layer to adapt.
+    rank : int
+        Rank of the low-rank decomposition. Lower rank = fewer parameters.
+    alpha : float, optional
+        Scaling factor for LoRA outputs, by default 1.0.
+    """
+
+    def __init__(
+        self,
+        original_layer: nn.Conv2d,
+        rank: int = 4,
+        alpha: float = 1.0,
+    ):
+        super().__init__()
+
+        self.in_channels = original_layer.in_channels
+        self.out_channels = original_layer.out_channels
+        self.kernel_size = original_layer.kernel_size
+        self.stride = original_layer.stride
+        self.padding = original_layer.padding
+        self.dilation = original_layer.dilation
+        self.groups = original_layer.groups
+        self.rank = rank
+        self.alpha = alpha
+
+        # Freeze original weights
+        self.weight = original_layer.weight
+        self.weight.requires_grad = False
+
+        # Handle bias
+        if original_layer.bias is not None:
+            self.bias = original_layer.bias
+            self.bias.requires_grad = False
+        else:
+            self.register_parameter("bias", None)
+
+        # LoRA trainable parameters (1x1 convolutions for efficiency)
+        # A: projects channels to low-rank space (in_channels -> rank)
+        # B: projects from low-rank space to output (rank -> out_channels)
+        self.lora_A = nn.Parameter(torch.zeros(rank, self.in_channels, 1, 1))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_channels, rank, 1, 1))
+
+        # Initialize A with Kaiming uniform (like nn.Conv2d default)
+        # Initialize B with zeros (so initially LoRA contributes nothing)
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        nn.init.zeros_(self.lora_B)
+
+        # Scaling factor
+        self.scaling = self.alpha / self.rank
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass combining frozen weights and LoRA adaptation.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch, in_channels, height, width)
+
+        Returns
+        -------
+        output : torch.Tensor
+            Output tensor of shape (batch, out_channels, height', width')
+        """
+        # Original forward pass (frozen)
+        result = nn.functional.conv2d(
+            x,
+            self.weight,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+
+        # LoRA adaptation: Apply A (1x1 conv) with original stride/padding to match spatial dims
+        # Then apply B (1x1 conv) with no additional spatial transformation
+        lora_out = nn.functional.conv2d(
+            x,
+            self.lora_A,
+            stride=self.stride,
+            padding=0,  # 1x1 conv doesn't need padding
+        )
+        lora_out = nn.functional.conv2d(
+            lora_out,
+            self.lora_B,
+            stride=1,  # No additional downsampling
+            padding=0,
+        )
+        result = result + lora_out * self.scaling
+
+        return result
+
+    def merge_weights(self) -> None:
+        """Merge LoRA weights into the original layer.
+
+        For Conv2d, this expands the 1x1 LoRA convolutions to match the original kernel size.
+        """
+        if self.rank > 0:
+            # Compute effective LoRA kernel: B @ A
+            # This requires expanding to full kernel size
+            lora_weight = torch.zeros_like(self.weight)
+
+            # For 1x1 LoRA on arbitrary kernel: contribution is centered
+            k_h, k_w = self.kernel_size
+            pad_h = k_h // 2
+            pad_w = k_w // 2
+
+            # Compute B @ A (both are 1x1, result is 1x1)
+            ba = self.lora_B.squeeze(-1).squeeze(-1) @ self.lora_A.squeeze(-1).squeeze(-1)
+            # Place in center of kernel
+            lora_weight[:, :, pad_h, pad_w] = ba
+
+            self.weight.data += self.scaling * lora_weight
+
+            # Reset LoRA matrices
+            nn.init.zeros_(self.lora_A)
+            nn.init.zeros_(self.lora_B)
+
+    def num_trainable_parameters(self) -> int:
+        """Return the number of trainable parameters in LoRA matrices."""
+        # A: rank x in_channels x 1 x 1
+        # B: out_channels x rank x 1 x 1
+        return self.rank * (self.in_channels + self.out_channels)
+
+    def num_total_parameters(self) -> int:
+        """Return the total number of parameters (frozen + trainable)."""
+        k_h, k_w = self.kernel_size
+        total = self.in_channels * self.out_channels * k_h * k_w
+        if self.bias is not None:
+            total += self.out_channels
+        total += self.num_trainable_parameters()
+        return total
+
+
 def replace_linear_with_lora(
     module: nn.Module,
     rank: int = 4,
     alpha: float = 1.0,
     target_modules: list[str] | None = None,
+    replace_conv2d: bool = False,
 ) -> nn.Module:
-    """Replace nn.Linear layers in a module with LoRALinear layers.
+    """Replace nn.Linear (and optionally nn.Conv2d) layers with LoRA versions.
 
     Parameters
     ----------
@@ -137,8 +288,9 @@ def replace_linear_with_lora(
     alpha : float, optional
         Scaling factor for LoRA, by default 1.0.
     target_modules : list[str], optional
-        List of module names to replace. If None, replaces all nn.Linear layers.
-        Use this to target specific layers (e.g., ['network_head.0', 'network_head.2']).
+        List of module names to replace. If None, replaces all matching layer types.
+    replace_conv2d : bool, optional
+        Whether to also replace Conv2d layers (for CNN encoders), by default False.
 
     Returns
     -------
@@ -152,9 +304,16 @@ def replace_linear_with_lora(
                 # Replace with LoRA version
                 lora_layer = LoRALinear(child, rank=rank, alpha=alpha)
                 setattr(module, name, lora_layer)
+        elif isinstance(child, nn.Conv2d) and replace_conv2d:
+            # Replace Conv2d layers if requested (for CNNs like ResNet)
+            if (target_modules is None or name in target_modules) and (child.groups == 1 or child.groups == child.in_channels):
+                lora_layer = LoRAConv2d(child, rank=rank, alpha=alpha)
+                setattr(module, name, lora_layer)
         else:
             # Recursively apply to nested modules
-            replace_linear_with_lora(child, rank=rank, alpha=alpha, target_modules=target_modules)
+            replace_linear_with_lora(
+                child, rank=rank, alpha=alpha, target_modules=target_modules, replace_conv2d=replace_conv2d
+            )
 
     return module
 
@@ -207,23 +366,24 @@ def print_lora_info(module: nn.Module) -> None:
     """
     print("\nLoRA Layer Information:")
     print("-" * 80)
-    print(f"{'Layer Name':<40} {'Rank':<6} {'Trainable':<12} {'Total':<12}")
+    print(f"{'Layer Name':<40} {'Type':<8} {'Rank':<6} {'Trainable':<12} {'Total':<12}")
     print("-" * 80)
 
     total_trainable = 0
     total_params = 0
 
     for name, layer in module.named_modules():
-        if isinstance(layer, LoRALinear):
+        if isinstance(layer, LoRALinear | LoRAConv2d):
+            layer_type = "Linear" if isinstance(layer, LoRALinear) else "Conv2d"
             trainable = layer.num_trainable_parameters()
             total = layer.num_total_parameters()
             total_trainable += trainable
             total_params += total
-            print(f"{name:<40} {layer.rank:<6} {trainable:<12,} {total:<12,}")
+            print(f"{name:<40} {layer_type:<8} {layer.rank:<6} {trainable:<12,} {total:<12,}")
 
     if total_params > 0:
         print("-" * 80)
-        print(f"{'TOTAL':<40} {'':<6} {total_trainable:<12,} {total_params:<12,}")
+        print(f"{'TOTAL':<40} {'':<8} {'':<6} {total_trainable:<12,} {total_params:<12,}")
         print(f"\nParameter Efficiency: {total_trainable/total_params*100:.4f}% trainable")
     else:
         print("No LoRA layers found.")
