@@ -206,6 +206,11 @@ def load_model_and_data(
     use_lora: bool = False,
     lora_rank: int = 4,
     lora_alpha: float = 1.0,
+    use_dual_lora: bool = False,
+    encoder_rank: int = 4,
+    head_rank: int = 8,
+    encoder_alpha: float = 16.0,
+    head_alpha: float = 16.0,
 ) -> tuple[Forecaster, dict[str, list[int]], Any]:
     """Load pretrained model and dataset.
 
@@ -218,11 +223,22 @@ def load_model_and_data(
     device : str
         Device to use ('cuda' or 'cpu').
     use_lora : bool, optional
-        Whether to apply LoRA to the model, by default False.
+        Whether to apply LoRA to head only, by default False.
     lora_rank : int, optional
-        Rank for LoRA decomposition, by default 4.
+        Rank for head-only LoRA decomposition, by default 4.
     lora_alpha : float, optional
-        LoRA scaling factor, by default 1.0.
+        Scaling factor for head-only LoRA, by default 1.0.
+    use_dual_lora : bool, optional
+        Whether to apply dual-LoRA (encoder + head), by default False.
+        Takes precedence over use_lora if both are True.
+    encoder_rank : int, optional
+        Rank for encoder LoRA (dual-LoRA only), by default 4.
+    head_rank : int, optional
+        Rank for head LoRA (dual-LoRA only), by default 8.
+    encoder_alpha : float, optional
+        Scaling factor for encoder LoRA (dual-LoRA only), by default 16.0.
+    head_alpha : float, optional
+        Scaling factor for head LoRA (dual-LoRA only), by default 16.0.
 
     Returns
     -------
@@ -245,9 +261,17 @@ def load_model_and_data(
     checkpoint_data = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint_data["state_dict"])
 
-    # Apply LoRA if requested
-    if use_lora:
-        print(f"\nApplying LoRA with rank={lora_rank}, alpha={lora_alpha}")
+    # Apply LoRA (dual-LoRA takes precedence)
+    if use_dual_lora:
+        model.apply_dual_lora(
+            encoder_rank=encoder_rank,
+            head_rank=head_rank,
+            encoder_alpha=encoder_alpha,
+            head_alpha=head_alpha,
+        )
+        model.freeze_all_except_lora()
+    elif use_lora:
+        print(f"\nApplying head-only LoRA with rank={lora_rank}, alpha={lora_alpha}")
         model.apply_lora_to_head(rank=lora_rank, alpha=lora_alpha)
         model.freeze_all_except_lora()
         print("Frozen entire network except LoRA parameters\n")
@@ -320,6 +344,9 @@ def train_on_day(
     device: str,
     freeze_image_encoder: bool = False,
     use_lora: bool = False,
+    use_dual_lora: bool = False,
+    encoder_lr: float | None = None,
+    head_lr: float | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Retrain model on all samples from a given day.
 
@@ -336,7 +363,7 @@ def train_on_day(
     replay_samples : list[tuple[Any, int]]
         Pre-sampled replay samples as (dataset_ref, sample_index) pairs.
     learning_rate : float
-        Learning rate for optimizer.
+        Learning rate for optimizer (used for head-only LoRA or legacy modes).
     weight_decay : float
         AdamW weight decay.
     max_grad_norm : float
@@ -351,9 +378,15 @@ def train_on_day(
         Device to use for training.
     freeze_image_encoder : bool, optional
         If True, freeze the image encoder and only train the network head, by default False.
-        Note: Ignored when use_lora=True, as LoRA freezes the entire network.
+        Note: Ignored when use_lora=True or use_dual_lora=True.
     use_lora : bool, optional
-        If True, only LoRA parameters are trainable (extreme parameter efficiency), by default False.
+        If True, only head LoRA parameters are trainable, by default False.
+    use_dual_lora : bool, optional
+        If True, both encoder and head LoRA parameters are trainable, by default False.
+    encoder_lr : float, optional
+        Learning rate for encoder LoRA (dual-LoRA only), by default None.
+    head_lr : float, optional
+        Learning rate for head LoRA (dual-LoRA only), by default None.
 
     Returns
     -------
@@ -382,8 +415,8 @@ def train_on_day(
 
     model.train()
 
-    # Apply freezing strategy based on use_lora
-    if use_lora:
+    # Apply freezing strategy based on use_lora/use_dual_lora
+    if use_dual_lora or use_lora:
         # LoRA: entire network is frozen except LoRA parameters
         # This is already done in load_model_and_data via freeze_all_except_lora()
         pass
@@ -391,10 +424,16 @@ def train_on_day(
         # Legacy mode: freeze only the image encoder
         model.freeze_image_encoder()
 
-    # Create optimizer (only trainable parameters will be optimized)
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay
-    )
+    # Create optimizer with asymmetric learning rates for dual-LoRA
+    if use_dual_lora and encoder_lr is not None and head_lr is not None:
+        # Dual-LoRA: use separate learning rates for encoder and head
+        param_groups = model.get_lora_param_groups(encoder_lr=encoder_lr, head_lr=head_lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(param_groups)
+    else:
+        # Single learning rate for all trainable parameters
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay
+        )
 
     # Snapshot trainable parameters for L2-SP anti-drift regularization
     reference_parameters = {
@@ -480,6 +519,13 @@ def run_local_training(
     use_lora: bool = False,
     lora_rank: int = 4,
     lora_alpha: float = 1.0,
+    use_dual_lora: bool = False,
+    encoder_rank: int = 4,
+    head_rank: int = 8,
+    encoder_alpha: float = 16.0,
+    head_alpha: float = 16.0,
+    encoder_lr: float = 1e-5,
+    head_lr: float = 1e-4,
     progress_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> dict[str, Any]:
     """Run continual local training simulation.
@@ -502,7 +548,7 @@ def run_local_training(
     start_day : str
         Starting day in MMDD format.
     adapt_lr : float
-        Learning rate for day adaptation.
+        Learning rate for day adaptation (head-only LoRA or legacy modes).
     adapt_weight_decay : float
         Weight decay for day adaptation optimizer.
     adapt_max_grad_norm : float
@@ -523,13 +569,28 @@ def run_local_training(
         Random seed for reproducibility.
     freeze_image_encoder : bool, optional
         If True, freeze the image encoder and only train the network head, by default False.
-        Note: Ignored when use_lora=True.
+        Note: Ignored when use_lora=True or use_dual_lora=True.
     use_lora : bool, optional
-        If True, use LoRA for extreme parameter efficiency, by default False.
+        If True, use head-only LoRA, by default False.
     lora_rank : int, optional
-        Rank for LoRA decomposition (only used if use_lora=True), by default 4.
+        Rank for head-only LoRA decomposition, by default 4.
     lora_alpha : float, optional
-        LoRA scaling factor (only used if use_lora=True), by default 1.0.
+        Scaling factor for head-only LoRA, by default 1.0.
+    use_dual_lora : bool, optional
+        If True, use dual-LoRA (encoder + head), by default False.
+        Takes precedence over use_lora.
+    encoder_rank : int, optional
+        Rank for encoder LoRA (dual-LoRA only), by default 4.
+    head_rank : int, optional
+        Rank for head LoRA (dual-LoRA only), by default 8.
+    encoder_alpha : float, optional
+        Scaling factor for encoder LoRA (dual-LoRA only), by default 16.0.
+    head_alpha : float, optional
+        Scaling factor for head LoRA (dual-LoRA only), by default 16.0.
+    encoder_lr : float, optional
+        Learning rate for encoder LoRA (dual-LoRA only), by default 1e-5.
+    head_lr : float, optional
+        Learning rate for head LoRA (dual-LoRA only), by default 1e-4.
 
     Returns
     -------
@@ -550,6 +611,11 @@ def run_local_training(
         use_lora=use_lora,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        use_dual_lora=use_dual_lora,
+        encoder_rank=encoder_rank,
+        head_rank=head_rank,
+        encoder_alpha=encoder_alpha,
+        head_alpha=head_alpha,
     )
 
     print(f"Dataset size: {len(dataset._periods)} samples")
@@ -648,6 +714,9 @@ def run_local_training(
             device=device,
             freeze_image_encoder=freeze_image_encoder,
             use_lora=use_lora,
+            use_dual_lora=use_dual_lora,
+            encoder_lr=encoder_lr if use_dual_lora else None,
+            head_lr=head_lr if use_dual_lora else None,
         )
 
         results.append(
@@ -766,7 +835,49 @@ def run_local_training(
     "--lora-alpha",
     type=float,
     default=1.0,
-    help="LoRA scaling factor",
+    help="LoRA scaling factor (head-only LoRA)",
+)
+@click.option(
+    "--use-dual-lora",
+    is_flag=True,
+    default=False,
+    help="Use Dual-LoRA (encoder + head) with asymmetric bottlenecking for handling seasonal drift",
+)
+@click.option(
+    "--encoder-rank",
+    type=int,
+    default=4,
+    help="Encoder LoRA rank (dual-LoRA only). Very low (2-4) prevents memorization. Default: 4",
+)
+@click.option(
+    "--head-rank",
+    type=int,
+    default=8,
+    help="Head LoRA rank (dual-LoRA only). Moderate (8-16) for final mapping. Default: 8",
+)
+@click.option(
+    "--encoder-alpha",
+    type=float,
+    default=16.0,
+    help="Encoder LoRA scaling factor (dual-LoRA only). Default: 16.0",
+)
+@click.option(
+    "--head-alpha",
+    type=float,
+    default=16.0,
+    help="Head LoRA scaling factor (dual-LoRA only). Default: 16.0",
+)
+@click.option(
+    "--encoder-lr",
+    type=float,
+    default=1e-5,
+    help="Encoder LoRA learning rate (dual-LoRA only). Recommended: 1e-5. Default: 1e-5",
+)
+@click.option(
+    "--head-lr",
+    type=float,
+    default=1e-4,
+    help="Head LoRA learning rate (dual-LoRA only). Recommended: 1e-4 (10x encoder_lr). Default: 1e-4",
 )
 @click.option(
     "--save-results",
@@ -792,6 +903,13 @@ def main(
     use_lora: bool,
     lora_rank: int,
     lora_alpha: float,
+    use_dual_lora: bool,
+    encoder_rank: int,
+    head_rank: int,
+    encoder_alpha: float,
+    head_alpha: float,
+    encoder_lr: float,
+    head_lr: float,
     save_results: bool,
 ) -> None:
     """Run local continual training simulation for solar irradiance forecasting."""
@@ -825,6 +943,13 @@ def main(
         use_lora=use_lora,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        use_dual_lora=use_dual_lora,
+        encoder_rank=encoder_rank,
+        head_rank=head_rank,
+        encoder_alpha=encoder_alpha,
+        head_alpha=head_alpha,
+        encoder_lr=encoder_lr,
+        head_lr=head_lr,
     )
 
     print(f"\n{'='*78}")
@@ -842,7 +967,12 @@ def main(
     # Save results if requested
     if save_results:
         # Add LoRA info to filename if used
-        suffix = f"_lora_r{lora_rank}" if use_lora else ""
+        if use_dual_lora:
+            suffix = f"_dual_lora_e{encoder_rank}_h{head_rank}"
+        elif use_lora:
+            suffix = f"_lora_r{lora_rank}"
+        else:
+            suffix = ""
         results_file = f"{dataset_name}_local_training{suffix}_results.txt"
         predictions_file = f"{dataset_name}_local_training{suffix}_predictions.csv"
 
@@ -856,7 +986,11 @@ def main(
             f.write(f"Local Training Results: {dataset_name}\n")
             f.write(f"Checkpoint: {checkpoint}\n")
             f.write(f"Dataset: {dataset_path}\n")
-            if use_lora:
+            if use_dual_lora:
+                f.write("Dual-LoRA Configuration:\n")
+                f.write(f"  Encoder: rank={encoder_rank}, alpha={encoder_alpha}, lr={encoder_lr}\n")
+                f.write(f"  Head:    rank={head_rank}, alpha={head_alpha}, lr={head_lr}\n")
+            elif use_lora:
                 f.write(f"LoRA: rank={lora_rank}, alpha={lora_alpha}\n")
             f.write("=" * 78 + "\n\n")
 
