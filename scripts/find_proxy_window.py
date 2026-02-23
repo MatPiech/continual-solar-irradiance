@@ -2,7 +2,7 @@ import click
 import pandas as pd
 
 
-def find_optimal_proxy_window(df, window_size=45, ghi_col="ghi", clear_ghi_col="ghi_clear"):
+def find_optimal_proxy_window(df, window_size, ghi_col, clear_ghi_col):
     """
     Identifies the most volatile N-day window in an irradiance dataset
     based on the variance of the Clear Sky Index (k_c).
@@ -73,7 +73,7 @@ def normalize_mixed_timezone(series, local_tz):
     return parsed
 
 
-def load_folsom_data(irradiance_path, clear_sky_path, local_tz):
+def load_data(irradiance_path, clear_sky_path, local_tz, ghi_col, clear_ghi_col):
     irradiance = pd.read_csv(irradiance_path)
     clear_sky = pd.read_csv(clear_sky_path)
 
@@ -83,17 +83,14 @@ def load_folsom_data(irradiance_path, clear_sky_path, local_tz):
     clear_sky["datetime"] = normalize_mixed_timezone(clear_sky["datetime"], local_tz)
     clear_sky = clear_sky.dropna(subset=["datetime"])
 
-    irradiance = irradiance.rename(columns={"ghi": "ghi"})
-    clear_sky = clear_sky.rename(columns={"ghi_clear": "ghi_clear"})
-
     merged = pd.merge(
-        irradiance[["datetime", "ghi"]],
-        clear_sky[["datetime", "ghi_clear"]],
+        irradiance[["datetime", ghi_col]].rename(columns={ghi_col: ghi_col}),
+        clear_sky[["datetime", clear_ghi_col]].rename(columns={clear_ghi_col: "ghi_clear"}),
         on="datetime",
         how="inner",
     )
 
-    merged = merged.dropna(subset=["ghi", "ghi_clear"])
+    merged = merged.dropna(subset=[ghi_col, "ghi_clear"])
     merged = merged.sort_values("datetime")
     merged = merged.set_index("datetime")
 
@@ -119,7 +116,7 @@ def load_folsom_data(irradiance_path, clear_sky_path, local_tz):
 @click.option("--local-tz", default="US/Pacific", show_default=True)
 def main(irradiance_csv, clear_sky_csv, window_days, ghi_col, clear_ghi_col, local_tz):
     """Find optimal 45-day proxy window using irradiance and clear-sky CSVs."""
-    df = load_folsom_data(irradiance_csv, clear_sky_csv, local_tz)
+    df = load_data(irradiance_csv, clear_sky_csv, local_tz, ghi_col=ghi_col, clear_ghi_col=clear_ghi_col)
 
     if ghi_col not in df.columns or clear_ghi_col not in df.columns:
         raise click.UsageError(f"Missing required columns: {ghi_col} or {clear_ghi_col}.")

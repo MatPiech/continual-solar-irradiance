@@ -203,6 +203,9 @@ def load_model_and_data(
     checkpoint_path: Path,
     dataset_path: Path,
     device: str,
+    use_lora: bool = False,
+    lora_rank: int = 4,
+    lora_alpha: float = 1.0,
 ) -> tuple[Forecaster, dict[str, list[int]], Any]:
     """Load pretrained model and dataset.
 
@@ -214,6 +217,12 @@ def load_model_and_data(
         Path to prepared dataset directory containing periods.pickle.
     device : str
         Device to use ('cuda' or 'cpu').
+    use_lora : bool, optional
+        Whether to apply LoRA to the model, by default False.
+    lora_rank : int, optional
+        Rank for LoRA decomposition, by default 4.
+    lora_alpha : float, optional
+        LoRA scaling factor, by default 1.0.
 
     Returns
     -------
@@ -235,6 +244,14 @@ def load_model_and_data(
     )
     checkpoint_data = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint_data["state_dict"])
+
+    # Apply LoRA if requested
+    if use_lora:
+        print(f"\nApplying LoRA with rank={lora_rank}, alpha={lora_alpha}")
+        model.apply_lora_to_head(rank=lora_rank, alpha=lora_alpha)
+        model.freeze_all_except_lora()
+        print("Frozen entire network except LoRA parameters\n")
+
     model = model.to(device)
 
     # Load dataset
@@ -302,6 +319,7 @@ def train_on_day(
     epochs: int,
     device: str,
     freeze_image_encoder: bool = False,
+    use_lora: bool = False,
 ) -> tuple[float, dict[str, Any]]:
     """Retrain model on all samples from a given day.
 
@@ -333,6 +351,9 @@ def train_on_day(
         Device to use for training.
     freeze_image_encoder : bool, optional
         If True, freeze the image encoder and only train the network head, by default False.
+        Note: Ignored when use_lora=True, as LoRA freezes the entire network.
+    use_lora : bool, optional
+        If True, only LoRA parameters are trainable (extreme parameter efficiency), by default False.
 
     Returns
     -------
@@ -361,12 +382,19 @@ def train_on_day(
 
     model.train()
 
-    # Freeze image encoder if requested
-    if freeze_image_encoder:
+    # Apply freezing strategy based on use_lora
+    if use_lora:
+        # LoRA: entire network is frozen except LoRA parameters
+        # This is already done in load_model_and_data via freeze_all_except_lora()
+        pass
+    elif freeze_image_encoder:
+        # Legacy mode: freeze only the image encoder
         model.freeze_image_encoder()
 
-    # Create optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # Create optimizer (only trainable parameters will be optimized)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay
+    )
 
     # Snapshot trainable parameters for L2-SP anti-drift regularization
     reference_parameters = {
@@ -449,6 +477,9 @@ def run_local_training(
     device: str,
     seed: int,
     freeze_image_encoder: bool = False,
+    use_lora: bool = False,
+    lora_rank: int = 4,
+    lora_alpha: float = 1.0,
     progress_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> dict[str, Any]:
     """Run continual local training simulation.
@@ -492,6 +523,13 @@ def run_local_training(
         Random seed for reproducibility.
     freeze_image_encoder : bool, optional
         If True, freeze the image encoder and only train the network head, by default False.
+        Note: Ignored when use_lora=True.
+    use_lora : bool, optional
+        If True, use LoRA for extreme parameter efficiency, by default False.
+    lora_rank : int, optional
+        Rank for LoRA decomposition (only used if use_lora=True), by default 4.
+    lora_alpha : float, optional
+        LoRA scaling factor (only used if use_lora=True), by default 1.0.
 
     Returns
     -------
@@ -505,7 +543,14 @@ def run_local_training(
         Per-day metrics with MMDD as keys.
     """
     print(f"Loading model from {checkpoint_path}...")
-    model, day_index_map, dataset = load_model_and_data(checkpoint_path, dataset_path, device=device)
+    model, day_index_map, dataset = load_model_and_data(
+        checkpoint_path,
+        dataset_path,
+        device=device,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+    )
 
     print(f"Dataset size: {len(dataset._periods)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
@@ -602,6 +647,7 @@ def run_local_training(
             epochs=adapt_epochs,
             device=device,
             freeze_image_encoder=freeze_image_encoder,
+            use_lora=use_lora,
         )
 
         results.append(
@@ -702,7 +748,25 @@ def run_local_training(
     "--freeze-image-encoder",
     is_flag=True,
     default=False,
-    help="Freeze image encoder and only train network head",
+    help="Freeze image encoder and only train network head (ignored if --use-lora is set)",
+)
+@click.option(
+    "--use-lora",
+    is_flag=True,
+    default=False,
+    help="Use LoRA for extreme parameter efficiency (freezes entire network except LoRA params)",
+)
+@click.option(
+    "--lora-rank",
+    type=int,
+    default=4,
+    help="LoRA rank (lower = fewer trainable params). Typical: 1-8 for extreme efficiency, 16-64 for moderate",
+)
+@click.option(
+    "--lora-alpha",
+    type=float,
+    default=1.0,
+    help="LoRA scaling factor",
 )
 @click.option(
     "--save-results",
@@ -725,6 +789,9 @@ def main(
     adapt_replay_ratio: float,
     seed: int,
     freeze_image_encoder: bool,
+    use_lora: bool,
+    lora_rank: int,
+    lora_alpha: float,
     save_results: bool,
 ) -> None:
     """Run local continual training simulation for solar irradiance forecasting."""
@@ -755,6 +822,9 @@ def main(
         device=device,
         seed=seed,
         freeze_image_encoder=freeze_image_encoder,
+        use_lora=use_lora,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
     )
 
     print(f"\n{'='*78}")
@@ -771,8 +841,10 @@ def main(
 
     # Save results if requested
     if save_results:
-        results_file = f"{dataset_name}_local_training_results.txt"
-        predictions_file = f"{dataset_name}_local_training_predictions.csv"
+        # Add LoRA info to filename if used
+        suffix = f"_lora_r{lora_rank}" if use_lora else ""
+        results_file = f"{dataset_name}_local_training{suffix}_results.txt"
+        predictions_file = f"{dataset_name}_local_training{suffix}_predictions.csv"
 
         # Save predictions to CSV
         df_predictions = pd.DataFrame(predictions_data)
@@ -784,6 +856,8 @@ def main(
             f.write(f"Local Training Results: {dataset_name}\n")
             f.write(f"Checkpoint: {checkpoint}\n")
             f.write(f"Dataset: {dataset_path}\n")
+            if use_lora:
+                f.write(f"LoRA: rank={lora_rank}, alpha={lora_alpha}\n")
             f.write("=" * 78 + "\n\n")
 
             f.write("Overall Metrics:\n")

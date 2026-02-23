@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
 
+from cirr.models.lora import LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
+
 
 class Forecaster(pl.LightningModule):
     def __init__(
@@ -80,6 +82,60 @@ class Forecaster(pl.LightningModule):
         """Unfreeze all parameters in the image encoder."""
         for param in self.image_encoder.parameters():
             param.requires_grad = True
+
+    def freeze_all_except_lora(self) -> None:
+        """Freeze all parameters except LoRA parameters.
+
+        This is the key method for extreme parameter efficiency:
+        - Freezes the entire network (encoder + head)
+        - Only LoRA parameters remain trainable
+        """
+        # Freeze everything first
+        for param in self.parameters():
+            param.requires_grad = False
+
+        # Then unfreeze only LoRA parameters
+        for module in self.modules():
+            if isinstance(module, LoRALinear):
+                module.lora_A.requires_grad = True
+                module.lora_B.requires_grad = True
+
+    def apply_lora_to_head(self, rank: int = 4, alpha: float = 1.0) -> None:
+        """Apply LoRA to the network head linear layers.
+
+        This replaces standard Linear layers with LoRALinear layers,
+        enabling parameter-efficient adaptation.
+
+        Parameters
+        ----------
+        rank : int, optional
+            Rank of LoRA decomposition. Lower = fewer parameters.
+            Recommended: 1-8 for extreme efficiency, by default 4.
+        alpha : float, optional
+            LoRA scaling factor, by default 1.0.
+        """
+        # Replace Linear layers in network_head with LoRA versions
+        replace_linear_with_lora(self.network_head, rank=rank, alpha=alpha)
+
+        # Print LoRA configuration
+        print_lora_info(self)
+
+        # Print overall parameter efficiency
+        stats = count_lora_parameters(self)
+        print("\nOverall Model Parameter Efficiency:")
+        print(f"  Trainable:  {stats['trainable']:,} ({stats['efficiency_pct']:.4f}%)")
+        print(f"  Frozen:     {stats['frozen']:,}")
+        print(f"  Total:      {stats['total']:,}\n")
+
+    def merge_lora_weights(self) -> None:
+        """Merge LoRA weights into base model for inference efficiency.
+
+        After merging, LoRA layers behave like standard Linear layers,
+        eliminating the overhead of low-rank computation.
+        """
+        for module in self.modules():
+            if isinstance(module, LoRALinear):
+                module.merge_weights()
 
     def _configure_loss(self, loss_name):
         """Factory method to get the correct loss function."""
