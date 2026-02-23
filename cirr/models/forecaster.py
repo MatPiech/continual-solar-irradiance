@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
 
-from cirr.models.lora import LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
+from cirr.models.lora import LoRAConv2d, LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
 
 
 class Forecaster(pl.LightningModule):
@@ -96,8 +96,9 @@ class Forecaster(pl.LightningModule):
 
         # Then unfreeze only LoRA parameters
         for module in self.modules():
-            if isinstance(module, LoRALinear):
+            if isinstance(module, LoRALinear | LoRAConv2d):
                 module.lora_A.requires_grad = True
+                module.lora_B.requires_grad = True
                 module.lora_B.requires_grad = True
 
     def apply_lora_to_head(self, rank: int = 4, alpha: float = 1.0) -> None:
@@ -164,15 +165,16 @@ class Forecaster(pl.LightningModule):
         print(f"Network Head:  rank={head_rank}, alpha={head_alpha}")
 
         # Apply LoRA to image encoder with extreme low rank
-        replace_linear_with_lora(self.image_encoder, rank=encoder_rank, alpha=encoder_alpha)
+        # For CNNs (ResNet), we need to replace Conv2d layers
+        replace_linear_with_lora(self.image_encoder, rank=encoder_rank, alpha=encoder_alpha, replace_conv2d=True)
 
-        # Apply LoRA to network head with moderate rank
+        # Apply LoRA to network head with moderate rank (only Linear layers)
         replace_linear_with_lora(self.network_head, rank=head_rank, alpha=head_alpha)
 
         # Print detailed LoRA configuration
         print("\nLoRA Layer Information:")
         print("-" * 80)
-        print(f"{'Layer Name':<50} {'Rank':<6} {'Trainable':<12} {'Total':<12}")
+        print(f"{'Layer Name':<50} {'Type':<8} {'Rank':<6} {'Trainable':<12} {'Total':<12}")
         print("-" * 80)
 
         encoder_trainable = 0
@@ -181,10 +183,11 @@ class Forecaster(pl.LightningModule):
         head_total = 0
 
         for name, layer in self.named_modules():
-            if isinstance(layer, LoRALinear):
+            if isinstance(layer, LoRALinear | LoRAConv2d):
+                layer_type = "Linear" if isinstance(layer, LoRALinear) else "Conv2d"
                 trainable = layer.num_trainable_parameters()
                 total = layer.num_total_parameters()
-                print(f"{name:<50} {layer.rank:<6} {trainable:<12,} {total:<12,}")
+                print(f"{name:<50} {layer_type:<8} {layer.rank:<6} {trainable:<12,} {total:<12,}")
 
                 if "image_encoder" in name:
                     encoder_trainable += trainable
@@ -231,7 +234,7 @@ class Forecaster(pl.LightningModule):
         head_lora_params = []
 
         for name, module in self.named_modules():
-            if isinstance(module, LoRALinear):
+            if isinstance(module, LoRALinear | LoRAConv2d):
                 if "image_encoder" in name:
                     encoder_lora_params.extend([module.lora_A, module.lora_B])
                 elif "network_head" in name:
@@ -250,11 +253,12 @@ class Forecaster(pl.LightningModule):
     def merge_lora_weights(self) -> None:
         """Merge LoRA weights into base model for inference efficiency.
 
-        After merging, LoRA layers behave like standard Linear layers,
+        After merging, LoRA layers behave like standard layers,
         eliminating the overhead of low-rank computation.
         """
         for module in self.modules():
-            if isinstance(module, LoRALinear):
+            if isinstance(module, LoRALinear | LoRAConv2d):
+                module.merge_weights()
                 module.merge_weights()
 
     def _configure_loss(self, loss_name):
