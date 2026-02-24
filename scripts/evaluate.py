@@ -308,8 +308,8 @@ def main(
             f.write("=" * 60 + "\n\n")
 
             f.write("Overall Metrics:\n")
-            f.write(f"  MAE:   {overall_metrics['mae']:.4f}\n")
-            f.write(f"  RMSE:  {overall_metrics['rmse']:.4f}\n")
+            f.write(f"  MAE:   {overall_metrics['mae']:.8f}\n")
+            f.write(f"  RMSE:  {overall_metrics['rmse']:.8f}\n")
             f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
             f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
             f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
