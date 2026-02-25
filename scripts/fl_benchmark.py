@@ -333,10 +333,11 @@ def run_fl_benchmark(
     print(f"Simulating {len(all_days)} days starting {all_days[0]} → {all_days[-1]}\n")
 
     # --- Progress table header ---
-    _nw = max(10, max(len(n) for n in client_names))
-    _header_names = "  ".join(f"{n:^{_nw + 22}s}" for n in client_names)
-    _header_metrics = "  ".join(f"{'MAE':>9}  {'RMSE':>9}  {'N':>6}" for _ in client_names)
-    _sep = "  ".join(["-" * (_nw + 22)] * len(client_names))
+    _col_w = 8 + 2 + 8 + 2 + 5  # MAE(8) + 2sp + RMSE(8) + 2sp + N(5) = 25
+    _col_w = max(_col_w, max(len(n) for n in client_names))
+    _header_names = "  ".join(f"{n:^{_col_w}s}" for n in client_names)
+    _header_metrics = "  ".join(f"{'MAE':>8}  {'RMSE':>8}  {'N':>5}" for _ in client_names)
+    _sep = "  ".join(["-" * _col_w] * len(client_names))
     print(f"  {'Day':<6}  {_header_names}")
     print(f"  {'':6}  {_header_metrics}")
     print(f"  {'------'}  {_sep}")
@@ -408,11 +409,11 @@ def run_fl_benchmark(
         def _fmt_client_col(n: str, _rec: dict = day_record) -> str:
             n_samples = _rec.get(f"{n}_n", 0)
             if n_samples == 0:
-                return f"{'---':>9}  {'---':>9}  {0:>6}"
+                return f"{'---':>8}  {'---':>8}  {0:>5}"
             return (
-                f"{_rec.get(f'{n}_mae', float('nan')):>9.5f}"
-                f"  {_rec.get(f'{n}_rmse', float('nan')):>9.5f}"
-                f"  {n_samples:>6}"
+                f"{_rec.get(f'{n}_mae', float('nan')):>8.6f}"
+                f"  {_rec.get(f'{n}_rmse', float('nan')):>8.6f}"
+                f"  {n_samples:>5}"
             )
 
         _row = "  ".join(_fmt_client_col(n) for n in client_names)
