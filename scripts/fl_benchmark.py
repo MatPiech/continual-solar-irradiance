@@ -88,15 +88,16 @@ def _load_test_dataset(dataset_path: Path) -> Any:
 
 def _load_checkpoint(checkpoint_path: Path, device: str) -> Forecaster:
     """Instantiate a Forecaster and load weights from *checkpoint_path*."""
-    model = Forecaster(
-        model_name="timm-resnet50",
-        pretrained=False,
-        input_channels=3,
-        loss_function="GNLL",
-        lr=1e-3,
-        lr_patience=5,
-    ).to(device)
     data = torch.load(checkpoint_path, map_location=device)
+    hparams = data.get("hyper_parameters", {})
+    model = Forecaster(
+        model_name=hparams.get("model_name", "timm-resnet50"),
+        pretrained=False,
+        input_channels=hparams.get("input_channels", 3),
+        loss_function=hparams.get("loss_function", "Berhu"),
+        lr=hparams.get("lr", 1e-3),
+        lr_patience=hparams.get("lr_patience", 5),
+    ).to(device)
     model.load_state_dict(data["state_dict"])
     return model
 
@@ -152,7 +153,7 @@ def _train_day(
     from *the start of the current FL round* (i.e. the last server broadcast).
     The proximal loss is:
 
-        loss_total = loss_gnll + (µ/2) * ||w - w_anchor||²
+        loss_total = loss_base + (µ/2) * ||w - w_anchor||²
 
     Critically the anchor is fixed for the entire sync window (7 days),
     not re-snapshotted on each day — this matches the FedProx paper.
@@ -192,7 +193,12 @@ def _train_day(
 
             optimizer.zero_grad()
             mean, var = model(imgs, hist)
-            base_loss = model.loss_fn(mean, tgts, var) if var is not None else model.loss_fn(mean, tgts)
+            if var is not None:
+                base_loss = model.loss_fn(mean, tgts, var)
+            elif model.loss_name == "Berhu":
+                base_loss = model.loss_fn(mean * 1000, tgts * 1000)
+            else:
+                base_loss = model.loss_fn(mean, tgts)
 
             if proximal_mu > 0.0 and proximal_ref:
                 prox_terms = [
