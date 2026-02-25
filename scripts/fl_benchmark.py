@@ -334,9 +334,9 @@ def run_fl_benchmark(
 
     # --- Progress table header ---
     _nw = max(10, max(len(n) for n in client_names))
-    _header_names = "  ".join(f"{n:^{_nw + 32}s}" for n in client_names)
-    _header_metrics = "  ".join(f"{'MAE':>9}  {'RMSE':>9}  {'N':>6}  {'Loss':>9}" for _ in client_names)
-    _sep = "  ".join(["-" * (_nw + 32)] * len(client_names))
+    _header_names = "  ".join(f"{n:^{_nw + 22}s}" for n in client_names)
+    _header_metrics = "  ".join(f"{'MAE':>9}  {'RMSE':>9}  {'N':>6}" for _ in client_names)
+    _sep = "  ".join(["-" * (_nw + 22)] * len(client_names))
     print(f"  {'Day':<6}  {_header_names}")
     print(f"  {'':6}  {_header_metrics}")
     print(f"  {'------'}  {_sep}")
@@ -359,6 +359,7 @@ def run_fl_benchmark(
     per_round: list[dict[str, Any]] = []
     days_since_sync = 0
     fl_round_idx = 0
+    last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
 
     # Accumulators for final overall metrics (avoid a second inference pass)
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
@@ -404,18 +405,17 @@ def run_fl_benchmark(
         days_since_sync += 1
 
         # Print day row (always)
-        def _fmt_client_col(n: str, j: int, _rec: dict = day_record, _losses: list = losses) -> str:
+        def _fmt_client_col(n: str, _rec: dict = day_record) -> str:
             n_samples = _rec.get(f"{n}_n", 0)
             if n_samples == 0:
-                return f"{'---':>9}  {'---':>9}  {0:>6}  {'---':>9}"
+                return f"{'---':>9}  {'---':>9}  {0:>6}"
             return (
                 f"{_rec.get(f'{n}_mae', float('nan')):>9.5f}"
                 f"  {_rec.get(f'{n}_rmse', float('nan')):>9.5f}"
                 f"  {n_samples:>6}"
-                f"  {_losses[j]:>9.5f}"
             )
 
-        _row = "  ".join(_fmt_client_col(n, j) for j, n in enumerate(client_names))
+        _row = "  ".join(_fmt_client_col(n) for n in client_names)
         print(f"  {day_key:<6}  {_row}")
 
         # Step 3: FL Aggregation Round (every sync_interval days)
@@ -430,6 +430,7 @@ def run_fl_benchmark(
                 local_head = [_extract_local_keys(sd, _is_head_key) for sd in state_dicts]
 
             new_global, wc = agg_fn(state_dicts[0], state_dicts)
+            last_global_state_dict = copy.deepcopy(new_global)
 
             # Distribute back — restore local layers per client
             for i, model in enumerate(models):
@@ -504,6 +505,8 @@ def run_fl_benchmark(
         "per_day": per_day,
         "per_round": per_round,
         "overall_metrics": overall_metrics,
+        "models": models,
+        "last_global_state_dict": last_global_state_dict,
     }
 
 
@@ -663,8 +666,23 @@ def main(
             df_round = pd.DataFrame(results["per_round"])
             df_round.to_csv(save_results / "per_round.csv", index=False)
 
-        # Summary JSON (exclude large per_day / per_round lists)
-        summary = {k: v for k, v in results.items() if k not in ("per_day", "per_round")}
+        # Per-client model checkpoints (last model state after simulation)
+        ckpt_dir = save_results / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        _final_models: list[Forecaster] = results["models"]
+        for _name, _model in zip(results["client_names"], _final_models, strict=False):
+            _ckpt_path = ckpt_dir / f"{_name}_final.pt"
+            torch.save({"state_dict": _model.state_dict(), "algorithm": algorithm}, _ckpt_path)
+            print(f"  {_ckpt_path}")
+        # Save the last global model broadcast (None for isolated — no aggregation)
+        _global_sd = results["last_global_state_dict"]
+        if _global_sd is not None:
+            _global_path = ckpt_dir / "global_final.pt"
+            torch.save({"state_dict": _global_sd, "algorithm": algorithm}, _global_path)
+            print(f"  {_global_path}")
+
+        # Summary JSON (exclude large per_day / per_round lists and non-serialisable models)
+        summary = {k: v for k, v in results.items() if k not in ("per_day", "per_round", "models", "last_global_state_dict")}
         summary["config"] = {
             "checkpoint": str(checkpoint),
             "clients": [(name, str(path)) for name, path in clients],
@@ -684,6 +702,8 @@ def main(
         if results["per_round"]:
             print(f"  per_round.csv ({len(results['per_round'])} rows)")
         print("  summary.json")
+        _n_global = 1 if results["last_global_state_dict"] is not None else 0
+        print(f"  checkpoints/  ({len(_final_models)} local models{', 1 global' if _n_global else ''})")
 
 
 if __name__ == "__main__":
