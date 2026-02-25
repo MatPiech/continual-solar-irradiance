@@ -169,7 +169,6 @@ def fedper_aggregate(
 
 AGGREGATION_FNS: dict[str, Any] = {
     "fedavg": federated_averaging,
-    "fedprox": federated_averaging,  # proximal term is in the local loss, not aggregation
     "fedbn": fedbn_aggregate,
     "fedper": fedper_aggregate,
 }

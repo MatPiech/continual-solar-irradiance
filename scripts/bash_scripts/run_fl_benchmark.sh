@@ -38,7 +38,6 @@ fi
 ALGORITHMS=(
     isolated   # lower bound — no federation
     fedavg     # standard weight averaging
-    fedprox    # FedAvg + proximal term
     fedbn      # FedAvg, BatchNorm layers kept local
     fedper     # backbone aggregated, head kept local
 )
@@ -48,12 +47,13 @@ RESULTS_ROOT="results/fl_benchmark/sync${SYNC_INTERVAL}"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
 # minimal so that FL aggregation does the heavy lifting).
+WARMUP_DAYS=30
+WARMUP_CACHE_DIR="warmup_cache"
 ADAPT_LR=1e-5
-ADAPT_WD=1e-3
+ADAPT_WD=1e-2
 ADAPT_GRAD_NORM=1.0
 ADAPT_BATCH=32
 ADAPT_EPOCHS=1
-FEDPROX_MU=0.01
 SEED=42
 DEVICE="cuda"
 
@@ -85,10 +85,11 @@ run_algorithm() {
         --algorithm           "${ALGO}" \
         --sync-interval       "${SYNC_INTERVAL}" \
         --num-days            "${NUM_DAYS}" \
+        --warmup-days         "${WARMUP_DAYS}" \
+        ${WARMUP_CACHE_DIR:+--warmup-cache-dir "${WARMUP_CACHE_DIR}"} \
         --adapt-lr            "${ADAPT_LR}" \
         --adapt-weight-decay  "${ADAPT_WD}" \
         --adapt-max-grad-norm "${ADAPT_GRAD_NORM}" \
-        --fedprox-mu          "${FEDPROX_MU}" \
         --adapt-batch-size    "${ADAPT_BATCH}" \
         --adapt-epochs        "${ADAPT_EPOCHS}" \
         --device              "${DEVICE}" \
