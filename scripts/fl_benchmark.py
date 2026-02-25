@@ -27,8 +27,6 @@ Algorithms
 ----------
   isolated  No federation — lower bound, proves source degrades and targets lag.
   fedavg    Standard FedAvg: average all weights every sync interval.
-  fedprox   FedAvg + proximal regularization (µ/2)||w - w_global||² in local
-            loss.  Prevents clients from drifting far from the global model.
   fedbn     Aggregate all layers *except* BatchNorm statistics, preserving
             per-site covariate normalization.
   fedper    Aggregate encoder only; each client's network_head stays local
@@ -48,6 +46,7 @@ Usage
 """
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 import random
@@ -137,28 +136,14 @@ def _train_day(
     model: Forecaster,
     dataset: Any,
     day_indices: list[int],
-    proximal_anchor: dict[str, torch.Tensor] | None,
     lr: float,
     weight_decay: float,
     max_grad_norm: float,
-    proximal_mu: float,
     batch_size: int,
     epochs: int,
     device: str,
 ) -> float:
     """Train *model* for *epochs* epochs on *day_indices*.
-
-    For FedProx the caller passes ``proximal_mu > 0`` and a
-    ``proximal_anchor`` dict that holds the trainable parameter snapshots
-    from *the start of the current FL round* (i.e. the last server broadcast).
-    The proximal loss is:
-
-        loss_total = loss_base + (µ/2) * ||w - w_anchor||²
-
-    Critically the anchor is fixed for the entire sync window (7 days),
-    not re-snapshotted on each day — this matches the FedProx paper.
-
-    For plain FedAvg / FedBN / FedPer pass ``proximal_mu=0.0``.
 
     Returns
     -------
@@ -178,10 +163,6 @@ def _train_day(
         weight_decay=weight_decay,
     )
 
-    # For FedProx use the caller-supplied anchor (fixed to round-start server
-    # weights); fall back to None which disables the proximal term.
-    proximal_ref = proximal_anchor if (proximal_mu > 0.0 and proximal_anchor is not None) else None
-
     total_loss = 0.0
     count = 0
 
@@ -194,22 +175,11 @@ def _train_day(
             optimizer.zero_grad()
             mean, var = model(imgs, hist)
             if var is not None:
-                base_loss = model.loss_fn(mean, tgts, var)
+                loss = model.loss_fn(mean, tgts, var)
             elif model.loss_name == "Berhu":
-                base_loss = model.loss_fn(mean * 1000, tgts * 1000)
+                loss = model.loss_fn(mean * 1000, tgts * 1000)
             else:
-                base_loss = model.loss_fn(mean, tgts)
-
-            if proximal_mu > 0.0 and proximal_ref:
-                prox_terms = [
-                    torch.mean((p - proximal_ref[n]) ** 2)
-                    for n, p in model.named_parameters()
-                    if p.requires_grad and n in proximal_ref
-                ]
-                prox = torch.stack(prox_terms).mean() if prox_terms else torch.tensor(0.0, device=device)
-                loss = base_loss + (proximal_mu / 2.0) * prox
-            else:
-                loss = base_loss
+                loss = model.loss_fn(mean, tgts)
 
             loss.backward()
             if max_grad_norm > 0:
@@ -244,6 +214,44 @@ def _restore_local_keys(
 
 
 # ---------------------------------------------------------------------------
+# Warmup cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_warmup_cache_key(
+    checkpoint_path: Path,
+    clients: list[tuple[str, Path]],
+    warmup_days: int,
+    start_day: str,
+    adapt_lr: float,
+    adapt_weight_decay: float,
+    adapt_max_grad_norm: float,
+    adapt_batch_size: int,
+    adapt_epochs: int,
+    seed: int,
+) -> str:
+    """Compute a short hex digest that uniquely identifies a warmup configuration.
+
+    *algorithm* is intentionally excluded: the warmup phase is algorithm-agnostic
+    (all methods do identical isolated local training), so the resulting per-client
+    weights are the same regardless of which FL algorithm follows.
+    """
+    config = {
+        "checkpoint": str(checkpoint_path),
+        "clients": [(name, str(path)) for name, path in clients],
+        "warmup_days": warmup_days,
+        "start_day": start_day,
+        "adapt_lr": adapt_lr,
+        "adapt_weight_decay": adapt_weight_decay,
+        "adapt_max_grad_norm": adapt_max_grad_norm,
+        "adapt_batch_size": adapt_batch_size,
+        "adapt_epochs": adapt_epochs,
+        "seed": seed,
+    }
+    return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
 # Main benchmark runner
 # ---------------------------------------------------------------------------
 
@@ -255,10 +263,11 @@ def run_fl_benchmark(
     sync_interval: int,
     num_days: int,
     start_day: str,
+    warmup_days: int,
+    warmup_cache_dir: Path | None,
     adapt_lr: float,
     adapt_weight_decay: float,
     adapt_max_grad_norm: float,
-    fedprox_mu: float,
     adapt_batch_size: int,
     adapt_epochs: int,
     device: str,
@@ -272,14 +281,23 @@ def run_fl_benchmark(
     ----------
     checkpoint_path     : Path to initial pretrained checkpoint (all clients start here).
     clients             : Ordered list of (name, dataset_path) tuples.
-    algorithm           : One of "isolated", "fedavg", "fedprox", "fedbn", "fedper".
+    algorithm           : One of "isolated", "fedavg", "fedbn", "fedper".
     sync_interval       : Days between FL aggregation rounds (e.g. 7 or 14).
     num_days            : Total days to simulate (-1 = all).
     start_day           : MMDD string (e.g. "0101").
+    warmup_days         : Number of initial days where all methods act as isolated
+                          (no federation).  At the end of the warmup period a single
+                          forced aggregation round fires before resuming the normal
+                          sync_interval schedule.  0 = no warmup.
+    warmup_cache_dir    : Optional directory for caching per-client model states at
+                          end of warmup.  The cache key is derived from all warmup-
+                          relevant hyperparameters (checkpoint, datasets, warmup_days,
+                          lr, …) but NOT the algorithm, so the same snapshot is reused
+                          across different algorithm runs with identical warmup configs.
+                          Pass None to disable caching.
     adapt_lr            : Local learning rate (all clients).
     adapt_weight_decay  : AdamW weight decay.
     adapt_max_grad_norm : Gradient clipping (-1 = disabled).
-    fedprox_mu          : Proximal coefficient µ (fedprox only).
     adapt_batch_size    : Mini-batch size.
     adapt_epochs        : Local epochs per day (all clients).
     device              : "cuda" or "cpu".
@@ -307,7 +325,7 @@ def run_fl_benchmark(
     client_names = [name for name, _ in clients]
 
     print(f"\n{'='*70}")
-    print(f"  FL Benchmark — algorithm: {algorithm.upper()}  sync_interval: {sync_interval} days")
+    print(f"  FL Benchmark — algorithm: {algorithm.upper()}  sync_interval: {sync_interval} days  warmup: {warmup_days} days")
     print(f"{'='*70}")
     for name, path in clients:
         print(f"  {name:20s}  lr={adapt_lr}  epochs={adapt_epochs}  path={path}")
@@ -352,31 +370,71 @@ def run_fl_benchmark(
     local_bn: list[dict[str, Any]] = [{} for _ in clients]
     local_head: list[dict[str, Any]] = [{} for _ in clients]
 
-    # --- FedProx: anchors fixed to server weights at round start ---
-    mu = fedprox_mu if algorithm == "fedprox" else 0.0
-
-    def _make_proximal_anchor(model: Forecaster) -> dict[str, torch.Tensor] | None:
-        if algorithm != "fedprox":
-            return None
-        return {name: p.detach().clone() for name, p in model.named_parameters() if p.requires_grad}
-
-    prox_anchors: list[dict[str, torch.Tensor] | None] = [_make_proximal_anchor(m) for m in models]
-
     per_day: list[dict[str, Any]] = []
     per_round: list[dict[str, Any]] = []
     days_since_sync = 0
     fl_round_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
+    in_warmup = warmup_days > 0 and algorithm != "isolated"
 
     # Accumulators for final overall metrics (avoid a second inference pass)
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
     _all_tgts: list[list[np.ndarray]] = [[] for _ in clients]
 
     # -----------------------------------------------------------------------
+    # Warmup cache — load if available, skipping the warmup simulation
+    # -----------------------------------------------------------------------
+    _warmup_cache_loaded = False
+    _warmup_cache_key: str | None = None
+    _warmup_cache_file: Path | None = None
+
+    _use_cache = warmup_days > 0 and algorithm != "isolated" and warmup_cache_dir is not None
+    if _use_cache:
+        _warmup_cache_key = _compute_warmup_cache_key(
+            checkpoint_path,
+            clients,
+            warmup_days,
+            start_day,
+            adapt_lr,
+            adapt_weight_decay,
+            adapt_max_grad_norm,
+            adapt_batch_size,
+            adapt_epochs,
+            seed,
+        )
+        _warmup_cache_file = warmup_cache_dir / f"{_warmup_cache_key}.pt"
+
+        if _warmup_cache_file.exists():
+            print(f"  Warmup cache HIT  ({_warmup_cache_file})")
+            print(f"  Skipping {warmup_days} days of isolated warmup training.\n")
+            _cache = torch.load(_warmup_cache_file, map_location=device, weights_only=False)
+            for i, model in enumerate(models):
+                model.load_state_dict(_cache["client_states"][i])
+            per_day = _cache["per_day"]
+            _all_preds = _cache["all_preds"]
+            _all_tgts = _cache["all_tgts"]
+            # Keep in_warmup=True so that warmup_ended_today fires on the
+            # first iteration (day_num == warmup_days), triggering the forced
+            # aggregation round naturally — identical to the non-cached path.
+            _warmup_cache_loaded = True
+        else:
+            print(f"  Warmup cache MISS (key={_warmup_cache_key})")
+            print(f"  Will save snapshot to {_warmup_cache_file} after warmup ends.\n")
+
+    # When cache was loaded, skip warmup days; day_num starts at warmup_days
+    # so the existing warmup_ended_today logic fires on the first iteration.
+    _loop_start = warmup_days if _warmup_cache_loaded else 0
+
+    # -----------------------------------------------------------------------
     # Main loop — identical treatment for every client
     # -----------------------------------------------------------------------
-    for day_num, day_key in enumerate(all_days):
-        day_record: dict[str, Any] = {"day": day_key, "day_num": day_num, "fl_round_after": None}
+    for day_num, day_key in enumerate(all_days[_loop_start:], start=_loop_start):
+        # Check whether warmup just ended (transition on this day)
+        warmup_ended_today = in_warmup and day_num >= warmup_days
+        if warmup_ended_today:
+            in_warmup = False
+
+        day_record: dict[str, Any] = {"day": day_key, "day_num": day_num, "fl_round_after": None, "in_warmup": in_warmup}
         losses: list[float] = []
 
         for i, (name, model) in enumerate(zip(client_names, models, strict=False)):
@@ -397,11 +455,9 @@ def run_fl_benchmark(
                 model,
                 datasets[i],
                 indices,
-                proximal_anchor=prox_anchors[i],
                 lr=adapt_lr,
                 weight_decay=adapt_weight_decay,
                 max_grad_norm=adapt_max_grad_norm,
-                proximal_mu=mu,
                 batch_size=adapt_batch_size,
                 epochs=adapt_epochs,
                 device=device,
@@ -409,9 +465,13 @@ def run_fl_benchmark(
             losses.append(loss)
 
         per_day.append(day_record)
-        days_since_sync += 1
+        # Only count toward sync_interval once warmup is over
+        if not in_warmup:
+            days_since_sync += 1
 
         # Print day row (always)
+        _warmup_tag = " [W]" if day_record["in_warmup"] else "    "
+
         def _fmt_client_col(n: str, _rec: dict = day_record) -> str:
             n_samples = _rec.get(f"{n}_n", 0)
             if n_samples == 0:
@@ -423,12 +483,44 @@ def run_fl_benchmark(
             )
 
         _row = "  ".join(_fmt_client_col(n) for n in client_names)
-        print(f"  {day_key:<6}  {_row}")
+        print(f"  {day_key:<6}{_warmup_tag}  {_row}")
 
-        # Step 3: FL Aggregation Round (every sync_interval days)
-        if algorithm != "isolated" and days_since_sync >= sync_interval:
+        # ---------------------------------------------------------------
+        # Step 3: FL Aggregation
+        #   - forced round immediately after warmup ends
+        #   - periodic round every sync_interval days (post-warmup)
+        # ---------------------------------------------------------------
+        _do_aggregate = algorithm != "isolated" and (warmup_ended_today or days_since_sync >= sync_interval)
+        if warmup_ended_today and not in_warmup:
+            # Reset counter so the next periodic sync starts fresh
+            days_since_sync = 0
+
+        if _do_aggregate:
             agg_fn = AGGREGATION_FNS[algorithm]
             state_dicts = [m.state_dict() for m in models]
+
+            # -----------------------------------------------------------------
+            # Warmup cache — save pre-aggregation client states so future runs
+            # with the same warmup config can skip straight to this point.
+            # Saved before aggregation: weights are purely from isolated training
+            # and contain no algorithm-specific bias.
+            # -----------------------------------------------------------------
+            if warmup_ended_today and _use_cache and not _warmup_cache_loaded:
+                assert _warmup_cache_file is not None
+                _warmup_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "cache_key": _warmup_cache_key,
+                        "warmup_days": warmup_days,
+                        "client_names": client_names,
+                        "client_states": list(state_dicts),
+                        "per_day": list(per_day),
+                        "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
+                        "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
+                    },
+                    _warmup_cache_file,
+                )
+                print(f"  {'':6}      [cache] Warmup snapshot saved → {_warmup_cache_file}")
 
             # Capture local-only layers before aggregation
             if algorithm == "fedbn":
@@ -448,9 +540,7 @@ def run_fl_benchmark(
                     merged = _restore_local_keys(merged, local_head[i])
                 model.load_state_dict(merged)
 
-            # Refresh FedProx anchors to newly broadcast weights
-            prox_anchors = [_make_proximal_anchor(m) for m in models]
-
+            round_tag = "[WARMUP END] " if warmup_ended_today else ""
             per_day[-1]["fl_round_after"] = fl_round_idx
             per_round.append(
                 {
@@ -458,10 +548,12 @@ def run_fl_benchmark(
                     "day": day_key,
                     "day_num": day_num,
                     "weight_change": wc,
-                    "days_in_round": days_since_sync,
+                    "days_in_round": days_since_sync if not warmup_ended_today else warmup_days,
+                    "warmup_round": warmup_ended_today,
                 }
             )
-            days_since_sync = 0
+            if not warmup_ended_today:
+                days_since_sync = 0
             fl_round_idx += 1
 
             _loss_str = "  ".join(
@@ -470,7 +562,7 @@ def run_fl_benchmark(
                 if day_record.get(f"{_name}_n", 0) > 0
             )
             print(
-                f"  {'':6}  └─ FL Round {fl_round_idx:3d}  ({per_round[-1]['days_in_round']}d)  ΔW={wc:.5f}  losses: {_loss_str}"
+                f"  {'':6}      └─ {round_tag}FL Round {fl_round_idx:3d}  ({per_round[-1]['days_in_round']}d)  ΔW={wc:.5f}  losses: {_loss_str}"
             )
 
     # -----------------------------------------------------------------------
@@ -507,6 +599,8 @@ def run_fl_benchmark(
         "sync_interval": sync_interval,
         "num_days": len(all_days),
         "start_day": start_day,
+        "warmup_days": warmup_days,
+        "warmup_cache_loaded": _warmup_cache_loaded,
         "client_names": client_names,
         "fl_rounds_total": fl_round_idx,
         "per_day": per_day,
@@ -542,14 +636,13 @@ def run_fl_benchmark(
 )
 @click.option(
     "--algorithm",
-    type=click.Choice(["isolated", "fedavg", "fedprox", "fedbn", "fedper"], case_sensitive=False),
+    type=click.Choice(["isolated", "fedavg", "fedbn", "fedper"], case_sensitive=False),
     default="fedbn",
     show_default=True,
     help=(
         "FL aggregation algorithm.\n"
         "  isolated — no federation (lower bound).\n"
         "  fedavg   — standard weight averaging.\n"
-        "  fedprox  — FedAvg + proximal term in local loss.\n"
         "  fedbn    — FedAvg excluding BatchNorm layers.\n"
         "  fedper   — aggregate backbone only, keep head local."
     ),
@@ -575,6 +668,31 @@ def run_fl_benchmark(
     show_default=True,
     help="Start day in MMDD format (e.g. 0101 for January 1).",
 )
+@click.option(
+    "--warmup-days",
+    type=int,
+    default=0,
+    show_default=True,
+    help=(
+        "Number of initial days where all methods train in isolation (no federation). "
+        "At the end of the warmup period a single forced aggregation round fires, "
+        "then normal sync-interval scheduling resumes.  0 = disabled."
+    ),
+)
+@click.option(
+    "--warmup-cache-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    show_default=True,
+    help=(
+        "Directory for caching per-client model states at the end of the warmup phase. "
+        "The cache key is derived from all warmup-relevant hyperparameters (checkpoint, "
+        "datasets, warmup_days, lr, …) but NOT the algorithm, so the same snapshot is "
+        "reused across all algorithm runs that share the same warmup config.  "
+        "If the cache file already exists the warmup phase is skipped entirely.  "
+        "Pass None (default) to disable caching."
+    ),
+)
 @click.option("--adapt-lr", type=float, default=1e-4, show_default=True, help="Local learning rate (all clients).")
 @click.option("--adapt-weight-decay", type=float, default=1e-3, show_default=True, help="AdamW weight decay.")
 @click.option(
@@ -583,13 +701,6 @@ def run_fl_benchmark(
     default=1.0,
     show_default=True,
     help="Gradient clipping max norm (-1 = disabled).",
-)
-@click.option(
-    "--fedprox-mu",
-    type=float,
-    default=0.01,
-    show_default=True,
-    help="FedProx proximal coefficient µ (only active for --algorithm fedprox).",
 )
 @click.option("--adapt-batch-size", type=int, default=32, show_default=True, help="Mini-batch size for local training.")
 @click.option(
@@ -625,10 +736,11 @@ def main(
     sync_interval: int,
     num_days: int,
     start_day: str,
+    warmup_days: int,
+    warmup_cache_dir: Path | None,
     adapt_lr: float,
     adapt_weight_decay: float,
     adapt_max_grad_norm: float,
-    fedprox_mu: float,
     adapt_batch_size: int,
     adapt_epochs: int,
     device: str,
@@ -651,10 +763,11 @@ def main(
         sync_interval=sync_interval,
         num_days=num_days,
         start_day=start_day,
+        warmup_days=warmup_days,
+        warmup_cache_dir=warmup_cache_dir,
         adapt_lr=adapt_lr,
         adapt_weight_decay=adapt_weight_decay,
         adapt_max_grad_norm=adapt_max_grad_norm,
-        fedprox_mu=fedprox_mu,
         adapt_batch_size=adapt_batch_size,
         adapt_epochs=adapt_epochs,
         device=device,
@@ -693,11 +806,13 @@ def main(
         summary["config"] = {
             "checkpoint": str(checkpoint),
             "clients": [(name, str(path)) for name, path in clients],
+            "warmup_days": warmup_days,
+            "warmup_cache_dir": str(warmup_cache_dir) if warmup_cache_dir else None,
+            "warmup_cache_loaded": results["warmup_cache_loaded"],
             "adapt_lr": adapt_lr,
             "adapt_epochs": adapt_epochs,
             "adapt_weight_decay": adapt_weight_decay,
             "adapt_max_grad_norm": adapt_max_grad_norm,
-            "fedprox_mu": fedprox_mu,
             "adapt_batch_size": adapt_batch_size,
             "seed": seed,
         }
