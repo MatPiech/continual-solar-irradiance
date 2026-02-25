@@ -360,6 +360,10 @@ def run_fl_benchmark(
     days_since_sync = 0
     fl_round_idx = 0
 
+    # Accumulators for final overall metrics (avoid a second inference pass)
+    _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
+    _all_tgts: list[list[np.ndarray]] = [[] for _ in clients]
+
     # -----------------------------------------------------------------------
     # Main loop — identical treatment for every client
     # -----------------------------------------------------------------------
@@ -376,6 +380,9 @@ def run_fl_benchmark(
             metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
             day_record[f"{name}_mae"] = metrics.get("mae", float("nan"))
             day_record[f"{name}_rmse"] = metrics.get("rmse", float("nan"))
+            if len(preds) > 0:
+                _all_preds[i].append(preds)
+                _all_tgts[i].append(tgts)
 
             # Step 2: Train — same loop for all clients
             loss = _train_day(
@@ -397,13 +404,18 @@ def run_fl_benchmark(
         days_since_sync += 1
 
         # Print day row (always)
-        _row = "  ".join(
-            f"{day_record.get(f'{n}_mae', float('nan')):>9.5f}"
-            f"  {day_record.get(f'{n}_rmse', float('nan')):>9.5f}"
-            f"  {day_record.get(f'{n}_n', 0):>6}"
-            f"  {losses[j]:>9.5f}"
-            for j, n in enumerate(client_names)
-        )
+        def _fmt_client_col(n: str, j: int, _rec: dict = day_record, _losses: list = losses) -> str:
+            n_samples = _rec.get(f"{n}_n", 0)
+            if n_samples == 0:
+                return f"{'---':>9}  {'---':>9}  {0:>6}  {'---':>9}"
+            return (
+                f"{_rec.get(f'{n}_mae', float('nan')):>9.5f}"
+                f"  {_rec.get(f'{n}_rmse', float('nan')):>9.5f}"
+                f"  {n_samples:>6}"
+                f"  {_losses[j]:>9.5f}"
+            )
+
+        _row = "  ".join(_fmt_client_col(n, j) for j, n in enumerate(client_names))
         print(f"  {day_key:<6}  {_row}")
 
         # Step 3: FL Aggregation Round (every sync_interval days)
@@ -444,24 +456,24 @@ def run_fl_benchmark(
             days_since_sync = 0
             fl_round_idx += 1
 
-            _loss_str = "  ".join(f"{_name}={_loss:.5f}" for _name, _loss in zip(client_names, losses, strict=False))
+            _loss_str = "  ".join(
+                f"{_name}={_loss:.5f}"
+                for _name, _loss in zip(client_names, losses, strict=False)
+                if day_record.get(f"{_name}_n", 0) > 0
+            )
             print(
                 f"  {'':6}  └─ FL Round {fl_round_idx:3d}  ({per_round[-1]['days_in_round']}d)  ΔW={wc:.5f}  losses: {_loss_str}"
             )
 
     # -----------------------------------------------------------------------
-    # Overall metrics (final model state)
+    # Overall metrics — built from accumulated predictions, no re-inference
     # -----------------------------------------------------------------------
     overall_metrics: dict[str, dict[str, float]] = {}
     for i, name in enumerate(client_names):
-        all_preds, all_tgts = [], []
-        for d in per_day:
-            indices = day_maps[i].get(d["day"], [])
-            if indices:
-                p, t = _predict_day(models[i], datasets[i], indices, device)
-                all_preds.append(p)
-                all_tgts.append(t)
-        overall_metrics[name] = compute_metrics(np.concatenate(all_preds), np.concatenate(all_tgts)) if all_preds else {}
+        if _all_preds[i]:
+            overall_metrics[name] = compute_metrics(np.concatenate(_all_preds[i]), np.concatenate(_all_tgts[i]))
+        else:
+            overall_metrics[name] = {}
 
     _nw = max(10, max(len(n) for n in client_names))
     print(f"\n{'='*80}")
