@@ -133,6 +133,9 @@ ignore = [
     "ARG002", # Allow unused arguments in function definitions
     "T201",   # Allow print statements
     "N812",   # Lowercase imported as non-lowercase
+    "RUF001",
+    "RUF002",
+    "RUF003",
 ]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
