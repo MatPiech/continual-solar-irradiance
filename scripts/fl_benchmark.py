@@ -658,7 +658,7 @@ def run_fl_benchmark(
     days_since_sync = 0
     fl_round_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
-    in_warmup = warmup_days > 0 and algorithm != "isolated"
+    in_warmup = warmup_days > 0
 
     # Accumulators for final overall metrics (avoid a second inference pass)
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
@@ -671,7 +671,7 @@ def run_fl_benchmark(
     _warmup_cache_key: str | None = None
     _warmup_cache_file: Path | None = None
 
-    _use_cache = warmup_days > 0 and algorithm != "isolated" and warmup_cache_dir is not None
+    _use_cache = warmup_days > 0 and warmup_cache_dir is not None
     if _use_cache:
         _warmup_cache_key = _compute_warmup_cache_key(
             checkpoint_path,
@@ -805,6 +805,30 @@ def run_fl_benchmark(
         print(f"  {day_key:<6}{_warmup_tag}  {_row}")
 
         # ---------------------------------------------------------------
+        # Warmup cache snapshot
+        #   - saved at warmup end even for isolated (no aggregation)
+        # ---------------------------------------------------------------
+        _state_dicts: list[dict[str, Any]] | None = None
+        if warmup_ended_today and _use_cache and not _warmup_cache_loaded:
+            assert _warmup_cache_file is not None
+            _warmup_cache_file.parent.mkdir(parents=True, exist_ok=True)
+            _state_dicts = [m.state_dict() for m in models]
+            torch.save(
+                {
+                    "cache_key": _warmup_cache_key,
+                    "warmup_days": warmup_days,
+                    "client_names": client_names,
+                    "client_states": list(_state_dicts),
+                    "per_day": list(per_day),
+                    "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
+                    "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
+                    "recent_states": [{"entries": list(buf._entries)} for buf in recent_buffers],
+                },
+                _warmup_cache_file,
+            )
+            print(f"  {'':6}      [cache] Warmup snapshot saved → {_warmup_cache_file}")
+
+        # ---------------------------------------------------------------
         # Step 3: FL Aggregation
         #   - forced round immediately after warmup ends
         #   - periodic round every sync_interval days (post-warmup)
@@ -816,31 +840,7 @@ def run_fl_benchmark(
 
         if _do_aggregate:
             agg_fn = AGGREGATION_FNS[algorithm]
-            state_dicts = [m.state_dict() for m in models]
-
-            # -----------------------------------------------------------------
-            # Warmup cache — save pre-aggregation client states so future runs
-            # with the same warmup config can skip straight to this point.
-            # Saved before aggregation: weights are purely from isolated training
-            # and contain no algorithm-specific bias.
-            # -----------------------------------------------------------------
-            if warmup_ended_today and _use_cache and not _warmup_cache_loaded:
-                assert _warmup_cache_file is not None
-                _warmup_cache_file.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(
-                    {
-                        "cache_key": _warmup_cache_key,
-                        "warmup_days": warmup_days,
-                        "client_names": client_names,
-                        "client_states": list(state_dicts),
-                        "per_day": list(per_day),
-                        "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
-                        "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
-                        "recent_states": [{"entries": list(buf._entries)} for buf in recent_buffers],
-                    },
-                    _warmup_cache_file,
-                )
-                print(f"  {'':6}      [cache] Warmup snapshot saved → {_warmup_cache_file}")
+            state_dicts = _state_dicts if _state_dicts is not None else [m.state_dict() for m in models]
 
             # Capture local-only layers before aggregation
             if algorithm == "fedbn":
