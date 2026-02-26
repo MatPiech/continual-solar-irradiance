@@ -700,8 +700,18 @@ def run_fl_benchmark(
             _all_tgts = _cache["all_tgts"]
             # Restore recent FIFO buffer states
             if "recent_states" in _cache:
+                assert len(recent_buffers) == len(
+                    _cache["recent_states"]
+                ), f"Mismatch: {len(recent_buffers)} clients but {len(_cache['recent_states'])} cached buffers"
                 for i, buf in enumerate(recent_buffers):
                     buf._entries = _cache["recent_states"][i]["entries"]
+                    assert (
+                        client_names[i] == _cache["client_names"][i]
+                    ), f"Client name mismatch at index {i}: {client_names[i]} vs {_cache['client_names'][i]}"
+                _per_client_counts = [len(s["entries"]) for s in _cache["recent_states"]]
+                print("  Restored recent FIFO buffers:")
+                for i, (name, count) in enumerate(zip(client_names, _per_client_counts, strict=False)):
+                    print(f"    [{i}] {name:15s} {count:>5d} samples")
             # Folsom replay buffer is rebuilt from Folsom at startup — no restore needed.
             # Keep in_warmup=True so that warmup_ended_today fires on the
             # first iteration (day_num == warmup_days), triggering the forced
@@ -813,6 +823,7 @@ def run_fl_benchmark(
             assert _warmup_cache_file is not None
             _warmup_cache_file.parent.mkdir(parents=True, exist_ok=True)
             _state_dicts = [m.state_dict() for m in models]
+            _recent_states = [{"entries": list(buf._entries)} for buf in recent_buffers]
             torch.save(
                 {
                     "cache_key": _warmup_cache_key,
@@ -822,11 +833,14 @@ def run_fl_benchmark(
                     "per_day": list(per_day),
                     "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
                     "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
-                    "recent_states": [{"entries": list(buf._entries)} for buf in recent_buffers],
+                    "recent_states": _recent_states,
                 },
                 _warmup_cache_file,
             )
             print(f"  {'':6}      [cache] Warmup snapshot saved → {_warmup_cache_file}")
+            print(f"  {'':6}              Recent FIFO buffers per client:")
+            for i, (name, buf_state) in enumerate(zip(client_names, _recent_states, strict=False)):
+                print(f"  {'':6}                [{i}] {name:15s} {len(buf_state['entries']):>5d} samples")
 
         # ---------------------------------------------------------------
         # Step 3: FL Aggregation
