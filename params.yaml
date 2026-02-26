@@ -37,7 +37,7 @@ train_forecaster:
     channels: 3
     pretrained: True
     compile: False
-    loss_function: GNLL
+    loss_function: Berhu
     lr: 3e-4
     lr_patience: 2
 

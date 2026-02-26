@@ -17,7 +17,6 @@
 #   bash scripts/bash_scripts/run_fl_benchmark.sh 7 -1 folsom karpicko poznan
 
 set -e
-pyenv local irr
 
 # ---------------------------------------------------------------------------
 # Configurable parameters
@@ -42,7 +41,7 @@ ALGORITHMS=(
     fedper     # backbone aggregated, head kept local
 )
 
-CHECKPOINT="checkpoints/epoch_011.ckpt"
+CHECKPOINT="checkpoints/epoch_009.ckpt"
 RESULTS_ROOT="results/fl_benchmark/sync${SYNC_INTERVAL}"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
