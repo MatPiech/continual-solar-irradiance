@@ -164,6 +164,107 @@ def fedper_aggregate(
 
 
 # ---------------------------------------------------------------------------
+# Soft-personalisation strategies
+#   Server-side aggregation is identical to FedAvg for all three.  The
+#   personalisation happens *locally*: either via a proximal training term
+#   (FedProx / Ditto) or via EMA interpolation at weight distribution time
+#   (FedEMA).  These thin wrappers carry self-documenting docstrings so
+#   that every algorithm in the registry has its own entry point.
+# ---------------------------------------------------------------------------
+
+
+def fedprox_aggregate(
+    global_weights: dict[str, Any],
+    client_updates: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    """FedProx: FedAvg aggregation with proximal-term regularised local training.
+
+    Server-side aggregation is identical to FedAvg — simple averaging of all
+    client weight submissions.  The proximal regularisation term
+    ``(μ/2) ‖w - w_global‖²`` is added **locally** during each client's
+    training step, keeping local updates close to the last global model.
+
+    Parameters
+    ----------
+    global_weights : dict
+        Current global model state dictionary.
+    client_updates : list[dict]
+        List of client state dictionaries submitted this round.
+
+    Returns
+    -------
+    new_weights : dict
+        Averaged global state dict (identical to FedAvg).
+    weight_change : float
+        L2 norm of the update to the global model.
+    """
+    return federated_averaging(global_weights, client_updates)
+
+
+def ditto_aggregate(
+    global_weights: dict[str, Any],
+    client_updates: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    """Ditto: FedAvg aggregation with per-client personalised models.
+
+    Server-side aggregation is identical to FedAvg.  Each client maintains a
+    *second* personalised model that is trained locally with a proximal term
+    ``(λ/2) ‖v - w_global‖²`` anchoring it to the latest global model.  The
+    personalised model is used for inference while the global copy participates
+    in federation — implemented in ``run_fl_benchmark``.
+
+    Parameters
+    ----------
+    global_weights : dict
+        Current global model state dictionary.
+    client_updates : list[dict]
+        List of client state dictionaries submitted this round.
+
+    Returns
+    -------
+    new_weights : dict
+        Averaged global state dict (identical to FedAvg).
+    weight_change : float
+        L2 norm of the update to the global model.
+    """
+    return federated_averaging(global_weights, client_updates)
+
+
+def fedema_aggregate(
+    global_weights: dict[str, Any],
+    client_updates: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    """FedEMA: FedAvg aggregation with EMA-interpolated weight distribution.
+
+    Server-side aggregation is identical to FedAvg.  The soft-personalisation
+    step happens at **distribution** time: instead of forcibly replacing local
+    weights with the global average, each client interpolates::
+
+        w_local ← α · w_local + (1 - α) · w_global  # noqa: RUF001
+
+    This single-line change turns the global server into a gentle regulariser
+    that whispers generalised physics to the local model without destroying
+    its hard-earned site-specific feature extractors.  Implemented in
+    ``run_fl_benchmark`` during the weight distribution step.
+
+    Parameters
+    ----------
+    global_weights : dict
+        Current global model state dictionary.
+    client_updates : list[dict]
+        List of client state dictionaries submitted this round.
+
+    Returns
+    -------
+    new_weights : dict
+        Averaged global state dict (identical to FedAvg).
+    weight_change : float
+        L2 norm of the update to the global model.
+    """
+    return federated_averaging(global_weights, client_updates)
+
+
+# ---------------------------------------------------------------------------
 # Public registry: maps algorithm name → aggregation callable
 # ---------------------------------------------------------------------------
 
@@ -171,4 +272,7 @@ AGGREGATION_FNS: dict[str, Any] = {
     "fedavg": federated_averaging,
     "fedbn": fedbn_aggregate,
     "fedper": fedper_aggregate,
+    "fedprox": fedprox_aggregate,
+    "ditto": ditto_aggregate,
+    "fedema": fedema_aggregate,
 }

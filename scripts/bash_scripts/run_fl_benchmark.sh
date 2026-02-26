@@ -39,6 +39,9 @@ ALGORITHMS=(
     fedavg     # standard weight averaging
     fedbn      # FedAvg, BatchNorm layers kept local
     fedper     # backbone aggregated, head kept local
+    fedprox    # FedAvg + proximal term in local training
+    ditto      # dual-model with personalised proximal anchor
+    fedema     # FedAvg + EMA interpolation at distribution
 )
 
 CHECKPOINT="checkpoints/epoch_009.ckpt"
@@ -53,10 +56,13 @@ ADAPT_WEIGHT_DECAY=1e-2
 ADAPT_GRAD_NORM=1.0
 ADAPT_BATCH=32
 ADAPT_EPOCHS=1
-REPLAY_BUFFER_SIZE=10000       # reservoir buffer capacity (0 = disabled)
+REPLAY_BUFFER_SIZE=10000   # reservoir buffer capacity (0 = disabled)
 REPLAY_RATIO=0.5           # reservoir samples as fraction of current-day count
 RECENT_BUFFER_SIZE=1000    # FIFO recent buffer capacity (0 = disabled)
 RECENT_REPLAY_RATIO=0.5    # recent-buffer samples as fraction of current-day count
+FEDPROX_MU=1.0             # proximal strength for FedProx
+DITTO_LAMBDA=1.0           # personalised proximal strength for Ditto
+FEDEMA_ALPHA=0.1           # EMA interpolation coefficient for FedEMA
 SEED=42
 DEVICE="cuda"
 
@@ -99,6 +105,9 @@ run_algorithm() {
         --adapt-max-grad-norm "${ADAPT_GRAD_NORM}" \
         --adapt-batch-size    "${ADAPT_BATCH}" \
         --adapt-epochs        "${ADAPT_EPOCHS}" \
+        --fedprox-mu          "${FEDPROX_MU}" \
+        --ditto-lambda        "${DITTO_LAMBDA}" \
+        --fedema-alpha        "${FEDEMA_ALPHA}" \
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --save-results        "${OUT_DIR}"

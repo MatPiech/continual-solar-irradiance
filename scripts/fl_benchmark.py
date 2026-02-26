@@ -31,6 +31,11 @@ Algorithms
             per-site covariate normalization.
   fedper    Aggregate encoder only; each client's network_head stays local
             (personalised regression mapping).
+  fedprox   FedAvg + proximal term (μ/2)‖w-w_global‖² during local training.
+  ditto     Dual-model: global participates in FedAvg, personalized model
+            trains with proximal regularization toward global.
+  fedema    FedAvg + EMA interpolation at distribution:
+            w ← α·w_local + (1-α)·w_global.
 
 Usage
 -----
@@ -143,6 +148,8 @@ def _train_day(
     epochs: int,
     device: str,
     replay_entries: list[tuple[Any, int]] | None = None,
+    global_state_dict: dict[str, Any] | None = None,
+    mu: float = 0.0,
 ) -> float:
     """Train *model* for *epochs* epochs on *day_indices*.
 
@@ -151,6 +158,15 @@ def _train_day(
     concatenated with the current-day samples before batching — matching
     the design of ``train_on_day`` in ``local_training.py``.
     The pool is reshuffled at the start of every epoch.
+
+    Parameters
+    ----------
+    global_state_dict : dict, optional
+        Reference weights for the proximal term (FedProx / Ditto).  When
+        provided together with ``mu > 0``, the loss is augmented with
+        ``(μ/2) ‖w - w_global‖²``.
+    mu : float
+        Proximal regularisation strength.  0 disables the proximal term.
 
     Returns
     -------
@@ -165,6 +181,13 @@ def _train_day(
     pool_base: list[tuple[Any, int]] = current_samples + (replay_entries or [])
 
     model.train()
+
+    # Pre-compute detached reference tensors for proximal regularisation
+    # (FedProx: μ/2 · ‖w - w_global‖²,  Ditto: λ/2 · ‖v - w_global‖²)
+    _prox_ref: dict[str, torch.Tensor] | None = None
+    if mu > 0.0 and global_state_dict is not None:
+        _prox_ref = {k: v.detach().to(device) for k, v in global_state_dict.items() if v.is_floating_point()}
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
@@ -193,6 +216,13 @@ def _train_day(
                 loss = model.loss_fn(mean * 1000, tgts * 1000)
             else:
                 loss = model.loss_fn(mean, tgts)
+
+            # Proximal term: (μ/2) · ‖w - w_global‖²  (FedProx / Ditto)
+            if _prox_ref is not None:
+                prox = sum(
+                    ((p - _prox_ref[n]) ** 2).sum() for n, p in model.named_parameters() if p.requires_grad and n in _prox_ref
+                )
+                loss = loss + (mu / 2.0) * prox
 
             loss.backward()
             if max_grad_norm > 0:
@@ -390,6 +420,25 @@ def _restore_local_keys(
     return merged
 
 
+def _ema_interpolate(
+    local_sd: dict[str, Any],
+    global_sd: dict[str, Any],
+    alpha: float,
+) -> dict[str, Any]:
+    """Soft interpolation: ``w = α · w_local + (1 - α) · w_global``.
+
+    Floating-point tensors are interpolated; integer tensors (e.g. BN
+    ``num_batches_tracked``) are kept from the local model.
+    """
+    merged = {}
+    for key in global_sd:
+        if global_sd[key].is_floating_point():
+            merged[key] = alpha * local_sd[key] + (1.0 - alpha) * global_sd[key]
+        else:
+            merged[key] = local_sd[key]
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Warmup cache helpers
 # ---------------------------------------------------------------------------
@@ -460,6 +509,9 @@ def run_fl_benchmark(
     adapt_epochs: int,
     device: str,
     seed: int,
+    fedprox_mu: float = 0.0,
+    ditto_lambda: float = 0.0,
+    fedema_alpha: float = 0.5,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
 
@@ -469,7 +521,8 @@ def run_fl_benchmark(
     ----------
     checkpoint_path     : Path to initial pretrained checkpoint (all clients start here).
     clients             : Ordered list of (name, dataset_path) tuples.
-    algorithm           : One of "isolated", "fedavg", "fedbn", "fedper".
+    algorithm           : One of "isolated", "fedavg", "fedbn", "fedper",
+                          "fedprox", "ditto", "fedema".
     sync_interval       : Days between FL aggregation rounds (e.g. 7 or 14).
     num_days            : Total days to simulate (-1 = all).
     start_day           : MMDD string (e.g. "0101").
@@ -505,6 +558,16 @@ def run_fl_benchmark(
     adapt_epochs        : Local epochs per day (all clients).
     device              : "cuda" or "cpu".
     seed                : RNG seed.
+    fedprox_mu          : Proximal regularisation strength for FedProx.
+                          Loss is augmented with (μ/2) ‖w - w_global‖².
+    ditto_lambda        : Proximal strength for the Ditto personalised model.
+                          The global model trains with standard FedAvg; the
+                          personal model's loss is augmented with
+                          (λ/2) ‖v - w_global‖².
+    fedema_alpha        : EMA interpolation coefficient for FedEMA.
+                          w_local ← α·w_local + (1-α)·w_global after each
+                          aggregation round.  Higher α retains more local
+                          knowledge.
 
     Returns
     -------
@@ -585,7 +648,7 @@ def run_fl_benchmark(
         if _folsom_replay_buffer:
             print(
                 f"  Folsom replay buffer: {len(_folsom_replay_buffer)} samples  "
-                f"μ={_folsom_dist['mean']:.3f}  σ={_folsom_dist['std']:.3f}  max={_folsom_dist['max']:.3f}"  # noqa: RUF001
+                f"μ={_folsom_dist['mean']:.3f}  σ={_folsom_dist['std']:.3f}  max={_folsom_dist['max']:.3f}"
             )
         else:
             print(f"  Folsom replay buffer: DISABLED (path not found: {_folsom_path})")
@@ -652,6 +715,11 @@ def run_fl_benchmark(
     # so the existing warmup_ended_today logic fires on the first iteration.
     _loop_start = warmup_days if _warmup_cache_loaded else 0
 
+    # --- Ditto: personalised models (deep copies of global; diverge after first aggregation) ---
+    ditto_models: list[Forecaster] = []
+    if algorithm == "ditto":
+        ditto_models = [copy.deepcopy(m) for m in models]
+
     # -----------------------------------------------------------------------
     # Main loop — identical treatment for every client
     # -----------------------------------------------------------------------
@@ -668,8 +736,9 @@ def run_fl_benchmark(
             indices = day_maps[i].get(day_key, [])
             day_record[f"{name}_n"] = len(indices)
 
-            # Step 1: Predict
-            preds, tgts = _predict_day(model, datasets[i], indices, device)
+            # Step 1: Predict  (Ditto: use personalised model for inference)
+            _infer_model = ditto_models[i] if algorithm == "ditto" else model
+            preds, tgts = _predict_day(_infer_model, datasets[i], indices, device)
             metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
             day_record[f"{name}_mae"] = metrics.get("mae", float("nan"))
             day_record[f"{name}_rmse"] = metrics.get("rmse", float("nan"))
@@ -690,6 +759,9 @@ def run_fl_benchmark(
                 _n_recent = max(0, int(round(len(indices) * recent_replay_ratio)))
                 _recent_entries = recent_buffers[i].sample(_n_recent, seed=_day_client_seed + 1)
             _replay = (_reservoir_entries + _recent_entries) or None
+            # Proximal reference for FedProx local training
+            _prox_sd = last_global_state_dict if algorithm == "fedprox" else None
+            _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
             loss = _train_day(
                 model,
                 datasets[i],
@@ -701,7 +773,10 @@ def run_fl_benchmark(
                 epochs=adapt_epochs,
                 device=device,
                 replay_entries=_replay,
+                global_state_dict=_prox_sd,
+                mu=_prox_mu,
             )
+
             losses.append(loss)
 
             # Update recent FIFO buffer with today's samples
@@ -783,7 +858,49 @@ def run_fl_benchmark(
                     merged = _restore_local_keys(merged, local_bn[i])
                 elif algorithm == "fedper":
                     merged = _restore_local_keys(merged, local_head[i])
+                elif algorithm == "fedema":
+                    # Soft interpolation: w ← α·w_local + (1-α)·w_global
+                    merged = _ema_interpolate(state_dicts[i], new_global, fedema_alpha)
                 model.load_state_dict(merged)
+
+            # Ditto: train personalised models with proximal toward the
+            # *freshly aggregated* global consensus.  Only the global
+            # model participates in FedAvg; the personalised model stays
+            # local and is never shared — it just trains on the current
+            # day's data anchored to the new global.
+            if algorithm == "ditto":
+                for i in range(len(clients)):
+                    _d_indices = day_maps[i].get(day_key, [])
+                    _d_seed = seed + day_num * len(clients) + i
+                    # Assemble same replay mix the global model used
+                    _d_reservoir: list[tuple[Any, int]] = []
+                    if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
+                        _d_reservoir = _sample_replay_for_day(
+                            _folsom_replay_buffer,
+                            max(0, int(round(len(_d_indices) * replay_ratio))),
+                            seed=_d_seed,
+                        )
+                    _d_recent: list[tuple[Any, int]] = []
+                    if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+                        _d_recent = recent_buffers[i].sample(
+                            max(0, int(round(len(_d_indices) * recent_replay_ratio))),
+                            seed=_d_seed + 1,
+                        )
+                    _d_replay = (_d_reservoir + _d_recent) or None
+                    _train_day(
+                        ditto_models[i],
+                        datasets[i],
+                        _d_indices,
+                        lr=adapt_lr,
+                        weight_decay=adapt_weight_decay,
+                        max_grad_norm=adapt_max_grad_norm,
+                        batch_size=adapt_batch_size,
+                        epochs=adapt_epochs,
+                        device=device,
+                        replay_entries=_d_replay,
+                        global_state_dict=last_global_state_dict,
+                        mu=ditto_lambda,
+                    )
 
             round_tag = "[WARMUP END] " if warmup_ended_today else ""
             per_day[-1]["fl_round_after"] = fl_round_idx
@@ -855,7 +972,7 @@ def run_fl_benchmark(
         "per_day": per_day,
         "per_round": per_round,
         "overall_metrics": overall_metrics,
-        "models": models,
+        "models": ditto_models if algorithm == "ditto" else models,
         "last_global_state_dict": last_global_state_dict,
     }
 
@@ -885,7 +1002,7 @@ def run_fl_benchmark(
 )
 @click.option(
     "--algorithm",
-    type=click.Choice(["isolated", "fedavg", "fedbn", "fedper"], case_sensitive=False),
+    type=click.Choice(["isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema"], case_sensitive=False),
     default="fedbn",
     show_default=True,
     help=(
@@ -893,7 +1010,10 @@ def run_fl_benchmark(
         "  isolated — no federation (lower bound).\n"
         "  fedavg   — standard weight averaging.\n"
         "  fedbn    — FedAvg excluding BatchNorm layers.\n"
-        "  fedper   — aggregate backbone only, keep head local."
+        "  fedper   — aggregate backbone only, keep head local.\n"
+        "  fedprox  — FedAvg + proximal term in local training.\n"
+        "  ditto    — dual-model with personalised proximal anchor.\n"
+        "  fedema   — FedAvg + EMA interpolation at distribution."
     ),
 )
 @click.option(
@@ -1013,6 +1133,38 @@ def run_fl_benchmark(
 )
 @click.option("--seed", type=int, default=42, show_default=True, help="Random seed.")
 @click.option(
+    "--fedprox-mu",
+    type=float,
+    default=0.01,
+    show_default=True,
+    help=(
+        "Proximal regularisation strength for FedProx.  "
+        "Local loss is augmented with (μ/2)‖w-w_global‖².  Only used when --algorithm=fedprox."
+    ),
+)
+@click.option(
+    "--ditto-lambda",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help=(
+        "Proximal strength for Ditto's personalised model.  The global model "
+        "trains with standard FedAvg; the personal model's loss is augmented "
+        "with (λ/2)‖v-w_global‖².  Only used when --algorithm=ditto."
+    ),
+)
+@click.option(
+    "--fedema-alpha",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help=(
+        "EMA interpolation coefficient for FedEMA.  After aggregation, local "
+        "weights are updated as w←α·w_local + (1-α)·w_global.  Higher α retains "
+        "more local knowledge.  Only used when --algorithm=fedema."
+    ),
+)
+@click.option(
     "--save-results",
     type=click.Path(path_type=Path),
     default=None,
@@ -1043,6 +1195,9 @@ def main(
     adapt_epochs: int,
     device: str,
     seed: int,
+    fedprox_mu: float,
+    ditto_lambda: float,
+    fedema_alpha: float,
     save_results: Path | None,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
@@ -1074,6 +1229,9 @@ def main(
         adapt_epochs=adapt_epochs,
         device=device,
         seed=seed,
+        fedprox_mu=fedprox_mu,
+        ditto_lambda=ditto_lambda,
+        fedema_alpha=fedema_alpha,
     )
 
     if save_results is not None:
@@ -1121,6 +1279,9 @@ def main(
             "adapt_max_grad_norm": adapt_max_grad_norm,
             "adapt_batch_size": adapt_batch_size,
             "seed": seed,
+            "fedprox_mu": fedprox_mu,
+            "ditto_lambda": ditto_lambda,
+            "fedema_alpha": fedema_alpha,
         }
         with (save_results / "summary.json").open("w") as fh:
             json.dump(summary, fh, indent=2)
