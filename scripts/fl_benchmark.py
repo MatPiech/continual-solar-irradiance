@@ -142,8 +142,15 @@ def _train_day(
     batch_size: int,
     epochs: int,
     device: str,
+    replay_entries: list[tuple[Any, int]] | None = None,
 ) -> float:
     """Train *model* for *epochs* epochs on *day_indices*.
+
+    *replay_entries* is a pre-sampled list of ``(dataset, index)`` pairs
+    (assembled by the caller via ``_sample_replay_for_day()``) that is
+    concatenated with the current-day samples before batching — matching
+    the design of ``train_on_day`` in ``local_training.py``.
+    The pool is reshuffled at the start of every epoch.
 
     Returns
     -------
@@ -152,9 +159,10 @@ def _train_day(
     if not day_indices:
         return 0.0
 
-    samples = [(dataset, idx) for idx in day_indices]
-    random.shuffle(samples)
-    batches = [samples[i : i + batch_size] for i in range(0, len(samples), batch_size)]
+    current_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
+    # Combine current-day samples with pre-sampled replay entries.
+    # Sizing and seeding are the caller's responsibility (mirrors local_training.py).
+    pool_base: list[tuple[Any, int]] = current_samples + (replay_entries or [])
 
     model.train()
     optimizer = torch.optim.AdamW(
@@ -167,10 +175,15 @@ def _train_day(
     count = 0
 
     for _ in range(epochs):
+        # Reshuffle the fixed pool each epoch (replay+current already sized by caller)
+        pool = list(pool_base)
+        random.shuffle(pool)
+        batches = [pool[i : i + batch_size] for i in range(0, len(pool), batch_size)]
+
         for batch in batches:
-            imgs = torch.stack([dataset[idx][0] for _, idx in batch]).to(device)
-            hist = torch.stack([dataset[idx][1] for _, idx in batch]).to(device)
-            tgts = torch.stack([dataset[idx][2] for _, idx in batch]).to(device)
+            imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)
+            hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)
+            tgts = torch.stack([ds[idx][2] for ds, idx in batch]).to(device)
 
             optimizer.zero_grad()
             mean, var = model(imgs, hist)
@@ -190,6 +203,170 @@ def _train_day(
             count += 1
 
     return total_loss / count if count > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Folsom replay buffer — static buffer sampled from Folsom training distribution
+# ---------------------------------------------------------------------------
+
+
+def _period_target_value(period: dict[str, Any]) -> float:
+    """Get normalised target value directly from period metadata."""
+    return float(period["target_irradiance"]) / 1000.0
+
+
+def _load_train_dataset(dataset_path: Path) -> Any:
+    """Load the training split of a prepared dataset."""
+    dm = ForecastingDataModule(
+        root_data_path=dataset_path,
+        periods_path=dataset_path / "train_periods.pickle",
+        augment=False,
+        image_size=[128, 128],
+        image_mean=[0.485, 0.456, 0.406],
+        image_std=[0.229, 0.224, 0.225],
+        batch_size=1,
+        workers=0,
+        seed=42,
+    )
+    dm.setup(None)
+    return dm._train_dataset
+
+
+def _build_initial_replay_buffer(
+    folsom_path: Path,
+    replay_size: int,
+    nonzero_threshold: float = 0.001,
+) -> tuple[list[tuple[Any, int]], dict[str, float]]:
+    """Build a static replay buffer from the Folsom training dataset.
+
+    Samples are allocated proportionally to a normal distribution fitted to
+    Folsom irradiance values, so the buffer distribution matches the Folsom
+    training distribution (mirrors ``local_training.py``).
+
+    Parameters
+    ----------
+    folsom_path : Path
+        Path to the ``folsom_prepared`` directory.
+    replay_size : int
+        Number of entries to include.  0 returns an empty buffer.
+    nonzero_threshold : float
+        Minimum normalised irradiance for a sample to be eligible.
+
+    Returns
+    -------
+    replay_buffer : list[tuple[Any, int]]
+        ``(dataset, index)`` pairs ready for ``_train_day``.
+    distribution_stats : dict[str, float]
+        ``mean``, ``std``, ``max`` of the Folsom irradiance values.
+    """
+    if replay_size <= 0 or not folsom_path.exists():
+        return [], {"mean": 0.0, "std": 0.0, "max": 0.0}
+
+    folsom_dataset = _load_train_dataset(folsom_path)
+
+    irradiance_values: list[float] = []
+    eligible_samples: list[tuple[Any, int]] = []
+    for idx, period in enumerate(folsom_dataset._periods):
+        val = _period_target_value(period)
+        if val < nonzero_threshold:
+            continue
+        irradiance_values.append(val)
+        eligible_samples.append((folsom_dataset, idx))
+
+    if not eligible_samples:
+        return [], {"mean": 0.0, "std": 0.0, "max": 0.0}
+
+    irr_array = np.array(irradiance_values)
+    mean_irr = float(np.mean(irr_array))
+    std_irr = float(np.std(irr_array))
+    max_irr = float(np.max(irr_array))
+
+    # Stratified sampling: bin by irradiance, weight bins by fitted normal
+    n_bins = min(10, max(2, replay_size // 20))
+    bin_edges = np.linspace(0, max_irr, n_bins + 1)
+    bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
+    for sample, irr_val in zip(eligible_samples, irradiance_values, strict=False):
+        bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
+        bins[bin_idx].append(sample)
+
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    normal_weights = np.exp(-0.5 * ((bin_centers - mean_irr) / (std_irr + 1e-6)) ** 2)
+    normal_weights /= normal_weights.sum()
+
+    replay_buffer: list[tuple[Any, int]] = []
+    for bin_idx in range(n_bins):
+        quota = max(0, int(round(replay_size * normal_weights[bin_idx])))
+        if quota > 0 and bins[bin_idx]:
+            replay_buffer.extend(bins[bin_idx][:quota])
+
+    # Fill any remaining slots
+    if len(replay_buffer) < replay_size:
+        already = {id(s) for s in replay_buffer}
+        remaining = [s for s in eligible_samples if id(s) not in already]
+        replay_buffer.extend(remaining[: replay_size - len(replay_buffer)])
+
+    random.Random(42).shuffle(replay_buffer)
+    return replay_buffer[:replay_size], {"mean": mean_irr, "std": std_irr, "max": max_irr}
+
+
+def _sample_replay_for_day(
+    replay_buffer: list[tuple[Any, int]],
+    num_samples: int,
+    seed: int | None = None,
+) -> list[tuple[Any, int]]:
+    """Draw *num_samples* entries from *replay_buffer* without replacement.
+
+    Uses ``numpy.random.RandomState`` for deterministic per-day sampling
+    (mirrors ``local_training.py``).
+    """
+    if num_samples <= 0 or not replay_buffer:
+        return []
+    rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
+    chosen = rng.choice(len(replay_buffer), size=min(num_samples, len(replay_buffer)), replace=False)
+    return [replay_buffer[i] for i in chosen]
+
+
+class RecentBuffer:
+    """Fixed-capacity FIFO buffer retaining the *most recent* N samples.
+
+    Unlike the Folsom reservoir buffer (static, normal-weighted), this buffer
+    keeps only the latest ``capacity`` samples.  Older entries are dropped when
+    the buffer is full.  This gives the model access to very recent context
+    without the recency bias of reservoir sampling.
+
+    Each entry is a ``(dataset, index)`` pair — same format as
+    the Folsom replay buffer and ``_train_day``.
+
+    Parameters
+    ----------
+    capacity : int
+        Maximum number of entries to retain.  0 disables the buffer.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._entries: list[tuple[Any, int]] = []
+
+    def add_day(self, dataset: Any, indices: list[int]) -> None:
+        """Append today's samples; trim to capacity (keep most recent)."""
+        if self.capacity == 0 or not indices:
+            return
+        for idx in indices:
+            self._entries.append((dataset, idx))
+        if len(self._entries) > self.capacity:
+            self._entries = self._entries[-self.capacity :]
+
+    def sample(self, n: int, seed: int | None = None) -> list[tuple[Any, int]]:
+        """Return up to *n* entries drawn without replacement."""
+        if not self._entries or n <= 0:
+            return []
+        rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
+        n = min(n, len(self._entries))
+        indices = rng.choice(len(self._entries), size=n, replace=False)
+        return [self._entries[i] for i in indices]
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
 
 # ---------------------------------------------------------------------------
@@ -229,12 +406,17 @@ def _compute_warmup_cache_key(
     adapt_batch_size: int,
     adapt_epochs: int,
     seed: int,
+    replay_buffer_size: int = 0,
+    recent_buffer_size: int = 0,
 ) -> str:
     """Compute a short hex digest that uniquely identifies a warmup configuration.
 
     *algorithm* is intentionally excluded: the warmup phase is algorithm-agnostic
     (all methods do identical isolated local training), so the resulting per-client
     weights are the same regardless of which FL algorithm follows.
+
+    *replay_buffer_size* and *recent_buffer_size* are included because the buffer
+    states (which are cached alongside model weights) depend on their capacity.
     """
     config = {
         "checkpoint": str(checkpoint_path),
@@ -247,6 +429,8 @@ def _compute_warmup_cache_key(
         "adapt_batch_size": adapt_batch_size,
         "adapt_epochs": adapt_epochs,
         "seed": seed,
+        "replay_buffer_size": replay_buffer_size,
+        "recent_buffer_size": recent_buffer_size,
     }
     return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -265,6 +449,10 @@ def run_fl_benchmark(
     start_day: str,
     warmup_days: int,
     warmup_cache_dir: Path | None,
+    replay_buffer_size: int,
+    replay_ratio: float,
+    recent_buffer_size: int,
+    recent_replay_ratio: float,
     adapt_lr: float,
     adapt_weight_decay: float,
     adapt_max_grad_norm: float,
@@ -295,6 +483,21 @@ def run_fl_benchmark(
                           lr, …) but NOT the algorithm, so the same snapshot is reused
                           across different algorithm runs with identical warmup configs.
                           Pass None to disable caching.
+    replay_buffer_size  : Number of samples to retain in the static Folsom replay
+                          buffer.  The buffer is built once from the Folsom training
+                          split using stratified normal-weighted sampling so that its
+                          irradiance distribution matches the Folsom distribution.
+                          0 = disabled.
+    replay_ratio        : Fraction of current-day sample count to draw from the Folsom
+                          replay buffer each day.  E.g. 0.3 adds samples equal to 30 %
+                          of the current day's count.  Ignored when replay_buffer_size
+                          is 0.
+    recent_buffer_size  : Maximum number of past samples retained in each client's
+                          recent FIFO buffer.  0 = disabled.  This buffer keeps only
+                          the most recent samples (as opposed to the reservoir buffer
+                          which samples uniformly over history).
+    recent_replay_ratio : Fraction of current-day sample count to draw from the
+                          recent FIFO buffer.  Ignored when recent_buffer_size is 0.
     adapt_lr            : Local learning rate (all clients).
     adapt_weight_decay  : AdamW weight decay.
     adapt_max_grad_norm : Gradient clipping (-1 = disabled).
@@ -370,6 +573,23 @@ def run_fl_benchmark(
     local_bn: list[dict[str, Any]] = [{} for _ in clients]
     local_head: list[dict[str, Any]] = [{} for _ in clients]
 
+    # --- Per-client recent FIFO buffers ---
+    recent_buffers: list[RecentBuffer] = [RecentBuffer(recent_buffer_size) for _ in clients]
+
+    # --- Folsom replay buffer (static, init once from Folsom training split) ---
+    # Distribution matches Folsom irradiance (stratified normal-weighted sampling).
+    _folsom_replay_buffer: list[tuple[Any, int]] = []
+    if replay_buffer_size > 0:
+        _folsom_path = clients[0][1].parent / "folsom_prepared"
+        _folsom_replay_buffer, _folsom_dist = _build_initial_replay_buffer(_folsom_path, replay_buffer_size)
+        if _folsom_replay_buffer:
+            print(
+                f"  Folsom replay buffer: {len(_folsom_replay_buffer)} samples  "
+                f"μ={_folsom_dist['mean']:.3f}  σ={_folsom_dist['std']:.3f}  max={_folsom_dist['max']:.3f}"  # noqa: RUF001
+            )
+        else:
+            print(f"  Folsom replay buffer: DISABLED (path not found: {_folsom_path})")
+
     per_day: list[dict[str, Any]] = []
     per_round: list[dict[str, Any]] = []
     days_since_sync = 0
@@ -401,6 +621,8 @@ def run_fl_benchmark(
             adapt_batch_size,
             adapt_epochs,
             seed,
+            replay_buffer_size=replay_buffer_size,
+            recent_buffer_size=recent_buffer_size,
         )
         _warmup_cache_file = warmup_cache_dir / f"{_warmup_cache_key}.pt"
 
@@ -413,6 +635,11 @@ def run_fl_benchmark(
             per_day = _cache["per_day"]
             _all_preds = _cache["all_preds"]
             _all_tgts = _cache["all_tgts"]
+            # Restore recent FIFO buffer states
+            if "recent_states" in _cache:
+                for i, buf in enumerate(recent_buffers):
+                    buf._entries = _cache["recent_states"][i]["entries"]
+            # Folsom replay buffer is rebuilt from Folsom at startup — no restore needed.
             # Keep in_warmup=True so that warmup_ended_today fires on the
             # first iteration (day_num == warmup_days), triggering the forced
             # aggregation round naturally — identical to the non-cached path.
@@ -451,6 +678,18 @@ def run_fl_benchmark(
                 _all_tgts[i].append(tgts)
 
             # Step 2: Train — same loop for all clients
+            # Sample from Folsom replay buffer and recent FIFO buffer before training.
+            # n = round(len(indices) * ratio) mirrors _sample_replay_for_day in local_training.py.
+            _day_client_seed = seed + day_num * len(clients) + i
+            _reservoir_entries: list[tuple[Any, int]] = []
+            if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
+                _n_reservoir = max(0, int(round(len(indices) * replay_ratio)))
+                _reservoir_entries = _sample_replay_for_day(_folsom_replay_buffer, _n_reservoir, seed=_day_client_seed)
+            _recent_entries: list[tuple[Any, int]] = []
+            if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+                _n_recent = max(0, int(round(len(indices) * recent_replay_ratio)))
+                _recent_entries = recent_buffers[i].sample(_n_recent, seed=_day_client_seed + 1)
+            _replay = (_reservoir_entries + _recent_entries) or None
             loss = _train_day(
                 model,
                 datasets[i],
@@ -461,8 +700,13 @@ def run_fl_benchmark(
                 batch_size=adapt_batch_size,
                 epochs=adapt_epochs,
                 device=device,
+                replay_entries=_replay,
             )
             losses.append(loss)
+
+            # Update recent FIFO buffer with today's samples
+            if recent_buffer_size > 0:
+                recent_buffers[i].add_day(datasets[i], indices)
 
         per_day.append(day_record)
         # Only count toward sync_interval once warmup is over
@@ -517,6 +761,7 @@ def run_fl_benchmark(
                         "per_day": list(per_day),
                         "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
                         "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
+                        "recent_states": [{"entries": list(buf._entries)} for buf in recent_buffers],
                     },
                     _warmup_cache_file,
                 )
@@ -601,6 +846,10 @@ def run_fl_benchmark(
         "start_day": start_day,
         "warmup_days": warmup_days,
         "warmup_cache_loaded": _warmup_cache_loaded,
+        "replay_buffer_size": replay_buffer_size,
+        "replay_ratio": replay_ratio,
+        "recent_buffer_size": recent_buffer_size,
+        "recent_replay_ratio": recent_replay_ratio,
         "client_names": client_names,
         "fl_rounds_total": fl_round_idx,
         "per_day": per_day,
@@ -693,6 +942,51 @@ def run_fl_benchmark(
         "Pass None (default) to disable caching."
     ),
 )
+@click.option(
+    "--replay-buffer-size",
+    type=int,
+    default=0,
+    show_default=True,
+    help=(
+        "Number of samples to draw from the Folsom training dataset for the static "
+        "replay buffer.  Samples are allocated with stratified normal-weighted sampling "
+        "so the buffer distribution matches the Folsom irradiance distribution.  "
+        "0 = disabled."
+    ),
+)
+@click.option(
+    "--replay-ratio",
+    type=float,
+    default=0.3,
+    show_default=True,
+    help=(
+        "Ratio of Folsom replay samples relative to current-day samples.  "
+        "E.g. 0.1 adds replay samples equal to 10 %% of the current day's count.  "
+        "Only used when --replay-buffer-size > 0."
+    ),
+)
+@click.option(
+    "--recent-buffer-size",
+    type=int,
+    default=0,
+    show_default=True,
+    help=(
+        "Capacity of each client's recent FIFO replay buffer (number of most-recent "
+        "samples retained).  0 = disabled.  Complements the reservoir buffer by giving "
+        "the model access to very recent context."
+    ),
+)
+@click.option(
+    "--recent-replay-ratio",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help=(
+        "Ratio of recent-buffer replay samples relative to current-day samples.  "
+        "E.g. 0.1 adds samples equal to 10 %% of the current day's count from the "
+        "recent FIFO buffer.  Only used when --recent-buffer-size > 0."
+    ),
+)
 @click.option("--adapt-lr", type=float, default=1e-4, show_default=True, help="Local learning rate (all clients).")
 @click.option("--adapt-weight-decay", type=float, default=1e-3, show_default=True, help="AdamW weight decay.")
 @click.option(
@@ -738,6 +1032,10 @@ def main(
     start_day: str,
     warmup_days: int,
     warmup_cache_dir: Path | None,
+    replay_buffer_size: int,
+    replay_ratio: float,
+    recent_buffer_size: int,
+    recent_replay_ratio: float,
     adapt_lr: float,
     adapt_weight_decay: float,
     adapt_max_grad_norm: float,
@@ -765,6 +1063,10 @@ def main(
         start_day=start_day,
         warmup_days=warmup_days,
         warmup_cache_dir=warmup_cache_dir,
+        replay_buffer_size=replay_buffer_size,
+        replay_ratio=replay_ratio,
+        recent_buffer_size=recent_buffer_size,
+        recent_replay_ratio=recent_replay_ratio,
         adapt_lr=adapt_lr,
         adapt_weight_decay=adapt_weight_decay,
         adapt_max_grad_norm=adapt_max_grad_norm,
@@ -809,6 +1111,10 @@ def main(
             "warmup_days": warmup_days,
             "warmup_cache_dir": str(warmup_cache_dir) if warmup_cache_dir else None,
             "warmup_cache_loaded": results["warmup_cache_loaded"],
+            "replay_buffer_size": replay_buffer_size,
+            "replay_ratio": replay_ratio,
+            "recent_buffer_size": recent_buffer_size,
+            "recent_replay_ratio": recent_replay_ratio,
             "adapt_lr": adapt_lr,
             "adapt_epochs": adapt_epochs,
             "adapt_weight_decay": adapt_weight_decay,

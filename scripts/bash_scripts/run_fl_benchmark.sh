@@ -50,10 +50,14 @@ RESULTS_ROOT="results/fl_benchmark/sync${SYNC_INTERVAL}"
 WARMUP_DAYS=30
 WARMUP_CACHE_DIR="warmup_cache"
 ADAPT_LR=1e-5
-ADAPT_WD=1e-2
+ADAPT_WEIGHT_DECAY=1e-2
 ADAPT_GRAD_NORM=1.0
 ADAPT_BATCH=32
 ADAPT_EPOCHS=1
+REPLAY_BUFFER_SIZE=10000       # reservoir buffer capacity (0 = disabled)
+REPLAY_RATIO=0.5           # reservoir samples as fraction of current-day count
+RECENT_BUFFER_SIZE=1000    # FIFO recent buffer capacity (0 = disabled)
+RECENT_REPLAY_RATIO=0.5    # recent-buffer samples as fraction of current-day count
 SEED=42
 DEVICE="cuda"
 
@@ -87,8 +91,12 @@ run_algorithm() {
         --num-days            "${NUM_DAYS}" \
         --warmup-days         "${WARMUP_DAYS}" \
         ${WARMUP_CACHE_DIR:+--warmup-cache-dir "${WARMUP_CACHE_DIR}"} \
+        --replay-buffer-size  "${REPLAY_BUFFER_SIZE}" \
+        --replay-ratio        "${REPLAY_RATIO}" \
+        --recent-buffer-size  "${RECENT_BUFFER_SIZE}" \
+        --recent-replay-ratio "${RECENT_REPLAY_RATIO}" \
         --adapt-lr            "${ADAPT_LR}" \
-        --adapt-weight-decay  "${ADAPT_WD}" \
+        --adapt-weight-decay  "${ADAPT_WEIGHT_DECAY}" \
         --adapt-max-grad-norm "${ADAPT_GRAD_NORM}" \
         --adapt-batch-size    "${ADAPT_BATCH}" \
         --adapt-epochs        "${ADAPT_EPOCHS}" \
@@ -141,6 +149,8 @@ echo "  $(printf '%-12s  %s' 'algorithm' 'MAE (all clients)')"
 echo "  $(printf '%-12s  %s' '---------' '-----------------')"
 find "${RESULTS_ROOT}" -name "summary.json" | sort | while read -r f; do
     ALGO=$(basename "$(dirname "$f")")
+    # Skip results from algorithms not in the current ALGORITHMS array
+    [[ " ${ALGORITHMS[*]} " == *" ${ALGO} "* ]] || continue
     MAES=$(python -c "
 import json; d=json.load(open('$f'))
 parts = [f\"{name}={m.get('mae','N/A'):.4f}\" for name, m in d.get('overall_metrics', {}).items()]
