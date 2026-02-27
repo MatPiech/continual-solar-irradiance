@@ -192,13 +192,30 @@ def _accumulate_prototypes(
 
 def _aggregate_global_prototypes(
     client_protos: list[dict[int, tuple[torch.Tensor, int]]],
-) -> dict[int, torch.Tensor]:
-    """Average per-class prototypes across all clients (weighted by count).
+) -> tuple[list[dict[int, torch.Tensor]], dict[int, list[list[float]]]]:
+    """Attention-weighted prototype aggregation (per-client personalised).
 
-    Each client's prototype for a class is the feature-vector sum and
-    sample count accumulated since the last sync.  The global prototype
-    is the *count-weighted* average across clients — clients with more
-    samples in a given class contribute proportionally more.
+    Instead of a single count-weighted average, each client receives a
+    *personalised* global prototype for every weather class.  The
+    personalisation is driven by **cosine similarity** between the
+    client's own mean prototype and every other client's mean prototype
+    for the same class.
+
+    For a given class *c* and target client *i*:
+
+    .. math::
+
+       w_{ij}^{(c)} = \frac{\\exp(\text{sim}(p_i^c, p_j^c) / \tau)}
+                           {\\sum_k \\exp(\text{sim}(p_i^c, p_k^c) / \tau)}
+
+       \\hat{p}_i^c = \\sum_j w_{ij}^{(c)} \\, p_j^c
+
+    where *τ = 0.5* is a temperature parameter that sharpens the
+    attention distribution (lower → more peaked toward similar clients).
+
+    This creates implicit topological clusters: Alpine sites like Alpnach
+    and Bern2 attend strongly to each other while down-weighting flat-
+    terrain sites like Karpicko, and vice versa.
 
     Parameters
     ----------
@@ -207,28 +224,64 @@ def _aggregate_global_prototypes(
 
     Returns
     -------
-    global_prototypes : dict[int, Tensor]
-        Global mean prototype for each weather class (on CPU).
+    per_client_protos : list[dict[int, Tensor]]
+        Personalised global prototypes for each client.
+    attention_weights : dict[int, list[list[float]]]
+        Per-class attention matrix (N_clients × N_clients) for logging.
+        ``attention_weights[cls][i][j]`` is the weight client *i* assigns
+        to client *j* for class *cls*.
     """
-    global_protos: dict[int, torch.Tensor] = {}
+    n_clients = len(client_protos)
+    tau = 0.5  # temperature — lower = sharper attention
+
+    # Step 1: compute per-client mean prototypes for each class
+    client_means: list[dict[int, torch.Tensor]] = []
+    for cp in client_protos:
+        means: dict[int, torch.Tensor] = {}
+        for cls, (feat_sum, count) in cp.items():
+            if count > 0:
+                means[cls] = feat_sum / count
+        client_means.append(means)
+
+    per_client_protos: list[dict[int, torch.Tensor]] = [{} for _ in range(n_clients)]
+    attention_weights: dict[int, list[list[float]]] = {}
 
     for cls in (PROTO_OVERCAST, PROTO_TRANSIENT, PROTO_CLEAR):
-        total_sum: torch.Tensor | None = None
-        total_count = 0
+        # Gather which clients have this class
+        present = [i for i in range(n_clients) if cls in client_means[i]]
+        if not present:
+            continue
 
-        for client_proto in client_protos:
-            if cls in client_proto:
-                feat_sum, count = client_proto[cls]
-                if total_sum is None:
-                    total_sum = feat_sum.clone()
-                else:
-                    total_sum += feat_sum
-                total_count += count
+        if len(present) == 1:
+            # Only one client has this class — no cross-client attention
+            i = present[0]
+            per_client_protos[i][cls] = client_means[i][cls]
+            attention_weights[cls] = [[0.0] * n_clients for _ in range(n_clients)]
+            attention_weights[cls][i][i] = 1.0
+            continue
 
-        if total_sum is not None and total_count > 0:
-            global_protos[cls] = total_sum / total_count
+        # Stack mean prototypes: (K, D) where K = len(present)
+        proto_stack = torch.stack([client_means[i][cls] for i in present])  # (K, D)
+        # Cosine similarity matrix: (K, K)
+        norms = proto_stack.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        normed = proto_stack / norms
+        sim_matrix = normed @ normed.T  # (K, K)
 
-    return global_protos
+        # Softmax attention with temperature
+        attn = torch.softmax(sim_matrix / tau, dim=1)  # (K, K)
+
+        # Weighted prototypes: each present client gets a personalised average
+        weighted = attn @ proto_stack  # (K, D)
+
+        # Build full N_clients × N_clients attention matrix for logging
+        cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]
+        for ki, i in enumerate(present):
+            per_client_protos[i][cls] = weighted[ki]
+            for kj, j in enumerate(present):
+                cls_attn[i][j] = attn[ki, kj].item()
+        attention_weights[cls] = cls_attn
+
+    return per_client_protos, attention_weights
 
 
 def _load_test_dataset(dataset_path: Path) -> Any:
@@ -1102,9 +1155,11 @@ def run_fl_benchmark(
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
     _all_tgts: list[list[np.ndarray]] = [[] for _ in clients]
 
-    # --- FedProto state: per-class prototype accumulators and global prototypes ---
+    # --- FedProto state: per-class prototype accumulators and per-client global prototypes ---
     _proto_accum: list[dict[int, tuple[torch.Tensor, int]]] = [{} for _ in clients]
-    _global_prototypes: dict[int, torch.Tensor] | None = None  # set after first FedProto sync
+    # Per-client personalised global prototypes (attention-weighted).
+    # After the first FedProto sync this becomes a list of dicts, one per client.
+    _per_client_global_protos: list[dict[int, torch.Tensor]] | None = None
 
     # -----------------------------------------------------------------------
     # Warmup cache — load if available, skipping the warmup simulation
@@ -1226,7 +1281,9 @@ def run_fl_benchmark(
                 "recent_replay_ratio": recent_replay_ratio,
                 "global_state_dict": _global_sd,
                 "prox_mu": _prox_mu,
-                "global_prototypes": _global_prototypes if _is_fedproto else None,
+                "global_prototypes": _per_client_global_protos[i]
+                if (_is_fedproto and _per_client_global_protos is not None)
+                else None,
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
                 "extract_prototypes": _is_fedproto and not in_warmup,
             }
@@ -1325,20 +1382,38 @@ def run_fl_benchmark(
                 # FedProto: aggregate prototypes, NOT model weights.
                 # Each client keeps its own model entirely local.
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                _global_prototypes = _aggregate_global_prototypes(_proto_accum)
+                _per_client_global_protos, _attn_weights = _aggregate_global_prototypes(_proto_accum)
                 wc = 0.0  # no weight-level change
 
-                # Log prototype summary
-                _proto_cls_str = "  ".join(
-                    f"{PROTO_CLASS_NAMES[c]}={_global_prototypes[c].norm():.3f}" for c in sorted(_global_prototypes)
-                )
-                print(f"  {'':6}      [proto] Aggregated {len(_global_prototypes)} class prototypes: " f"{_proto_cls_str}")
-                # Print per-client sample counts that contributed
+                # Log per-client prototype norms and attention weights
+                _all_classes = sorted({c for p in _per_client_global_protos for c in p})
+                _n_classes = len(_all_classes)
+                print(f"  {'':6}      [proto] Aggregated {_n_classes} class prototypes (attention-weighted):")
+                # Per-client sample counts
                 for ci, cname in enumerate(client_names):
                     _counts = {PROTO_CLASS_NAMES[c]: cnt for c, (_, cnt) in _proto_accum[ci].items()}
+                    _norms = {
+                        PROTO_CLASS_NAMES[c]: _per_client_global_protos[ci][c].norm().item()
+                        for c in _per_client_global_protos[ci]
+                    }
                     if _counts:
                         _cnt_str = "  ".join(f"{k}={v}" for k, v in _counts.items())
-                        print(f"  {'':6}              {cname}: {_cnt_str}")
+                        _nrm_str = "  ".join(f"{k}={v:.3f}" for k, v in _norms.items())
+                        print(f"  {'':6}              {cname}: samples=[{_cnt_str}]  norms=[{_nrm_str}]")
+                # Attention matrix per class
+                for cls in _all_classes:
+                    if cls in _attn_weights:
+                        cname = PROTO_CLASS_NAMES[cls]
+                        present = [
+                            i
+                            for i in range(len(client_names))
+                            if any(_attn_weights[cls][i][j] > 0 for j in range(len(client_names)))
+                        ]
+                        if len(present) > 1:
+                            print(f"  {'':6}              attn[{cname}]:")
+                            for i in present:
+                                _w_str = "  ".join(f"{client_names[j]}={_attn_weights[cls][i][j]:.3f}" for j in present)
+                                print(f"  {'':6}                {client_names[i]:>12s} → {_w_str}")
 
                 # Reset accumulators for next sync interval
                 _proto_accum = [{} for _ in clients]
