@@ -338,6 +338,37 @@ class Forecaster(pl.LightningModule):
             out = F.softplus(out)
             return out, None
 
+    def forward_with_features(
+        self, x: torch.Tensor, irradiance_history: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Forward pass that also returns intermediate image-encoder features.
+
+        Used by FedProto for prototype extraction and regularisation.
+        The feature vector is the raw output of ``self.image_encoder`` *before*
+        fusion with the irradiance history — i.e. the semantic representation
+        of the sky image that prototypes are built from.
+
+        Returns
+        -------
+        mean : Tensor
+            Predicted irradiance (after softplus).
+        variance : Tensor or None
+            Predicted variance (probabilistic mode) or None.
+        img_feats : Tensor, shape (B, num_features)
+            Image-encoder feature vectors.
+        """
+        img_feats = self.image_encoder(x)
+        fused = torch.cat([img_feats, irradiance_history], dim=1)
+        out = self.network_head(fused)
+
+        if self.is_probabilistic:
+            mean = F.softplus(out[:, 0].unsqueeze(1))
+            variance = F.softplus(out[:, 1].unsqueeze(1)) + 1e-6
+            return mean, variance, img_feats
+        else:
+            out = F.softplus(out)
+            return out, None, img_feats
+
     def _shared_step(self, batch, stage):
         """
         Handles the logic for Train, Val, and Test to avoid code duplication.

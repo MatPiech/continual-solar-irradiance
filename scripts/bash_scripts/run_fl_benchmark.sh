@@ -42,6 +42,7 @@ ALGORITHMS=(
     fedprox    # FedAvg + proximal term in local training
     ditto      # dual-model with personalised proximal anchor
     fedema     # FedAvg + EMA interpolation at distribution
+    fedproto   # prototype exchange, no weight sharing
 )
 
 CHECKPOINT="checkpoints/epoch_009.ckpt"
@@ -62,6 +63,7 @@ RECENT_REPLAY_RATIO=0.5    # recent-buffer samples as fraction of current-day co
 FEDPROX_MU=1.0             # proximal strength for FedProx
 DITTO_LAMBDA=1.0           # personalised proximal strength for Ditto
 FEDEMA_ALPHA=0.1           # EMA interpolation coefficient for FedEMA
+FEDPROTO_LAMBDA=0.1        # prototype regularisation strength for FedProto
 SEED=42
 DEVICE="cuda"
 PARALLEL_CLIENTS=0         # 0 = auto (number of datasets), 1 = sequential
@@ -110,6 +112,7 @@ run_algorithm() {
         --fedprox-mu          "${FEDPROX_MU}" \
         --ditto-lambda        "${DITTO_LAMBDA}" \
         --fedema-alpha        "${FEDEMA_ALPHA}" \
+        --fedproto-lambda     "${FEDPROTO_LAMBDA}" \
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \
