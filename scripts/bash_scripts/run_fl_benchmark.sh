@@ -51,7 +51,7 @@ CHECKPOINT="checkpoints/epoch_009.ckpt"
 WARMUP_DAYS=30
 WARMUP_CACHE_DIR="warmup_cache"
 ADAPT_LR=1e-5
-ADAPT_WEIGHT_DECAY=1e-2
+ADAPT_WEIGHT_DECAY=1e-4
 ADAPT_GRAD_NORM=1.0
 ADAPT_BATCH=32
 ADAPT_EPOCHS=1
@@ -113,6 +113,7 @@ run_algorithm() {
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \
+        --freeze-early-backbone \
         --save-results        "${OUT_DIR}"
 
     echo "  Done. Results saved to ${OUT_DIR}/"

@@ -84,6 +84,37 @@ class Forecaster(pl.LightningModule):
         for param in self.image_encoder.parameters():
             param.requires_grad = True
 
+    def freeze_early_backbone(self) -> None:
+        """Freeze early backbone layers (conv1, bn1, layer1, layer2, layer3) in ResNet.
+
+        This prevents the early feature extractors from adapting during
+        continual learning, forcing adaptation to occur only in higher-level
+        layers. Useful for preventing catastrophic forgetting of low-level
+        features while allowing task-specific adaptation in deeper layers.
+
+        Freezes:
+        - conv1: Initial 7x7 convolution
+        - bn1: Initial batch normalization
+        - layer1: First residual block (Block 1)
+        - layer2: Second residual block (Block 2)
+        - layer3: Third residual block (Block 3)
+        """
+        layers_to_freeze = ["conv1", "bn1", "layer1", "layer2", "layer3"]
+        frozen_params = 0
+        frozen_tensors = 0
+
+        for layer_name in layers_to_freeze:
+            if hasattr(self.image_encoder, layer_name):
+                layer = getattr(self.image_encoder, layer_name)
+                for param in layer.parameters():
+                    param.requires_grad = False
+                    frozen_params += param.numel()
+                    frozen_tensors += 1
+
+        print(
+            f"  Frozen early backbone: {frozen_params:,} parameters in {frozen_tensors} tensors (conv1, bn1, layer1, layer2, layer3)"
+        )
+
     def freeze_all_except_lora(self) -> None:
         """Freeze all parameters except LoRA parameters.
 
