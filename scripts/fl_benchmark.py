@@ -50,17 +50,21 @@ Usage
       --save-results results/fedbn_7day
 """
 
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import copy
 import hashlib
 import json
 from pathlib import Path
 import random
+import sys
 from typing import Any
 
 import click
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from cirr.datamodules.forecasting import ForecastingDataModule
 from cirr.fl.server import AGGREGATION_FNS, _is_bn_key, _is_head_key
@@ -116,25 +120,58 @@ def _predict_day(
     dataset: Any,
     day_indices: list[int],
     device: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Run inference for every sample in *day_indices*.
+    batch_size: int,
+    client_name: str = "",
+) -> tuple[np.ndarray, np.ndarray, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
+    """Run batched inference for every sample in *day_indices*.
 
     Returns
     -------
-    predictions : np.ndarray, shape (N,)
-    targets     : np.ndarray, shape (N,)
+    predictions  : np.ndarray, shape (N,)
+    targets      : np.ndarray, shape (N,)
+    day_samples  : list of (image, irr_hist, target) tensor tuples on CPU,
+                   one per sample — reusable by ``_train_day`` to avoid
+                   redundant dataset loads.
     """
+    if not day_indices:
+        return np.array([]), np.array([]), []
+
     model.eval()
     preds, tgts = [], []
+    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     with torch.no_grad():
-        for idx in day_indices:
-            images, irr_hist, target, _ = dataset[idx]
-            images = images.unsqueeze(0).to(device)
-            irr_hist = irr_hist.unsqueeze(0).to(device)
-            mean, _ = model(images, irr_hist)
-            preds.append(mean.cpu().item())
-            tgts.append(target.cpu().item())
-    return np.array(preds), np.array(tgts)
+        _pbar = tqdm(
+            total=len(day_indices),
+            desc=f"  [{client_name}] load+infer",
+            leave=False,
+            unit="smp",
+            file=sys.stdout,
+            dynamic_ncols=True,
+        )
+        for start in range(0, len(day_indices), batch_size):
+            batch_idx = day_indices[start : start + batch_size]
+            imgs, hists, targets = [], [], []
+            for idx in batch_idx:
+                images, irr_hist, target, _ = dataset[idx]
+                imgs.append(images)
+                hists.append(irr_hist)
+                if not isinstance(target, torch.Tensor):
+                    target = torch.tensor(target)
+                targets.append(target)
+                # Cache each sample as-is (already on CPU)
+                day_samples.append((images, irr_hist, target))
+                _pbar.update(1)
+            imgs_t = torch.stack(imgs).to(device)
+            hists_t = torch.stack(hists).to(device)
+            mean, _ = model(imgs_t, hists_t)
+            preds.append(mean.cpu().numpy().ravel())
+            tgts.extend(t.item() for t in targets)
+        _pbar.close()
+    return (
+        np.concatenate(preds) if preds else np.array([]),
+        np.array(tgts),
+        day_samples,
+    )
 
 
 def _train_day(
@@ -150,6 +187,9 @@ def _train_day(
     replay_entries: list[tuple[Any, int]] | None = None,
     global_state_dict: dict[str, Any] | None = None,
     mu: float = 0.0,
+    rng_seed: int | None = None,
+    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
+    client_name: str = "",
 ) -> float:
     """Train *model* for *epochs* epochs on *day_indices*.
 
@@ -167,6 +207,9 @@ def _train_day(
         ``(μ/2) ‖w - w_global‖²``.
     mu : float
         Proximal regularisation strength.  0 disables the proximal term.
+    day_samples : list, optional
+        Pre-loaded (image, irr_hist, target) tensor tuples from
+        ``_predict_day()``.  Avoids redundant dataset reads.
 
     Returns
     -------
@@ -175,10 +218,30 @@ def _train_day(
     if not day_indices:
         return 0.0
 
-    current_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
-    # Combine current-day samples with pre-sampled replay entries.
-    # Sizing and seeding are the caller's responsibility (mirrors local_training.py).
-    pool_base: list[tuple[Any, int]] = current_samples + (replay_entries or [])
+    # Build the training pool.  When day_samples is available we already have
+    # the tensors; replay entries are also materialised to the same format
+    # so the entire pool is homogeneous (img, hist, tgt) tensor tuples.
+    if day_samples is not None:
+        preloaded_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = list(day_samples)
+        if replay_entries:
+            for ds, idx in tqdm(
+                replay_entries,
+                desc=f"  [{client_name}] load replay",
+                leave=False,
+                unit="smp",
+                file=sys.stdout,
+                dynamic_ncols=True,
+            ):
+                img, hist, tgt, _ = ds[idx]
+                if not isinstance(tgt, torch.Tensor):
+                    tgt = torch.tensor(tgt)
+                preloaded_pool.append((img, hist, tgt))
+        pool_base: list = preloaded_pool
+        _preloaded = True
+    else:
+        current_ds: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
+        pool_base = current_ds + (replay_entries or [])
+        _preloaded = False
 
     model.train()
 
@@ -196,17 +259,33 @@ def _train_day(
 
     total_loss = 0.0
     count = 0
+    _rng = random.Random(rng_seed)
 
-    for _ in range(epochs):
+    for ep in range(epochs):
         # Reshuffle the fixed pool each epoch (replay+current already sized by caller)
         pool = list(pool_base)
-        random.shuffle(pool)
+        _rng.shuffle(pool)
         batches = [pool[i : i + batch_size] for i in range(0, len(pool), batch_size)]
 
-        for batch in batches:
-            imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)
-            hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)
-            tgts = torch.stack([ds[idx][2] for ds, idx in batch]).to(device)
+        _pbar = tqdm(
+            batches,
+            desc=f"  [{client_name}] train e{ep+1}/{epochs}",
+            leave=False,
+            unit="batch",
+            file=sys.stdout,
+            dynamic_ncols=True,
+        )
+        for batch in _pbar:
+            if _preloaded:
+                # Pool entries are (img, hist, target) tensor tuples
+                imgs = torch.stack([item[0] for item in batch]).to(device)
+                hist = torch.stack([item[1] for item in batch]).to(device)
+                tgts = torch.stack([item[2] for item in batch]).to(device)
+            else:
+                # Pool entries are (dataset, idx) tuples; load from dataset
+                imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)  # type: ignore
+                hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)  # type: ignore
+                tgts = torch.stack([ds[idx][2] for ds, idx in batch]).to(device)  # type: ignore
 
             optimizer.zero_grad()
             mean, var = model(imgs, hist)
@@ -440,6 +519,100 @@ def _ema_interpolate(
 
 
 # ---------------------------------------------------------------------------
+# Parallel client processing
+# ---------------------------------------------------------------------------
+
+
+def _process_client_day(
+    client_idx: int,
+    name: str,
+    model: Forecaster,
+    infer_model: Forecaster,
+    dataset: Any,
+    day_indices: list[int],
+    device: str,
+    rng_seed: int,
+    adapt_lr: float,
+    adapt_weight_decay: float,
+    adapt_max_grad_norm: float,
+    adapt_batch_size: int,
+    adapt_epochs: int,
+    folsom_replay_buffer: list[tuple[Any, int]],
+    replay_buffer_size: int,
+    replay_ratio: float,
+    recent_buffer: RecentBuffer,
+    recent_buffer_size: int,
+    recent_replay_ratio: float,
+    global_state_dict: dict[str, Any] | None,
+    prox_mu: float,
+) -> dict[str, Any]:
+    """Process prediction + training for one client on one day.
+
+    Thread-safe: uses per-client CUDA stream and deterministic local RNG.
+    Each client operates on its own model, dataset, and buffers — no shared
+    mutable state between clients.
+    """
+    use_cuda = device != "cpu" and torch.cuda.is_available()
+    stream = torch.cuda.Stream(device) if use_cuda else None
+    ctx = torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext()
+
+    with ctx:
+        # Step 1: Predict (also caches per-sample tensors for training)
+        preds, tgts, day_samples = _predict_day(
+            infer_model, dataset, day_indices, device, batch_size=adapt_batch_size, client_name=name
+        )
+        metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
+
+        # Step 2: Prepare replay samples
+        _reservoir_entries: list[tuple[Any, int]] = []
+        if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
+            _n = max(0, int(round(len(day_indices) * replay_ratio)))
+            _reservoir_entries = _sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
+        _recent_entries: list[tuple[Any, int]] = []
+        if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+            _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
+            _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
+        _replay = (_reservoir_entries + _recent_entries) or None
+
+        # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
+        loss = _train_day(
+            model,
+            dataset,
+            day_indices,
+            lr=adapt_lr,
+            weight_decay=adapt_weight_decay,
+            max_grad_norm=adapt_max_grad_norm,
+            batch_size=adapt_batch_size,
+            epochs=adapt_epochs,
+            device=device,
+            replay_entries=_replay,
+            global_state_dict=global_state_dict,
+            mu=prox_mu,
+            rng_seed=rng_seed,
+            day_samples=day_samples,
+            client_name=name,
+        )
+
+        # Step 4: Update recent FIFO buffer
+        if recent_buffer_size > 0:
+            recent_buffer.add_day(dataset, day_indices)
+
+    if stream is not None:
+        stream.synchronize()
+
+    return {
+        "client_idx": client_idx,
+        "name": name,
+        "n_samples": len(day_indices),
+        "preds": preds,
+        "tgts": tgts,
+        "mae": metrics.get("mae", float("nan")),
+        "rmse": metrics.get("rmse", float("nan")),
+        "loss": loss,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Warmup cache helpers
 # ---------------------------------------------------------------------------
 
@@ -512,6 +685,7 @@ def run_fl_benchmark(
     fedprox_mu: float = 0.0,
     ditto_lambda: float = 0.0,
     fedema_alpha: float = 0.5,
+    parallel_clients: int = 1,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
 
@@ -691,7 +865,7 @@ def run_fl_benchmark(
 
         if _warmup_cache_file.exists():
             print(f"  Warmup cache HIT  ({_warmup_cache_file})")
-            print(f"  Skipping {warmup_days} days of isolated warmup training.\n")
+            print(f"  Skipping {warmup_days} days of isolated warmup training.")
             _cache = torch.load(_warmup_cache_file, map_location=device, weights_only=False)
             for i, model in enumerate(models):
                 model.load_state_dict(_cache["client_states"][i])
@@ -699,15 +873,18 @@ def run_fl_benchmark(
             _all_preds = _cache["all_preds"]
             _all_tgts = _cache["all_tgts"]
             # Restore recent FIFO buffer states
+            # Cache stores lightweight (client_index, sample_index) pairs;
+            # reconstruct (dataset, sample_index) using the current run's datasets.
             if "recent_states" in _cache:
                 assert len(recent_buffers) == len(
                     _cache["recent_states"]
                 ), f"Mismatch: {len(recent_buffers)} clients but {len(_cache['recent_states'])} cached buffers"
                 for i, buf in enumerate(recent_buffers):
-                    buf._entries = _cache["recent_states"][i]["entries"]
                     assert (
                         client_names[i] == _cache["client_names"][i]
                     ), f"Client name mismatch at index {i}: {client_names[i]} vs {_cache['client_names'][i]}"
+                    # Reconstruct (dataset, idx) tuples from stored (client_idx, sample_idx) pairs
+                    buf._entries = [(datasets[ci], si) for ci, si in _cache["recent_states"][i]["entries"]]
                 _per_client_counts = [len(s["entries"]) for s in _cache["recent_states"]]
                 print("  Restored recent FIFO buffers:")
                 for i, (name, count) in enumerate(zip(client_names, _per_client_counts, strict=False)):
@@ -719,7 +896,7 @@ def run_fl_benchmark(
             _warmup_cache_loaded = True
         else:
             print(f"  Warmup cache MISS (key={_warmup_cache_key})")
-            print(f"  Will save snapshot to {_warmup_cache_file} after warmup ends.\n")
+            print(f"  Will save snapshot to {_warmup_cache_file} after warmup ends.")
 
     # When cache was loaded, skip warmup days; day_num starts at warmup_days
     # so the existing warmup_ended_today logic fires on the first iteration.
@@ -729,6 +906,13 @@ def run_fl_benchmark(
     ditto_models: list[Forecaster] = []
     if algorithm == "ditto":
         ditto_models = [copy.deepcopy(m) for m in models]
+
+    # --- Thread pool for parallel client processing ---
+    _n_workers = min(parallel_clients, len(clients)) if parallel_clients > 1 else 0
+    _pool: ThreadPoolExecutor | None = None
+    if _n_workers > 1:
+        _pool = ThreadPoolExecutor(max_workers=_n_workers)
+        print(f"  Parallel client processing: {_n_workers} workers (CUDA streams)")
 
     # -----------------------------------------------------------------------
     # Main loop — identical treatment for every client
@@ -742,56 +926,55 @@ def run_fl_benchmark(
         day_record: dict[str, Any] = {"day": day_key, "day_num": day_num, "fl_round_after": None, "in_warmup": in_warmup}
         losses: list[float] = []
 
-        for i, (name, model) in enumerate(zip(client_names, models, strict=False)):
-            indices = day_maps[i].get(day_key, [])
-            day_record[f"{name}_n"] = len(indices)
+        # --- Process all clients (parallel or sequential) ---
+        _day_key = day_key
+        _day_num = day_num
+        _infer_models = ditto_models if algorithm == "ditto" else models
+        _global_sd = last_global_state_dict if algorithm == "fedprox" else None
+        _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
+        client_kwargs = [
+            {
+                "client_idx": i,
+                "name": client_names[i],
+                "model": models[i],
+                "infer_model": _infer_models[i],
+                "dataset": datasets[i],
+                "day_indices": day_maps[i].get(_day_key, []),
+                "device": device,
+                "rng_seed": seed + _day_num * len(clients) + i,
+                "adapt_lr": adapt_lr,
+                "adapt_weight_decay": adapt_weight_decay,
+                "adapt_max_grad_norm": adapt_max_grad_norm,
+                "adapt_batch_size": adapt_batch_size,
+                "adapt_epochs": adapt_epochs,
+                "folsom_replay_buffer": _folsom_replay_buffer,
+                "replay_buffer_size": replay_buffer_size,
+                "replay_ratio": replay_ratio,
+                "recent_buffer": recent_buffers[i],
+                "recent_buffer_size": recent_buffer_size,
+                "recent_replay_ratio": recent_replay_ratio,
+                "global_state_dict": _global_sd,
+                "prox_mu": _prox_mu,
+            }
+            for i in range(len(clients))
+        ]
 
-            # Step 1: Predict  (Ditto: use personalised model for inference)
-            _infer_model = ditto_models[i] if algorithm == "ditto" else model
-            preds, tgts = _predict_day(_infer_model, datasets[i], indices, device)
-            metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
-            day_record[f"{name}_mae"] = metrics.get("mae", float("nan"))
-            day_record[f"{name}_rmse"] = metrics.get("rmse", float("nan"))
-            if len(preds) > 0:
-                _all_preds[i].append(preds)
-                _all_tgts[i].append(tgts)
+        if _pool is not None:
+            futures = [_pool.submit(_process_client_day, **kwargs) for kwargs in client_kwargs]
+            client_results = [f.result() for f in futures]
+        else:
+            client_results = [_process_client_day(**kwargs) for kwargs in client_kwargs]
 
-            # Step 2: Train — same loop for all clients
-            # Sample from Folsom replay buffer and recent FIFO buffer before training.
-            # n = round(len(indices) * ratio) mirrors _sample_replay_for_day in local_training.py.
-            _day_client_seed = seed + day_num * len(clients) + i
-            _reservoir_entries: list[tuple[Any, int]] = []
-            if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
-                _n_reservoir = max(0, int(round(len(indices) * replay_ratio)))
-                _reservoir_entries = _sample_replay_for_day(_folsom_replay_buffer, _n_reservoir, seed=_day_client_seed)
-            _recent_entries: list[tuple[Any, int]] = []
-            if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
-                _n_recent = max(0, int(round(len(indices) * recent_replay_ratio)))
-                _recent_entries = recent_buffers[i].sample(_n_recent, seed=_day_client_seed + 1)
-            _replay = (_reservoir_entries + _recent_entries) or None
-            # Proximal reference for FedProx local training
-            _prox_sd = last_global_state_dict if algorithm == "fedprox" else None
-            _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
-            loss = _train_day(
-                model,
-                datasets[i],
-                indices,
-                lr=adapt_lr,
-                weight_decay=adapt_weight_decay,
-                max_grad_norm=adapt_max_grad_norm,
-                batch_size=adapt_batch_size,
-                epochs=adapt_epochs,
-                device=device,
-                replay_entries=_replay,
-                global_state_dict=_prox_sd,
-                mu=_prox_mu,
-            )
-
-            losses.append(loss)
-
-            # Update recent FIFO buffer with today's samples
-            if recent_buffer_size > 0:
-                recent_buffers[i].add_day(datasets[i], indices)
+        for result in client_results:
+            i = result["client_idx"]
+            name = result["name"]
+            day_record[f"{name}_n"] = result["n_samples"]
+            day_record[f"{name}_mae"] = result["mae"]
+            day_record[f"{name}_rmse"] = result["rmse"]
+            if len(result["preds"]) > 0:
+                _all_preds[i].append(result["preds"])
+                _all_tgts[i].append(result["tgts"])
+            losses.append(result["loss"])
 
         per_day.append(day_record)
         # Only count toward sync_interval once warmup is over
@@ -812,7 +995,7 @@ def run_fl_benchmark(
             )
 
         _row = "  ".join(_fmt_client_col(n) for n in client_names)
-        print(f"  {day_key:<6}{_warmup_tag}  {_row}")
+        print(f"  {day_key:<6}{_warmup_tag}  {_row}", flush=True)
 
         # ---------------------------------------------------------------
         # Warmup cache snapshot
@@ -823,7 +1006,13 @@ def run_fl_benchmark(
             assert _warmup_cache_file is not None
             _warmup_cache_file.parent.mkdir(parents=True, exist_ok=True)
             _state_dicts = [m.state_dict() for m in models]
-            _recent_states = [{"entries": list(buf._entries)} for buf in recent_buffers]
+            # Save only (client_index, sample_index) pairs — NOT dataset objects.
+            # The datasets list order matches clients, so we map each dataset
+            # reference back to its client index for compact serialisation.
+            _ds_id_to_client = {id(ds): ci for ci, ds in enumerate(datasets)}
+            _recent_states = [
+                {"entries": [(_ds_id_to_client[id(ds)], idx) for ds, idx in buf._entries]} for buf in recent_buffers
+            ]
             torch.save(
                 {
                     "cache_key": _warmup_cache_key,
@@ -914,6 +1103,7 @@ def run_fl_benchmark(
                         replay_entries=_d_replay,
                         global_state_dict=last_global_state_dict,
                         mu=ditto_lambda,
+                        rng_seed=_d_seed,
                     )
 
             round_tag = "[WARMUP END] " if warmup_ended_today else ""
@@ -940,6 +1130,10 @@ def run_fl_benchmark(
             print(
                 f"  {'':6}      └─ {round_tag}FL Round {fl_round_idx:3d}  ({per_round[-1]['days_in_round']}d)  ΔW={wc:.5f}  losses: {_loss_str}"
             )
+
+    # Shut down thread pool
+    if _pool is not None:
+        _pool.shutdown(wait=False)
 
     # -----------------------------------------------------------------------
     # Overall metrics — built from accumulated predictions, no re-inference
@@ -1189,6 +1383,18 @@ def run_fl_benchmark(
         "  <dir>/summary.json    — overall metrics and config."
     ),
 )
+@click.option(
+    "--parallel-clients",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "Number of clients to process in parallel per day.  "
+        "Each client runs prediction + training on its own CUDA stream.  "
+        "1 = sequential (default).  Set to the number of clients for full "
+        "parallelism (overlaps CPU work and enables GPU stream concurrency)."
+    ),
+)
 def main(
     checkpoint: Path,
     dataset: tuple[Path, ...],
@@ -1213,6 +1419,7 @@ def main(
     ditto_lambda: float,
     fedema_alpha: float,
     save_results: Path | None,
+    parallel_clients: int,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
     # Build ordered client list from all --dataset flags
@@ -1246,6 +1453,7 @@ def main(
         fedprox_mu=fedprox_mu,
         ditto_lambda=ditto_lambda,
         fedema_alpha=fedema_alpha,
+        parallel_clients=parallel_clients,
     )
 
     if save_results is not None:

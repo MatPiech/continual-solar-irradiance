@@ -45,7 +45,6 @@ ALGORITHMS=(
 )
 
 CHECKPOINT="checkpoints/epoch_009.ckpt"
-RESULTS_ROOT="results/fl_benchmark/sync${SYNC_INTERVAL}"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
 # minimal so that FL aggregation does the heavy lifting).
@@ -65,6 +64,9 @@ DITTO_LAMBDA=1.0           # personalised proximal strength for Ditto
 FEDEMA_ALPHA=0.1           # EMA interpolation coefficient for FedEMA
 SEED=42
 DEVICE="cuda"
+PARALLEL_CLIENTS=0         # 0 = auto (number of datasets), 1 = sequential
+
+RESULTS_ROOT="results/fl_benchmark/days${NUM_DAYS}_warmup${WARMUP_DAYS}_sync${SYNC_INTERVAL}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -110,6 +112,7 @@ run_algorithm() {
         --fedema-alpha        "${FEDEMA_ALPHA}" \
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
+        --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \
         --save-results        "${OUT_DIR}"
 
     echo "  Done. Results saved to ${OUT_DIR}/"
