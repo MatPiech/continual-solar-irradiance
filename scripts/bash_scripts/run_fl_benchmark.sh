@@ -35,13 +35,13 @@ fi
 
 # FL algorithms to run for every dataset pair (comment out any you want to skip).
 ALGORITHMS=(
-    isolated   # lower bound — no federation
-    fedavg     # standard weight averaging
-    fedbn      # FedAvg, BatchNorm layers kept local
-    fedper     # backbone aggregated, head kept local
-    fedprox    # FedAvg + proximal term in local training
-    ditto      # dual-model with personalised proximal anchor
-    fedema     # FedAvg + EMA interpolation at distribution
+    # isolated   # lower bound — no federation
+    # fedavg     # standard weight averaging
+    # fedbn      # FedAvg, BatchNorm layers kept local
+    # fedper     # backbone aggregated, head kept local
+    # fedprox    # FedAvg + proximal term in local training
+    # ditto      # dual-model with personalised proximal anchor
+    # fedema     # FedAvg + EMA interpolation at distribution
     fedproto   # prototype exchange, no weight sharing
 )
 
@@ -66,7 +66,7 @@ FEDEMA_ALPHA=0.1           # EMA interpolation coefficient for FedEMA
 FEDPROTO_LAMBDA=0.1        # prototype regularisation strength for FedProto
 SEED=42
 DEVICE="cuda"
-PARALLEL_CLIENTS=0         # 0 = auto (number of datasets), 1 = sequential
+PARALLEL_CLIENTS="${#DATASETS[@]}"  # number of datasets
 
 RESULTS_ROOT="results/fl_benchmark/days${NUM_DAYS}_warmup${WARMUP_DAYS}_sync${SYNC_INTERVAL}"
 
@@ -116,7 +116,6 @@ run_algorithm() {
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \
-        --freeze-early-backbone \
         --save-results        "${OUT_DIR}"
 
     echo "  Done. Results saved to ${OUT_DIR}/"
