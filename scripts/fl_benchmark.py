@@ -94,8 +94,18 @@ def _load_test_dataset(dataset_path: Path) -> Any:
     return dm._test_dataset
 
 
-def _load_checkpoint(checkpoint_path: Path, device: str) -> Forecaster:
-    """Instantiate a Forecaster and load weights from *checkpoint_path*."""
+def _load_checkpoint(checkpoint_path: Path, device: str, freeze_early_backbone: bool = False) -> Forecaster:
+    """Instantiate a Forecaster and load weights from *checkpoint_path*.
+
+    Parameters
+    ----------
+    checkpoint_path : Path
+        Path to the checkpoint file.
+    device : str
+        Device to load the model on.
+    freeze_early_backbone : bool, optional
+        If True, freezes conv1, bn1, layer1, layer2 in the ResNet backbone.
+    """
     data = torch.load(checkpoint_path, map_location=device)
     hparams = data.get("hyper_parameters", {})
     model = Forecaster(
@@ -107,6 +117,10 @@ def _load_checkpoint(checkpoint_path: Path, device: str) -> Forecaster:
         lr_patience=hparams.get("lr_patience", 5),
     ).to(device)
     model.load_state_dict(data["state_dict"])
+
+    if freeze_early_backbone:
+        model.freeze_early_backbone()
+
     return model
 
 
@@ -686,6 +700,7 @@ def run_fl_benchmark(
     ditto_lambda: float = 0.0,
     fedema_alpha: float = 0.5,
     parallel_clients: int = 1,
+    freeze_early_backbone: bool = False,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
 
@@ -784,8 +799,11 @@ def run_fl_benchmark(
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
-    models = [_load_checkpoint(checkpoint_path, device) for _ in clients]
-    print(f"  All {len(clients)} clients initialised from the same checkpoint.\n")
+    models = [_load_checkpoint(checkpoint_path, device, freeze_early_backbone) for _ in clients]
+    if freeze_early_backbone:
+        print(f"  All {len(clients)} clients initialised from the same checkpoint (early backbone frozen).\n")
+    else:
+        print(f"  All {len(clients)} clients initialised from the same checkpoint.\n")
 
     # --- Day schedule ---
     all_days = generate_year_days()
@@ -869,6 +887,8 @@ def run_fl_benchmark(
             _cache = torch.load(_warmup_cache_file, map_location=device, weights_only=False)
             for i, model in enumerate(models):
                 model.load_state_dict(_cache["client_states"][i])
+                if freeze_early_backbone:
+                    model.freeze_early_backbone()
             per_day = _cache["per_day"]
             _all_preds = _cache["all_preds"]
             _all_tgts = _cache["all_tgts"]
@@ -1072,7 +1092,14 @@ def run_fl_benchmark(
             # local and is never shared — it just trains on the current
             # day's data anchored to the new global.
             if algorithm == "ditto":
-                for i in range(len(clients)):
+
+                def _ditto_train_client(
+                    i: int,
+                    day_key: str = day_key,
+                    day_num: int = day_num,
+                    last_global_state_dict: dict[str, Any] | None = last_global_state_dict,
+                ) -> None:
+                    _d_name = client_names[i]
                     _d_indices = day_maps[i].get(day_key, [])
                     _d_seed = seed + day_num * len(clients) + i
                     # Assemble same replay mix the global model used
@@ -1104,7 +1131,16 @@ def run_fl_benchmark(
                         global_state_dict=last_global_state_dict,
                         mu=ditto_lambda,
                         rng_seed=_d_seed,
+                        client_name=f"{_d_name} ditto",
                     )
+
+                if _pool is not None:
+                    ditto_futures = [_pool.submit(_ditto_train_client, i) for i in range(len(clients))]
+                    for fut in ditto_futures:
+                        fut.result()
+                else:
+                    for i in range(len(clients)):
+                        _ditto_train_client(i)
 
             round_tag = "[WARMUP END] " if warmup_ended_today else ""
             per_day[-1]["fl_round_after"] = fl_round_idx
@@ -1395,6 +1431,17 @@ def run_fl_benchmark(
         "parallelism (overlaps CPU work and enables GPU stream concurrency)."
     ),
 )
+@click.option(
+    "--freeze-early-backbone",
+    is_flag=True,
+    default=False,
+    help=(
+        "Freeze early backbone layers (conv1, bn1, layer1, layer2) in ResNet models. "
+        "Prevents low-level feature extractors from adapting during continual learning, "
+        "forcing adaptation to occur only in higher-level layers. Helps prevent catastrophic "
+        "forgetting of low-level features while allowing task-specific adaptation in deeper layers."
+    ),
+)
 def main(
     checkpoint: Path,
     dataset: tuple[Path, ...],
@@ -1420,6 +1467,7 @@ def main(
     fedema_alpha: float,
     save_results: Path | None,
     parallel_clients: int,
+    freeze_early_backbone: bool,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
     # Build ordered client list from all --dataset flags
@@ -1454,6 +1502,7 @@ def main(
         ditto_lambda=ditto_lambda,
         fedema_alpha=fedema_alpha,
         parallel_clients=parallel_clients,
+        freeze_early_backbone=freeze_early_backbone,
     )
 
     if save_results is not None:
