@@ -388,8 +388,10 @@ def _train_day(
         regularisation term that pulls local feature representations
         toward the global consensus.
     proto_lambda : float
-        Prototype regularisation strength for FedProto.
-        ``loss += λ · mean(‖feature(x) - global_proto[class(x)]‖²)``.
+        Prototype regularisation strength for FedProto (relative weight).
+        The prototype MSE term is adaptively scaled to match the task-loss
+        magnitude, so ``proto_lambda`` acts as a *relative* contribution:
+        0.1 means the prototype term contributes ~10 % of the task loss.
         0 disables the prototype term.
 
     Returns
@@ -498,9 +500,15 @@ def _train_day(
                 )
                 loss = loss + (mu / 2.0) * prox
 
-            # Prototype regularisation: λ · mean(‖f(x) - proto[class(x)]‖²)
-            # Pulls local feature representations toward the global consensus
-            # prototype for each weather condition (Clear / Overcast / Transient).
+            # Prototype regularisation (adaptively scaled):
+            #   loss += λ_rel · |L_task| · mean(‖f(x) - proto[class(x)]‖²) / (mean(‖…‖²) + ε)
+            # The BerHu task loss can range from single digits to millions
+            # (because it operates on ×1000 W/m² predictions), while prototype
+            # MSE on 2048-dim feature vectors is typically single digits.
+            # A fixed λ cannot balance both scales, so we adaptively scale
+            # the prototype term relative to the task loss magnitude.  This
+            # makes proto_lambda a *relative* weight: 0.1 ≈ proto contributes
+            # 10 % of the task-loss magnitude to the total gradient.
             if _use_proto:
                 proto_loss = torch.tensor(0.0, device=device)
                 n_proto = 0
@@ -511,7 +519,26 @@ def _train_day(
                         proto_loss = proto_loss + F.mse_loss(img_feats[b], _proto_on_device[cls])
                         n_proto += 1
                 if n_proto > 0:
-                    loss = loss + proto_lambda * (proto_loss / n_proto)
+                    avg_proto = proto_loss / n_proto
+                    # Adaptive scale: ratio of task-loss to proto-loss (both
+                    # detached so the scaling factor is treated as a constant
+                    # and gradients flow only through avg_proto).
+                    _task_loss_val = loss.detach()
+                    scale = _task_loss_val / (avg_proto.detach() + 1e-8)
+                    _proto_contrib = proto_lambda * scale * avg_proto
+                    loss = loss + _proto_contrib
+
+                    # Log loss components once per epoch (first batch only)
+                    # if count % len(batches) == 0:
+                    #     print(
+                    #         f"  {'':6}      [proto] {client_name} e{ep+1}  "
+                    #         f"task={_task_loss_val.item():.5f}  "
+                    #         f"proto_raw={avg_proto.item():.5f}  "
+                    #         f"scale={scale.item():.2f}  "
+                    #         f"proto_scaled={_proto_contrib.item():.5f}  "
+                    #         f"total={loss.item():.5f}  "
+                    #         f"λ={proto_lambda}  n={n_proto}/{imgs.size(0)}",
+                    #     )
 
             loss.backward()
             if max_grad_norm > 0:
@@ -970,13 +997,12 @@ def run_fl_benchmark(
                           w_local ← α·w_local + (1-α)·w_global after each
                           aggregation round.  Higher α retains more local
                           knowledge.
-    fedproto_lambda     : Prototype regularisation strength for FedProto.
-                          During local training the loss is augmented with
-                          λ · mean(‖feature(x) - global_proto[class(x)]‖²)
-                          where class(x) is the kc-stratified weather class
-                          (Clear / Overcast / Transient).  Higher values pull
-                          the local feature space closer to the global
-                          consensus.
+    fedproto_lambda     : Prototype regularisation relative weight for FedProto.
+                          The prototype MSE term is adaptively scaled to match
+                          the task-loss magnitude, so this parameter acts as a
+                          relative contribution (0.1 ≈ 10 % of the task loss).
+                          Higher values pull the local feature space closer to
+                          the global consensus.
 
     Returns
     -------
@@ -1676,10 +1702,10 @@ def run_fl_benchmark(
     default=0.1,
     show_default=True,
     help=(
-        "Prototype regularisation strength for FedProto.  Local loss is "
-        "augmented with λ·mean(‖feature(x)-global_proto[class(x)]‖²) where "
-        "class(x) is the kc-stratified weather class (Clear / Overcast / "
-        "Transient).  Only used when --algorithm=fedproto."
+        "Prototype regularisation relative weight for FedProto.  The prototype "
+        "MSE term is adaptively scaled to match the task-loss magnitude, so "
+        "this parameter acts as a relative contribution: 0.1 ≈ proto adds 10%% "
+        "of the task loss.  Only used when --algorithm=fedproto."
     ),
 )
 @click.option(
