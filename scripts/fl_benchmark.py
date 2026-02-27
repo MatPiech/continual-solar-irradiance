@@ -36,6 +36,9 @@ Algorithms
             trains with proximal regularization toward global.
   fedema    FedAvg + EMA interpolation at distribution:
             w ← α·w_local + (1-α)·w_global.
+  fedproto  Federated Prototype Learning: clients exchange per-class feature
+            prototypes (Clear/Overcast/Transient) instead of model weights.
+            Local loss is regularised toward global consensus prototypes.
 
 Usage
 -----
@@ -64,6 +67,7 @@ import click
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from cirr.datamodules.forecasting import ForecastingDataModule
@@ -75,6 +79,156 @@ from cirr.utils.metrics import compute_metrics
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# FedProto: kc-stratified prototype classes
+# ---------------------------------------------------------------------------
+# Weather conditions are classified from normalised target irradiance
+# (target_irradiance / 1000).  These thresholds approximate the clearness
+# index (kc) bins commonly used in solar forecasting literature.
+PROTO_OVERCAST = 0  # heavy cloud cover
+PROTO_TRANSIENT = 1  # variable / partly cloudy
+PROTO_CLEAR = 2  # clear or mostly clear sky
+PROTO_CLASS_NAMES = {PROTO_OVERCAST: "overcast", PROTO_TRANSIENT: "transient", PROTO_CLEAR: "clear"}
+
+_KC_OVERCAST_THRESHOLD = 0.15  # norm irradiance < 150 W/m²
+_KC_CLEAR_THRESHOLD = 0.50  # norm irradiance >= 500 W/m²
+
+
+def _classify_irradiance(norm_irradiance: float) -> int:
+    """Classify a normalised irradiance value into a prototype weather class.
+
+    Parameters
+    ----------
+    norm_irradiance : float
+        Target irradiance normalised to [0, 1] (i.e. target / 1000 W/m²).
+
+    Returns
+    -------
+    class_idx : int
+        One of ``PROTO_OVERCAST``, ``PROTO_TRANSIENT``, ``PROTO_CLEAR``.
+    """
+    if norm_irradiance < _KC_OVERCAST_THRESHOLD:
+        return PROTO_OVERCAST
+    elif norm_irradiance < _KC_CLEAR_THRESHOLD:
+        return PROTO_TRANSIENT
+    else:
+        return PROTO_CLEAR
+
+
+def _extract_day_prototypes(
+    model: Forecaster,
+    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    device: str,
+    batch_size: int,
+) -> dict[int, tuple[torch.Tensor, int]]:
+    """Extract per-class prototype feature vectors from a day's samples.
+
+    Passes samples through the image encoder and accumulates feature sums
+    per weather class (Clear, Overcast, Transient).
+
+    Parameters
+    ----------
+    model : Forecaster
+        Model whose ``image_encoder`` produces the feature vectors.
+    day_samples : list
+        Pre-loaded ``(image, irr_hist, target)`` tensor tuples.
+    device : str
+        Compute device.
+    batch_size : int
+        Batch size for feature extraction.
+
+    Returns
+    -------
+    prototypes : dict[int, tuple[Tensor, int]]
+        Mapping from class index to ``(sum_of_features, sample_count)``.
+        Feature sums are on CPU.
+    """
+    if not day_samples:
+        return {}
+
+    model.eval()
+    proto_sums: dict[int, torch.Tensor] = {}
+    proto_counts: dict[int, int] = {}
+
+    with torch.no_grad():
+        for start in range(0, len(day_samples), batch_size):
+            batch = day_samples[start : start + batch_size]
+            imgs = torch.stack([s[0] for s in batch]).to(device)
+            tgts = [s[2] for s in batch]
+
+            features = model.image_encoder(imgs)  # [B, num_features]
+
+            for b in range(len(batch)):
+                tgt_val = tgts[b].item() if isinstance(tgts[b], torch.Tensor) else float(tgts[b])
+                cls = _classify_irradiance(tgt_val)
+                feat = features[b].cpu()
+
+                if cls not in proto_sums:
+                    proto_sums[cls] = torch.zeros_like(feat)
+                    proto_counts[cls] = 0
+                proto_sums[cls] += feat
+                proto_counts[cls] += 1
+
+    return {cls: (proto_sums[cls], proto_counts[cls]) for cls in proto_sums}
+
+
+def _accumulate_prototypes(
+    accum: dict[int, tuple[torch.Tensor, int]],
+    day_protos: dict[int, tuple[torch.Tensor, int]],
+) -> dict[int, tuple[torch.Tensor, int]]:
+    """Merge *day_protos* into running accumulator *accum* (in-place).
+
+    Returns the modified *accum* for convenience.
+    """
+    for cls, (feat_sum, count) in day_protos.items():
+        if cls in accum:
+            old_sum, old_count = accum[cls]
+            accum[cls] = (old_sum + feat_sum, old_count + count)
+        else:
+            accum[cls] = (feat_sum.clone(), count)
+    return accum
+
+
+def _aggregate_global_prototypes(
+    client_protos: list[dict[int, tuple[torch.Tensor, int]]],
+) -> dict[int, torch.Tensor]:
+    """Average per-class prototypes across all clients (weighted by count).
+
+    Each client's prototype for a class is the feature-vector sum and
+    sample count accumulated since the last sync.  The global prototype
+    is the *count-weighted* average across clients — clients with more
+    samples in a given class contribute proportionally more.
+
+    Parameters
+    ----------
+    client_protos : list[dict[int, tuple[Tensor, int]]]
+        Per-client accumulated prototypes: class → ``(sum_features, count)``.
+
+    Returns
+    -------
+    global_prototypes : dict[int, Tensor]
+        Global mean prototype for each weather class (on CPU).
+    """
+    global_protos: dict[int, torch.Tensor] = {}
+
+    for cls in (PROTO_OVERCAST, PROTO_TRANSIENT, PROTO_CLEAR):
+        total_sum: torch.Tensor | None = None
+        total_count = 0
+
+        for client_proto in client_protos:
+            if cls in client_proto:
+                feat_sum, count = client_proto[cls]
+                if total_sum is None:
+                    total_sum = feat_sum.clone()
+                else:
+                    total_sum += feat_sum
+                total_count += count
+
+        if total_sum is not None and total_count > 0:
+            global_protos[cls] = total_sum / total_count
+
+    return global_protos
 
 
 def _load_test_dataset(dataset_path: Path) -> Any:
@@ -204,6 +358,8 @@ def _train_day(
     rng_seed: int | None = None,
     day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
     client_name: str = "",
+    global_prototypes: dict[int, torch.Tensor] | None = None,
+    proto_lambda: float = 0.0,
 ) -> float:
     """Train *model* for *epochs* epochs on *day_indices*.
 
@@ -224,6 +380,17 @@ def _train_day(
     day_samples : list, optional
         Pre-loaded (image, irr_hist, target) tensor tuples from
         ``_predict_day()``.  Avoids redundant dataset reads.
+    global_prototypes : dict, optional
+        FedProto global prototypes: mapping from weather class index
+        (``PROTO_OVERCAST``, ``PROTO_TRANSIENT``, ``PROTO_CLEAR``) to a
+        mean feature-vector tensor.  When provided together with
+        ``proto_lambda > 0``, the loss is augmented with a prototype
+        regularisation term that pulls local feature representations
+        toward the global consensus.
+    proto_lambda : float
+        Prototype regularisation strength for FedProto.
+        ``loss += λ · mean(‖feature(x) - global_proto[class(x)]‖²)``.
+        0 disables the prototype term.
 
     Returns
     -------
@@ -265,6 +432,12 @@ def _train_day(
     if mu > 0.0 and global_state_dict is not None:
         _prox_ref = {k: v.detach().to(device) for k, v in global_state_dict.items() if v.is_floating_point()}
 
+    # Pre-move global prototypes to device for FedProto regularisation
+    _use_proto = global_prototypes is not None and proto_lambda > 0.0
+    _proto_on_device: dict[int, torch.Tensor] = {}
+    if _use_proto:
+        _proto_on_device = {cls: proto.detach().to(device) for cls, proto in global_prototypes.items()}
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr,
@@ -302,7 +475,15 @@ def _train_day(
                 tgts = torch.stack([ds[idx][2] for ds, idx in batch]).to(device)  # type: ignore
 
             optimizer.zero_grad()
-            mean, var = model(imgs, hist)
+
+            # Forward pass — use forward_with_features when prototype
+            # regularisation is active to get intermediate encoder features
+            # in a single pass (no redundant encoder computation).
+            if _use_proto:
+                mean, var, img_feats = model.forward_with_features(imgs, hist)
+            else:
+                mean, var = model(imgs, hist)
+
             if var is not None:
                 loss = model.loss_fn(mean, tgts, var)
             elif model.loss_name == "Berhu":
@@ -316,6 +497,21 @@ def _train_day(
                     ((p - _prox_ref[n]) ** 2).sum() for n, p in model.named_parameters() if p.requires_grad and n in _prox_ref
                 )
                 loss = loss + (mu / 2.0) * prox
+
+            # Prototype regularisation: λ · mean(‖f(x) - proto[class(x)]‖²)
+            # Pulls local feature representations toward the global consensus
+            # prototype for each weather condition (Clear / Overcast / Transient).
+            if _use_proto:
+                proto_loss = torch.tensor(0.0, device=device)
+                n_proto = 0
+                for b in range(imgs.size(0)):
+                    tgt_val = tgts[b].item()
+                    cls = _classify_irradiance(tgt_val)
+                    if cls in _proto_on_device:
+                        proto_loss = proto_loss + F.mse_loss(img_feats[b], _proto_on_device[cls])
+                        n_proto += 1
+                if n_proto > 0:
+                    loss = loss + proto_lambda * (proto_loss / n_proto)
 
             loss.backward()
             if max_grad_norm > 0:
@@ -559,12 +755,19 @@ def _process_client_day(
     recent_replay_ratio: float,
     global_state_dict: dict[str, Any] | None,
     prox_mu: float,
+    global_prototypes: dict[int, torch.Tensor] | None = None,
+    proto_lambda: float = 0.0,
+    extract_prototypes: bool = False,
 ) -> dict[str, Any]:
     """Process prediction + training for one client on one day.
 
     Thread-safe: uses per-client CUDA stream and deterministic local RNG.
     Each client operates on its own model, dataset, and buffers — no shared
     mutable state between clients.
+
+    When *extract_prototypes* is True, per-class prototype feature vectors
+    are extracted after training and included in the returned dict under
+    key ``"day_prototypes"`` (for FedProto accumulation).
     """
     use_cuda = device != "cpu" and torch.cuda.is_available()
     stream = torch.cuda.Stream(device) if use_cuda else None
@@ -605,9 +808,17 @@ def _process_client_day(
             rng_seed=rng_seed,
             day_samples=day_samples,
             client_name=name,
+            global_prototypes=global_prototypes,
+            proto_lambda=proto_lambda,
         )
 
-        # Step 4: Update recent FIFO buffer
+        # Step 4: Extract per-class prototypes (FedProto — after training
+        # so features reflect the updated model)
+        day_protos: dict[int, tuple[torch.Tensor, int]] = {}
+        if extract_prototypes and day_samples:
+            day_protos = _extract_day_prototypes(model, day_samples, device, adapt_batch_size)
+
+        # Step 5: Update recent FIFO buffer
         if recent_buffer_size > 0:
             recent_buffer.add_day(dataset, day_indices)
 
@@ -623,6 +834,7 @@ def _process_client_day(
         "mae": metrics.get("mae", float("nan")),
         "rmse": metrics.get("rmse", float("nan")),
         "loss": loss,
+        "day_prototypes": day_protos,
     }
 
 
@@ -699,6 +911,7 @@ def run_fl_benchmark(
     fedprox_mu: float = 0.0,
     ditto_lambda: float = 0.0,
     fedema_alpha: float = 0.5,
+    fedproto_lambda: float = 0.1,
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
 ) -> dict[str, Any]:
@@ -711,7 +924,7 @@ def run_fl_benchmark(
     checkpoint_path     : Path to initial pretrained checkpoint (all clients start here).
     clients             : Ordered list of (name, dataset_path) tuples.
     algorithm           : One of "isolated", "fedavg", "fedbn", "fedper",
-                          "fedprox", "ditto", "fedema".
+                          "fedprox", "ditto", "fedema", "fedproto".
     sync_interval       : Days between FL aggregation rounds (e.g. 7 or 14).
     num_days            : Total days to simulate (-1 = all).
     start_day           : MMDD string (e.g. "0101").
@@ -757,6 +970,13 @@ def run_fl_benchmark(
                           w_local ← α·w_local + (1-α)·w_global after each
                           aggregation round.  Higher α retains more local
                           knowledge.
+    fedproto_lambda     : Prototype regularisation strength for FedProto.
+                          During local training the loss is augmented with
+                          λ · mean(‖feature(x) - global_proto[class(x)]‖²)
+                          where class(x) is the kc-stratified weather class
+                          (Clear / Overcast / Transient).  Higher values pull
+                          the local feature space closer to the global
+                          consensus.
 
     Returns
     -------
@@ -856,6 +1076,10 @@ def run_fl_benchmark(
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
     _all_tgts: list[list[np.ndarray]] = [[] for _ in clients]
 
+    # --- FedProto state: per-class prototype accumulators and global prototypes ---
+    _proto_accum: list[dict[int, tuple[torch.Tensor, int]]] = [{} for _ in clients]
+    _global_prototypes: dict[int, torch.Tensor] | None = None  # set after first FedProto sync
+
     # -----------------------------------------------------------------------
     # Warmup cache — load if available, skipping the warmup simulation
     # -----------------------------------------------------------------------
@@ -952,6 +1176,7 @@ def run_fl_benchmark(
         _infer_models = ditto_models if algorithm == "ditto" else models
         _global_sd = last_global_state_dict if algorithm == "fedprox" else None
         _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
+        _is_fedproto = algorithm == "fedproto"
         client_kwargs = [
             {
                 "client_idx": i,
@@ -975,6 +1200,9 @@ def run_fl_benchmark(
                 "recent_replay_ratio": recent_replay_ratio,
                 "global_state_dict": _global_sd,
                 "prox_mu": _prox_mu,
+                "global_prototypes": _global_prototypes if _is_fedproto else None,
+                "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
+                "extract_prototypes": _is_fedproto and not in_warmup,
             }
             for i in range(len(clients))
         ]
@@ -995,6 +1223,10 @@ def run_fl_benchmark(
                 _all_preds[i].append(result["preds"])
                 _all_tgts[i].append(result["tgts"])
             losses.append(result["loss"])
+
+            # FedProto: accumulate per-class prototypes for this client
+            if _is_fedproto and result.get("day_prototypes"):
+                _accumulate_prototypes(_proto_accum[i], result["day_prototypes"])
 
         per_day.append(day_record)
         # Only count toward sync_interval once warmup is over
@@ -1062,29 +1294,56 @@ def run_fl_benchmark(
             days_since_sync = 0
 
         if _do_aggregate:
-            agg_fn = AGGREGATION_FNS[algorithm]
-            state_dicts = _state_dicts if _state_dicts is not None else [m.state_dict() for m in models]
+            if algorithm == "fedproto":
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # FedProto: aggregate prototypes, NOT model weights.
+                # Each client keeps its own model entirely local.
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                _global_prototypes = _aggregate_global_prototypes(_proto_accum)
+                wc = 0.0  # no weight-level change
 
-            # Capture local-only layers before aggregation
-            if algorithm == "fedbn":
-                local_bn = [_extract_local_keys(sd, _is_bn_key) for sd in state_dicts]
-            if algorithm == "fedper":
-                local_head = [_extract_local_keys(sd, _is_head_key) for sd in state_dicts]
+                # Log prototype summary
+                _proto_cls_str = "  ".join(
+                    f"{PROTO_CLASS_NAMES[c]}={_global_prototypes[c].norm():.3f}" for c in sorted(_global_prototypes)
+                )
+                print(f"  {'':6}      [proto] Aggregated {len(_global_prototypes)} class prototypes: " f"{_proto_cls_str}")
+                # Print per-client sample counts that contributed
+                for ci, cname in enumerate(client_names):
+                    _counts = {PROTO_CLASS_NAMES[c]: cnt for c, (_, cnt) in _proto_accum[ci].items()}
+                    if _counts:
+                        _cnt_str = "  ".join(f"{k}={v}" for k, v in _counts.items())
+                        print(f"  {'':6}              {cname}: {_cnt_str}")
 
-            new_global, wc = agg_fn(state_dicts[0], state_dicts)
-            last_global_state_dict = copy.deepcopy(new_global)
+                # Reset accumulators for next sync interval
+                _proto_accum = [{} for _ in clients]
 
-            # Distribute back — restore local layers per client
-            for i, model in enumerate(models):
-                merged = new_global
+            else:
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                # Weight-based FL algorithms
+                # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                agg_fn = AGGREGATION_FNS[algorithm]
+                state_dicts = _state_dicts if _state_dicts is not None else [m.state_dict() for m in models]
+
+                # Capture local-only layers before aggregation
                 if algorithm == "fedbn":
-                    merged = _restore_local_keys(merged, local_bn[i])
-                elif algorithm == "fedper":
-                    merged = _restore_local_keys(merged, local_head[i])
-                elif algorithm == "fedema":
-                    # Soft interpolation: w ← α·w_local + (1-α)·w_global
-                    merged = _ema_interpolate(state_dicts[i], new_global, fedema_alpha)
-                model.load_state_dict(merged)
+                    local_bn = [_extract_local_keys(sd, _is_bn_key) for sd in state_dicts]
+                if algorithm == "fedper":
+                    local_head = [_extract_local_keys(sd, _is_head_key) for sd in state_dicts]
+
+                new_global, wc = agg_fn(state_dicts[0], state_dicts)
+                last_global_state_dict = copy.deepcopy(new_global)
+
+                # Distribute back — restore local layers per client
+                for i, model in enumerate(models):
+                    merged = new_global
+                    if algorithm == "fedbn":
+                        merged = _restore_local_keys(merged, local_bn[i])
+                    elif algorithm == "fedper":
+                        merged = _restore_local_keys(merged, local_head[i])
+                    elif algorithm == "fedema":
+                        # Soft interpolation: w ← α·w_local + (1-α)·w_global
+                        merged = _ema_interpolate(state_dicts[i], new_global, fedema_alpha)
+                    model.load_state_dict(merged)
 
             # Ditto: train personalised models with proximal toward the
             # *freshly aggregated* global consensus.  Only the global
@@ -1246,7 +1505,9 @@ def run_fl_benchmark(
 )
 @click.option(
     "--algorithm",
-    type=click.Choice(["isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema"], case_sensitive=False),
+    type=click.Choice(
+        ["isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto"], case_sensitive=False
+    ),
     default="fedbn",
     show_default=True,
     help=(
@@ -1257,7 +1518,8 @@ def run_fl_benchmark(
         "  fedper   — aggregate backbone only, keep head local.\n"
         "  fedprox  — FedAvg + proximal term in local training.\n"
         "  ditto    — dual-model with personalised proximal anchor.\n"
-        "  fedema   — FedAvg + EMA interpolation at distribution."
+        "  fedema   — FedAvg + EMA interpolation at distribution.\n"
+        "  fedproto — share per-class feature prototypes, not weights."
     ),
 )
 @click.option(
@@ -1409,6 +1671,18 @@ def run_fl_benchmark(
     ),
 )
 @click.option(
+    "--fedproto-lambda",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help=(
+        "Prototype regularisation strength for FedProto.  Local loss is "
+        "augmented with λ·mean(‖feature(x)-global_proto[class(x)]‖²) where "
+        "class(x) is the kc-stratified weather class (Clear / Overcast / "
+        "Transient).  Only used when --algorithm=fedproto."
+    ),
+)
+@click.option(
     "--save-results",
     type=click.Path(path_type=Path),
     default=None,
@@ -1465,6 +1739,7 @@ def main(
     fedprox_mu: float,
     ditto_lambda: float,
     fedema_alpha: float,
+    fedproto_lambda: float,
     save_results: Path | None,
     parallel_clients: int,
     freeze_early_backbone: bool,
@@ -1501,6 +1776,7 @@ def main(
         fedprox_mu=fedprox_mu,
         ditto_lambda=ditto_lambda,
         fedema_alpha=fedema_alpha,
+        fedproto_lambda=fedproto_lambda,
         parallel_clients=parallel_clients,
         freeze_early_backbone=freeze_early_backbone,
     )
@@ -1553,6 +1829,7 @@ def main(
             "fedprox_mu": fedprox_mu,
             "ditto_lambda": ditto_lambda,
             "fedema_alpha": fedema_alpha,
+            "fedproto_lambda": fedproto_lambda,
         }
         with (save_results / "summary.json").open("w") as fh:
             json.dump(summary, fh, indent=2)

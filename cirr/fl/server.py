@@ -264,6 +264,39 @@ def fedema_aggregate(
     return federated_averaging(global_weights, client_updates)
 
 
+def fedproto_aggregate(
+    global_weights: dict[str, Any],
+    _client_updates: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    """FedProto: no weight aggregation — each client keeps fully local weights.
+
+    In Federated Prototype Learning, clients exchange per-class prototype
+    feature vectors (average image-encoder outputs for Clear / Overcast /
+    Transient weather conditions) instead of model weights.  The server
+    aggregates prototypes, not weights, so this function is a deliberate
+    no-op on the weight dictionaries.
+
+    Prototype extraction, aggregation, and the contrastive regularisation
+    loss are implemented in the benchmark runner (``run_fl_benchmark``).
+
+    Parameters
+    ----------
+    global_weights : dict
+        Current global model state dictionary (returned **unchanged**).
+    client_updates : list[dict]
+        Client state dictionaries (ignored — prototypes are handled
+        separately).
+
+    Returns
+    -------
+    global_weights : dict
+        Unchanged model weights.
+    weight_change : float
+        Always 0.0 (no weight-level aggregation).
+    """
+    return global_weights, 0.0
+
+
 # ---------------------------------------------------------------------------
 # Public registry: maps algorithm name → aggregation callable
 # ---------------------------------------------------------------------------
@@ -275,4 +308,5 @@ AGGREGATION_FNS: dict[str, Any] = {
     "fedprox": fedprox_aggregate,
     "ditto": ditto_aggregate,
     "fedema": fedema_aggregate,
+    "fedproto": fedproto_aggregate,
 }
