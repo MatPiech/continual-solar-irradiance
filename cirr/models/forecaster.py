@@ -32,17 +32,20 @@ class Forecaster(pl.LightningModule):
         self.image_encoder = timm.create_model(
             model_name.replace("timm-", ""),
             pretrained=pretrained,
-            num_classes=0,  # num_classes=0 removes the final classification layer automatically in newer timm versions
+            num_classes=1,  # num_classes=0 removes the final classification layer automatically in newer timm versions
             in_chans=input_channels,
         )
 
         # Handling timm version differences for retrieving feature dim
         if hasattr(self.image_encoder, "num_features"):
             self.num_features = self.image_encoder.num_features
-        else:
+        elif "resnet" in model_name:
             # Fallback for some models
             self.num_features = self.image_encoder.fc.in_features
             self.image_encoder.fc = torch.nn.Identity()
+        elif "efficientvit" in model_name:
+            self.num_features = self.image_encoder.head.classifier[-1].in_features
+            self.image_encoder.head.classifier[-1] = torch.nn.Identity()
 
         # 3. Dynamic Head Construction
         # If Probabilistic (GNLL), we need 2 outputs [Mean, Var].
@@ -338,15 +341,60 @@ class Forecaster(pl.LightningModule):
             out = F.softplus(out)
             return out, None
 
+    def extract_proto_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract prototype features from the deep attention stage.
+
+        For EfficientViT models (those with ``image_encoder.stages``), runs the
+        input through the full encoder with a forward hook on ``stages[3]`` (the
+        linear attention block) and returns the global-average-pooled output
+        ``[B, proto_dim]``.  Early CNN stages (``stages[0]`` / ``stages[1]``)
+        learn site-local texture and horizon lines and are deliberately excluded
+        from the prototype representation — their output is never compared
+        across clients.
+
+        For other architectures (e.g. ResNet) falls back to the full encoder
+        output so that legacy checkpoints work unchanged.
+
+        Returns
+        -------
+        proto_feats : Tensor, shape (B, proto_dim)
+            Stage-3 GAP features (EfficientViT) or full encoder output (ResNet).
+        """
+        if hasattr(self.image_encoder, "stages"):
+            _out: dict[str, torch.Tensor] = {}
+            _handle = self.image_encoder.stages[3].register_forward_hook(lambda _m, _i, o: _out.update({"feat": o}))
+            try:
+                self.image_encoder(x)
+            finally:
+                _handle.remove()
+            feat = _out["feat"]  # [B, C, H, W]
+            return feat.mean(dim=(-2, -1))  # GAP → [B, proto_dim]
+        else:
+            return self.image_encoder(x)
+
     def forward_with_features(
         self, x: torch.Tensor, irradiance_history: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Forward pass that also returns intermediate image-encoder features.
+        """Forward pass that also returns stage-3 prototype features.
 
-        Used by FedProto for prototype extraction and regularisation.
-        The feature vector is the raw output of ``self.image_encoder`` *before*
-        fusion with the irradiance history — i.e. the semantic representation
-        of the sky image that prototypes are built from.
+        Used by FedProto for prototype regularisation.  A single encoder
+        forward pass is performed; prototype features are captured via a
+        lightweight hook on ``stages[3]`` and must **not** be confused with
+        the full encoder output used for the irradiance prediction.
+
+        Architecture contract (EfficientViT B2)
+        -----------------------------------------
+        * **Private stem** — ``stages[0]`` / ``stages[1]`` (early CNN blocks)
+          learn site-local textures and horizon geometry.  Their gradients are
+          untouched by the prototype loss and weights stay fully local.
+        * **Shared core** — ``stages[3]`` (linear attention) produces
+          disentangled cloud-physics representations suitable for cross-client
+          prototype comparison.  The prototype MSE loss applies here.
+        * **Private head** — ``network_head`` adapts to the local pyranometer
+          calibration offset without any federated penalty.
+
+        For ResNet checkpoints the full encoder output is returned unchanged
+        (backward-compatible fallback).
 
         Returns
         -------
@@ -354,20 +402,32 @@ class Forecaster(pl.LightningModule):
             Predicted irradiance (after softplus).
         variance : Tensor or None
             Predicted variance (probabilistic mode) or None.
-        img_feats : Tensor, shape (B, num_features)
-            Image-encoder feature vectors.
+        proto_feats : Tensor, shape (B, proto_dim)
+            Stage-3 GAP features (EfficientViT) or full encoder output (ResNet).
         """
-        img_feats = self.image_encoder(x)
+        # Capture stage-3 spatial output during the single encoder forward pass.
+        _proto_holder: dict[str, torch.Tensor] = {}
+        if hasattr(self.image_encoder, "stages"):
+            _handle = self.image_encoder.stages[3].register_forward_hook(lambda _m, _i, o: _proto_holder.update({"feat": o}))
+
+        try:
+            img_feats = self.image_encoder(x)  # [B, encoder_dim] — used for prediction
+        finally:
+            if hasattr(self.image_encoder, "stages"):
+                _handle.remove()
+
+        proto_feats = _proto_holder["feat"].mean(dim=(-2, -1)) if "feat" in _proto_holder else img_feats
+
         fused = torch.cat([img_feats, irradiance_history], dim=1)
         out = self.network_head(fused)
 
         if self.is_probabilistic:
             mean = F.softplus(out[:, 0].unsqueeze(1))
             variance = F.softplus(out[:, 1].unsqueeze(1)) + 1e-6
-            return mean, variance, img_feats
+            return mean, variance, proto_feats
         else:
             out = F.softplus(out)
-            return out, None, img_feats
+            return out, None, proto_feats
 
     def _shared_step(self, batch, stage):
         """

@@ -45,7 +45,7 @@ ALGORITHMS=(
     fedproto   # prototype exchange, no weight sharing
 )
 
-CHECKPOINT="checkpoints/epoch_009.ckpt"
+CHECKPOINT="checkpoints/epoch_024.ckpt"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
 # minimal so that FL aggregation does the heavy lifting).
