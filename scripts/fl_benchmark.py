@@ -157,7 +157,10 @@ def _extract_day_prototypes(
             imgs = torch.stack([s[0] for s in batch]).to(device)
             tgts = [s[2] for s in batch]
 
-            features = model.image_encoder(imgs)  # [B, num_features]
+            # Use extract_proto_features so EfficientViT prototypes come from
+            # stages[3] (deep attention) rather than the full encoder head.
+            # For ResNet this falls back to the full image_encoder output.
+            features = model.extract_proto_features(imgs)  # [B, proto_dim]
 
             for b in range(len(batch)):
                 tgt_val = tgts[b].item() if isinstance(tgts[b], torch.Tensor) else float(tgts[b])
@@ -227,7 +230,7 @@ def _aggregate_global_prototypes(
     per_client_protos : list[dict[int, Tensor]]
         Personalised global prototypes for each client.
     attention_weights : dict[int, list[list[float]]]
-        Per-class attention matrix (N_clients × N_clients) for logging.
+        Per-class attention matrix (N_clients x N_clients) for logging.
         ``attention_weights[cls][i][j]`` is the weight client *i* assigns
         to client *j* for class *cls*.
     """
@@ -273,7 +276,7 @@ def _aggregate_global_prototypes(
         # Weighted prototypes: each present client gets a personalised average
         weighted = attn @ proto_stack  # (K, D)
 
-        # Build full N_clients × N_clients attention matrix for logging
+        # Build full N_clients x N_clients attention matrix for logging
         cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]
         for ki, i in enumerate(present):
             per_client_protos[i][cls] = weighted[ki]
