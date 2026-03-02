@@ -6,13 +6,15 @@ from typing import Any
 
 import click
 import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.datamodules.loading import load_dataset
+from cirr.evaluation.printing import print_day_metrics, print_metrics_header, print_overall_metrics
+from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
-from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
+from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.utils.dataset_utils import build_subset_loader, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
 
@@ -59,8 +61,7 @@ def evaluate_dataset(
     current_day_preds = []
     current_day_targets = []
 
-    print("Day    MAE        RMSE       MAPE       WAPE       SMAPE      Samples ")
-    print("------------------------------------------------------------------------")
+    print_metrics_header()
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
@@ -92,14 +93,13 @@ def evaluate_dataset(
             if isinstance(image_name, bytes):
                 image_name = image_name.decode("utf-8")
 
-            day_key = None
-            timestamp = None
+            day_key: str | None = None
+            timestamp: str | None = None
             if isinstance(image_name, str) and len(image_name) >= 8:
-                day_key = image_name[4:8]  # MMDD format
-                timestamp = image_name  # Use full image name as timestamp
+                day_key = image_name[4:8]
+                timestamp = image_name
             elif indices is not None and batch_idx < len(indices):
-                period = periods[indices[batch_idx]]
-                period_image = period["history"][-1]["image_name"]
+                period_image = periods[indices[batch_idx]]["history"][-1]["image_name"]
                 day_key = period_image[4:8]
                 timestamp = period_image
 
@@ -123,16 +123,7 @@ def evaluate_dataset(
                     current_day = day_key
 
                 if day_key != current_day:
-                    day_metrics = compute_metrics(
-                        np.array(current_day_preds),
-                        np.array(current_day_targets),
-                    )
-                    print(
-                        f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-                        f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
-                        f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
-                        f"{day_metrics['count']:<8}"
-                    )
+                    print_day_metrics(current_day, current_day_preds, current_day_targets)
                     current_day = day_key
                     current_day_preds = []
                     current_day_targets = []
@@ -141,29 +132,13 @@ def evaluate_dataset(
                 current_day_targets.extend(target_np)
 
     if current_day is not None and current_day_preds:
-        day_metrics = compute_metrics(
-            np.array(current_day_preds),
-            np.array(current_day_targets),
-        )
-        print(
-            f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-            f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
-            f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
-            f"{day_metrics['count']:<8}"
-        )
+        print_day_metrics(current_day, current_day_preds, current_day_targets)
 
-    # Compute overall metrics
-    all_predictions = np.array(all_predictions)
-    all_targets = np.array(all_targets)
-    overall_metrics = compute_metrics(all_predictions, all_targets)
-
-    # Compute per-day metrics
-    per_day_metrics = {}
-    for day_key in sorted(day_predictions.keys()):
-        day_preds = np.array(day_predictions[day_key])
-        day_targets_arr = np.array(day_targets[day_key])
-        per_day_metrics[day_key] = compute_metrics(day_preds, day_targets_arr)
-
+    overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
+    per_day_metrics = {
+        day_key: compute_metrics(np.array(day_predictions[day_key]), np.array(day_targets[day_key]))
+        for day_key in sorted(day_predictions)
+    }
     return overall_metrics, per_day_metrics, predictions_data
 
 
@@ -197,7 +172,7 @@ def evaluate_dataset(
     help="Starting day in MMDD format (e.g., 0101)",
 )
 def main(
-    checkpoint: str,
+    checkpoint: Path,
     dataset_path: Path,
     save_results: bool,
     num_days: int,
@@ -205,127 +180,46 @@ def main(
 ) -> None:
     """Evaluate solar irradiance forecasting model."""
     dataset_name = dataset_path.name.split("_")[0]
-    # Load model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print("Loading model...")
-    model = Forecaster(
-        model_name="timm-resnet50",
-        pretrained=True,
-        input_channels=3,
-        loss_function="GNLL",
-        lr=0.001,
-        lr_patience=5,
-    )
-    checkpoint_data = torch.load(checkpoint)
-    model.load_state_dict(checkpoint_data["state_dict"])
+    model = load_forecaster_from_checkpoint(checkpoint, device=device, strict=False)
 
-    # Load dataset
     print(f"Loading dataset from {dataset_path}...")
-    datamodule = ForecastingDataModule(
-        root_data_path=dataset_path,
-        periods_path=dataset_path / "periods.pickle",
-        augment=False,
-        image_size=[128, 128],
-        image_mean=[0.485, 0.456, 0.406],
-        image_std=[0.229, 0.224, 0.225],
-        batch_size=1,
-        workers=0,
-        seed=42,
-    )
-    datamodule.setup(None)
-    test_dataset = datamodule._test_dataset
-
-    print(f"Test set size: {len(test_dataset)} samples\n")
-
-    # Group indices by day
+    test_dataset = load_dataset(dataset_path, split="test")
     day_index_map = group_indices_by_day(test_dataset._periods)
+    print(f"Test set size: {len(test_dataset)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
 
-    # Determine which days to evaluate
-    indices = None
-    if num_days > 0:
-        all_days = generate_year_days()
-        if start_day not in all_days:
-            raise ValueError(f"Invalid start_day '{start_day}'. Must be in MMDD format (0101-1231)")
-        start_idx = all_days.index(start_day)
-        selected_days = all_days[start_idx : start_idx + num_days]
-
-        # Collect indices for selected days
-        indices = []
-        for day_key in selected_days:
-            if day_key in day_index_map:
-                indices.extend(day_index_map[day_key])
-
-        print(f"Evaluating {len(selected_days)} days starting from {start_day}")
+    test_loader, indices = build_subset_loader(test_dataset, day_index_map, num_days, start_day)
+    if indices:
+        print(f"Evaluating {num_days} days starting from {start_day}")
         print(f"Total samples: {len(indices)}\n")
     else:
         print("Evaluating all days\n")
 
-    # Create test loader
-    if indices is not None:
-        test_loader = DataLoader(
-            Subset(test_dataset, indices),
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-        )
-    else:
-        test_loader = datamodule.test_dataloader()
-
-    # Evaluate
     print("Evaluating model...")
     overall_metrics, per_day_metrics, predictions_data = evaluate_dataset(
-        model,
-        test_loader,
-        test_dataset._periods,
-        indices=indices,
+        model, test_loader, test_dataset._periods, indices=indices or None, device=device
     )
 
-    # Print results
-    print(f"\n{'='*60}")
-    print(f"Evaluation Results: {dataset_name}")
-    print(f"{'='*60}\n")
+    print_overall_metrics(overall_metrics, tag=dataset_name)
 
-    print("Overall Metrics:")
-    print(f"  MAE:   {overall_metrics['mae']:.4f}")
-    print(f"  RMSE:  {overall_metrics['rmse']:.4f}")
-    print(f"  MAPE:  {overall_metrics['mape']:.2%}")
-    print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
-    print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
-    print(f"  Samples: {overall_metrics['count']}")
-
-    # Save results if requested
     if save_results:
-        results_file = f"{dataset_name}_results.txt"
-        predictions_file = f"{dataset_name}_predictions.csv"
-        df_predictions = pd.DataFrame(predictions_data)
-        df_predictions.to_csv(predictions_file, index=False)
-        print(f"Predictions saved to {predictions_file}")
-
-        with Path(results_file).open("w") as f:
-            f.write(f"Evaluation Results: {dataset_name}\n")
-            f.write(f"Checkpoint: {checkpoint}\n")
-            f.write(f"Dataset: {dataset_path}\n")
-            f.write("=" * 60 + "\n\n")
-
-            f.write("Overall Metrics:\n")
-            f.write(f"  MAE:   {overall_metrics['mae']:.8f}\n")
-            f.write(f"  RMSE:  {overall_metrics['rmse']:.8f}\n")
-            f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
-            f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
-            f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
-            f.write(f"  Samples: {overall_metrics['count']}\n\n")
-            f.write("Per-Day Metrics:\n")
-            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
-            f.write("-" * 78 + "\n")
-            for day_key, metrics in per_day_metrics.items():
-                f.write(
-                    f"{day_key:<6} {metrics['mae']:<10.4f} "
-                    f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
-                    f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
-                    f"{metrics['count']:<8}\n"
-                )
-
-        print(f"\nResults saved to {results_file}")
+        csv_path = f"{dataset_name}_predictions.csv"
+        txt_path = f"{dataset_name}_results.txt"
+        save_predictions_csv(predictions_data, csv_path)
+        print(f"Predictions saved to {csv_path}")
+        save_metrics_report(
+            tag=dataset_name,
+            dataset_name=dataset_name,
+            checkpoint=checkpoint,
+            dataset_path=dataset_path,
+            overall_metrics=overall_metrics,
+            per_day_metrics=per_day_metrics,
+            path=txt_path,
+        )
+        print(f"Results saved to {txt_path}")
 
 
 if __name__ == "__main__":

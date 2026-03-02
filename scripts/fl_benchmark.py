@@ -70,9 +70,11 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.datamodules.loading import load_dataset
 from cirr.fl.server import AGGREGATION_FNS, _is_bn_key, _is_head_key
 from cirr.models.forecaster import Forecaster
+from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
@@ -287,50 +289,11 @@ def _aggregate_global_prototypes(
     return per_client_protos, attention_weights
 
 
-def _load_test_dataset(dataset_path: Path) -> Any:
-    """Load the test split of a prepared dataset."""
-    dm = ForecastingDataModule(
-        root_data_path=dataset_path,
-        periods_path=dataset_path / "periods.pickle",
-        augment=False,
-        image_size=[128, 128],
-        image_mean=[0.485, 0.456, 0.406],
-        image_std=[0.229, 0.224, 0.225],
-        batch_size=1,
-        workers=0,
-        seed=42,
-    )
-    dm.setup(None)
-    return dm._test_dataset
-
-
 def _load_checkpoint(checkpoint_path: Path, device: str, freeze_early_backbone: bool = False) -> Forecaster:
-    """Instantiate a Forecaster and load weights from *checkpoint_path*.
-
-    Parameters
-    ----------
-    checkpoint_path : Path
-        Path to the checkpoint file.
-    device : str
-        Device to load the model on.
-    freeze_early_backbone : bool, optional
-        If True, freezes conv1, bn1, layer1, layer2 in the ResNet backbone.
-    """
-    data = torch.load(checkpoint_path, map_location=device)
-    hparams = data.get("hyper_parameters", {})
-    model = Forecaster(
-        model_name=hparams.get("model_name", "timm-resnet50"),
-        pretrained=False,
-        input_channels=hparams.get("input_channels", 3),
-        loss_function=hparams.get("loss_function", "Berhu"),
-        lr=hparams.get("lr", 1e-3),
-        lr_patience=hparams.get("lr_patience", 5),
-    ).to(device)
-    model.load_state_dict(data["state_dict"])
-
+    """Instantiate a Forecaster and load weights from *checkpoint_path*."""
+    model = load_forecaster_from_checkpoint(checkpoint_path, device=device, use_hparams=True)
     if freeze_early_backbone:
         model.freeze_early_backbone()
-
     return model
 
 
@@ -420,7 +383,7 @@ def _train_day(
     """Train *model* for *epochs* epochs on *day_indices*.
 
     *replay_entries* is a pre-sampled list of ``(dataset, index)`` pairs
-    (assembled by the caller via ``_sample_replay_for_day()``) that is
+    (assembled by the caller via ``sample_replay_for_day()``) that is
     concatenated with the current-day samples before batching — matching
     the design of ``train_on_day`` in ``local_training.py``.
     The pool is reshuffled at the start of every epoch.
@@ -612,165 +575,6 @@ def _train_day(
 # ---------------------------------------------------------------------------
 
 
-def _period_target_value(period: dict[str, Any]) -> float:
-    """Get normalised target value directly from period metadata."""
-    return float(period["target_irradiance"]) / 1000.0
-
-
-def _load_train_dataset(dataset_path: Path) -> Any:
-    """Load the training split of a prepared dataset."""
-    dm = ForecastingDataModule(
-        root_data_path=dataset_path,
-        periods_path=dataset_path / "train_periods.pickle",
-        augment=False,
-        image_size=[128, 128],
-        image_mean=[0.485, 0.456, 0.406],
-        image_std=[0.229, 0.224, 0.225],
-        batch_size=1,
-        workers=0,
-        seed=42,
-    )
-    dm.setup(None)
-    return dm._train_dataset
-
-
-def _build_initial_replay_buffer(
-    folsom_path: Path,
-    replay_size: int,
-    nonzero_threshold: float = 0.001,
-) -> tuple[list[tuple[Any, int]], dict[str, float]]:
-    """Build a static replay buffer from the Folsom training dataset.
-
-    Samples are allocated proportionally to a normal distribution fitted to
-    Folsom irradiance values, so the buffer distribution matches the Folsom
-    training distribution (mirrors ``local_training.py``).
-
-    Parameters
-    ----------
-    folsom_path : Path
-        Path to the ``folsom_prepared`` directory.
-    replay_size : int
-        Number of entries to include.  0 returns an empty buffer.
-    nonzero_threshold : float
-        Minimum normalised irradiance for a sample to be eligible.
-
-    Returns
-    -------
-    replay_buffer : list[tuple[Any, int]]
-        ``(dataset, index)`` pairs ready for ``_train_day``.
-    distribution_stats : dict[str, float]
-        ``mean``, ``std``, ``max`` of the Folsom irradiance values.
-    """
-    if replay_size <= 0 or not folsom_path.exists():
-        return [], {"mean": 0.0, "std": 0.0, "max": 0.0}
-
-    folsom_dataset = _load_train_dataset(folsom_path)
-
-    irradiance_values: list[float] = []
-    eligible_samples: list[tuple[Any, int]] = []
-    for idx, period in enumerate(folsom_dataset._periods):
-        val = _period_target_value(period)
-        if val < nonzero_threshold:
-            continue
-        irradiance_values.append(val)
-        eligible_samples.append((folsom_dataset, idx))
-
-    if not eligible_samples:
-        return [], {"mean": 0.0, "std": 0.0, "max": 0.0}
-
-    irr_array = np.array(irradiance_values)
-    mean_irr = float(np.mean(irr_array))
-    std_irr = float(np.std(irr_array))
-    max_irr = float(np.max(irr_array))
-
-    # Stratified sampling: bin by irradiance, weight bins by fitted normal
-    n_bins = min(10, max(2, replay_size // 20))
-    bin_edges = np.linspace(0, max_irr, n_bins + 1)
-    bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
-    for sample, irr_val in zip(eligible_samples, irradiance_values, strict=False):
-        bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
-        bins[bin_idx].append(sample)
-
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    normal_weights = np.exp(-0.5 * ((bin_centers - mean_irr) / (std_irr + 1e-6)) ** 2)
-    normal_weights /= normal_weights.sum()
-
-    replay_buffer: list[tuple[Any, int]] = []
-    for bin_idx in range(n_bins):
-        quota = max(0, int(round(replay_size * normal_weights[bin_idx])))
-        if quota > 0 and bins[bin_idx]:
-            replay_buffer.extend(bins[bin_idx][:quota])
-
-    # Fill any remaining slots
-    if len(replay_buffer) < replay_size:
-        already = {id(s) for s in replay_buffer}
-        remaining = [s for s in eligible_samples if id(s) not in already]
-        replay_buffer.extend(remaining[: replay_size - len(replay_buffer)])
-
-    random.Random(42).shuffle(replay_buffer)
-    return replay_buffer[:replay_size], {"mean": mean_irr, "std": std_irr, "max": max_irr}
-
-
-def _sample_replay_for_day(
-    replay_buffer: list[tuple[Any, int]],
-    num_samples: int,
-    seed: int | None = None,
-) -> list[tuple[Any, int]]:
-    """Draw *num_samples* entries from *replay_buffer* without replacement.
-
-    Uses ``numpy.random.RandomState`` for deterministic per-day sampling
-    (mirrors ``local_training.py``).
-    """
-    if num_samples <= 0 or not replay_buffer:
-        return []
-    rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-    chosen = rng.choice(len(replay_buffer), size=min(num_samples, len(replay_buffer)), replace=False)
-    return [replay_buffer[i] for i in chosen]
-
-
-class RecentBuffer:
-    """Fixed-capacity FIFO buffer retaining the *most recent* N samples.
-
-    Unlike the Folsom reservoir buffer (static, normal-weighted), this buffer
-    keeps only the latest ``capacity`` samples.  Older entries are dropped when
-    the buffer is full.  This gives the model access to very recent context
-    without the recency bias of reservoir sampling.
-
-    Each entry is a ``(dataset, index)`` pair — same format as
-    the Folsom replay buffer and ``_train_day``.
-
-    Parameters
-    ----------
-    capacity : int
-        Maximum number of entries to retain.  0 disables the buffer.
-    """
-
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self._entries: list[tuple[Any, int]] = []
-
-    def add_day(self, dataset: Any, indices: list[int]) -> None:
-        """Append today's samples; trim to capacity (keep most recent)."""
-        if self.capacity == 0 or not indices:
-            return
-        for idx in indices:
-            self._entries.append((dataset, idx))
-        if len(self._entries) > self.capacity:
-            self._entries = self._entries[-self.capacity :]
-
-    def sample(self, n: int, seed: int | None = None) -> list[tuple[Any, int]]:
-        """Return up to *n* entries drawn without replacement."""
-        if not self._entries or n <= 0:
-            return []
-        rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-        n = min(n, len(self._entries))
-        indices = rng.choice(len(self._entries), size=n, replace=False)
-        return [self._entries[i] for i in indices]
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-
 # ---------------------------------------------------------------------------
 # Per-client BN / head state tracking for FedBN and FedPer
 # ---------------------------------------------------------------------------
@@ -867,7 +671,7 @@ def _process_client_day(
         _reservoir_entries: list[tuple[Any, int]] = []
         if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
             _n = max(0, int(round(len(day_indices) * replay_ratio)))
-            _reservoir_entries = _sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
+            _reservoir_entries = sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
         _recent_entries: list[tuple[Any, int]] = []
         if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
             _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
@@ -1093,7 +897,7 @@ def run_fl_benchmark(
     datasets = []
     day_maps = []
     for name, path in clients:
-        ds = _load_test_dataset(path)
+        ds = load_dataset(path, split="test")
         dm = group_indices_by_day(ds._periods)
         datasets.append(ds)
         day_maps.append(dm)
@@ -1138,7 +942,7 @@ def run_fl_benchmark(
     _folsom_replay_buffer: list[tuple[Any, int]] = []
     if replay_buffer_size > 0:
         _folsom_path = clients[0][1].parent / "folsom_prepared"
-        _folsom_replay_buffer, _folsom_dist = _build_initial_replay_buffer(_folsom_path, replay_buffer_size)
+        _folsom_replay_buffer, _folsom_dist = build_folsom_replay_buffer(_folsom_path, replay_buffer_size)
         if _folsom_replay_buffer:
             print(
                 f"  Folsom replay buffer: {len(_folsom_replay_buffer)} samples  "
@@ -1468,7 +1272,7 @@ def run_fl_benchmark(
                     # Assemble same replay mix the global model used
                     _d_reservoir: list[tuple[Any, int]] = []
                     if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
-                        _d_reservoir = _sample_replay_for_day(
+                        _d_reservoir = sample_replay_for_day(
                             _folsom_replay_buffer,
                             max(0, int(round(len(_d_indices) * replay_ratio))),
                             seed=_d_seed,

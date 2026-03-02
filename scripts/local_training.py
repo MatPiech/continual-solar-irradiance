@@ -16,160 +16,16 @@ from typing import Any
 
 import click
 import numpy as np
-import pandas as pd
 import torch
 
-from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.datamodules.loading import load_dataset
+from cirr.evaluation.printing import print_overall_metrics
+from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
+from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.training.replay import build_folsom_replay_buffer, period_target_value, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
-
-
-def _period_target_value(period: dict[str, Any]) -> float:
-    """Get normalized target value directly from period metadata."""
-    return float(period["target_irradiance"]) / 1000.0
-
-
-def _load_dataset(dataset_path: Path, split: str = "test") -> Any:
-    """Load selected dataset split from prepared directory path."""
-    datamodule = ForecastingDataModule(
-        root_data_path=dataset_path,
-        periods_path=dataset_path / "periods.pickle" if split == "test" else dataset_path / "train_periods.pickle",
-        augment=False,
-        image_size=[128, 128],
-        image_mean=[0.485, 0.456, 0.406],
-        image_std=[0.229, 0.224, 0.225],
-        batch_size=1,
-        workers=0,
-        seed=42,
-    )
-    datamodule.setup(None)
-    if split == "test":
-        return datamodule._test_dataset
-    if split == "training":
-        return datamodule._train_dataset
-    raise ValueError(f"Invalid split '{split}'. Expected 'test' or 'training'.")
-
-
-def _build_initial_replay_buffer(
-    dataset_path: Path,
-    replay_size: int,
-    nonzero_threshold: float = 0.001,
-) -> tuple[list[tuple[Any, int]], dict[str, float]]:
-    """Create initial replay samples from Folsom prepared dataset using normal distribution.
-
-    Parameters
-    ----------
-    dataset_path : Path
-        Path to dataset directory.
-    replay_size : int
-        Number of samples to include in replay buffer.
-    nonzero_threshold : float, optional
-        Minimum target value for replay eligibility, by default 0.001.
-
-    Returns
-    -------
-    replay_buffer : list[tuple[Any, int]]
-        List of (dataset, sample_index) tuples for replay.
-    distribution_stats : dict[str, float]
-        Dictionary with 'mean' and 'std' computed from Folsom irradiance values.
-    """
-    if replay_size <= 0:
-        return [], {"mean": 0.0, "std": 0.0}
-
-    folsom_dataset_path = dataset_path.parent / "folsom_prepared"
-    if not folsom_dataset_path.exists():
-        return [], {"mean": 0.0, "std": 0.0}
-
-    folsom_dataset = _load_dataset(folsom_dataset_path, split="training")
-
-    # Collect eligible samples and their irradiance values
-    irradiance_values = []
-    eligible_samples: list[tuple[Any, int]] = []
-
-    for idx, period in enumerate(folsom_dataset._periods):
-        target_value = _period_target_value(period)
-        if target_value < nonzero_threshold:
-            continue
-        irradiance_values.append(target_value)
-        eligible_samples.append((folsom_dataset, idx))
-
-    if len(eligible_samples) == 0:
-        return [], {"mean": 0.0, "std": 0.0}
-
-    # Compute distribution statistics from Folsom
-    irradiance_array = np.array(irradiance_values)
-    mean_irr = float(np.mean(irradiance_array))
-    std_irr = float(np.std(irradiance_array))
-    max_irr = float(np.max(irradiance_array))
-
-    # Create irradiance bins (e.g., 10 bins) for stratified sampling
-    # to match normal distribution while covering the full range
-    n_bins = min(10, max(2, replay_size // 20))
-    bin_edges = np.linspace(0, max_irr, n_bins + 1)
-    bins: dict[int, list[tuple[Any, int]]] = {i: [] for i in range(n_bins)}
-
-    for sample, irr_val in zip(eligible_samples, irradiance_values, strict=False):
-        bin_idx = min(n_bins - 1, int(np.digitize(irr_val, bin_edges)) - 1)
-        bins[bin_idx].append(sample)
-
-    # Compute normal distribution weights for each bin center
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-    normal_weights = np.exp(-0.5 * ((bin_centers - mean_irr) / (std_irr + 1e-6)) ** 2)
-    normal_weights /= np.sum(normal_weights)  # Normalize to sum to 1
-
-    # Allocate replay samples proportionally to normal distribution
-    replay_buffer: list[tuple[Any, int]] = []
-    for bin_idx in range(n_bins):
-        quota = max(0, int(round(replay_size * normal_weights[bin_idx])))
-        if quota > 0 and bins[bin_idx]:
-            replay_buffer.extend(bins[bin_idx][:quota])
-
-    # Fill remaining slots with any available samples
-    if len(replay_buffer) < replay_size:
-        all_remaining = [
-            sample
-            for bin_idx in range(n_bins)
-            for sample in bins[bin_idx][len([s for s in replay_buffer if s in bins[bin_idx]]) :]
-        ]
-        replay_buffer.extend(all_remaining[: replay_size - len(replay_buffer)])
-
-    random.Random(42).shuffle(replay_buffer)
-    distribution_stats = {"mean": mean_irr, "std": std_irr, "max": max_irr}
-    return replay_buffer[:replay_size], distribution_stats
-
-
-def _sample_replay_for_day(
-    replay_buffer: list[tuple[Any, int]],
-    num_samples: int,
-    seed: int | None = None,
-) -> list[tuple[Any, int]]:
-    """Sample replay instances for a single day from the replay buffer.
-
-    Maintains the distribution of the replay buffer while providing different
-    samples for each day.
-
-    Parameters
-    ----------
-    replay_buffer : list[tuple[Any, int]]
-        Full replay buffer containing all candidate samples.
-    num_samples : int
-        Number of samples to draw for this day.
-    seed : int, optional
-        Random seed for reproducibility. If None, uses system randomness.
-
-    Returns
-    -------
-    sampled_replay : list[tuple[Any, int]]
-        Subset of replay samples for this day.
-    """
-    if num_samples <= 0 or len(replay_buffer) == 0:
-        return []
-
-    # Sample without replacement to ensure diversity across days
-    rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-    selected_indices = rng.choice(len(replay_buffer), size=min(num_samples, len(replay_buffer)), replace=False)
-    return [replay_buffer[idx] for idx in selected_indices]
 
 
 def _compute_sample_distribution(samples: list[tuple[Any, int]]) -> dict[str, float]:
@@ -188,7 +44,7 @@ def _compute_sample_distribution(samples: list[tuple[Any, int]]) -> dict[str, fl
     if len(samples) == 0:
         return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
-    irradiances = [_period_target_value(dataset._periods[idx]) for dataset, idx in samples]
+    irradiances = [period_target_value(dataset._periods[idx]) for dataset, idx in samples]
     irr_array = np.array(irradiances)
 
     return {
@@ -250,16 +106,7 @@ def load_model_and_data(
         Test dataset object containing periods.
     """
     # Load model
-    model = Forecaster(
-        model_name="timm-resnet50",
-        pretrained=True,
-        input_channels=3,
-        loss_function="GNLL",
-        lr=0.001,
-        lr_patience=5,
-    )
-    checkpoint_data = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint_data["state_dict"])
+    model = load_forecaster_from_checkpoint(checkpoint_path, device=device)
 
     # Apply LoRA (dual-LoRA takes precedence)
     if use_dual_lora:
@@ -276,10 +123,8 @@ def load_model_and_data(
         model.freeze_all_except_lora()
         print("Frozen entire network except LoRA parameters\n")
 
-    model = model.to(device)
-
     # Load dataset
-    test_dataset = _load_dataset(dataset_path, split="test")
+    test_dataset = load_dataset(dataset_path, split="test")
     day_index_map = group_indices_by_day(test_dataset._periods)
 
     return model, day_index_map, test_dataset
@@ -485,7 +330,7 @@ def train_on_day(
     # Compute replay sample distribution statistics
     replay_stats: dict[str, Any] = {"count": len(replay_samples)}
     if len(replay_samples) > 0:
-        replay_irradiances = [_period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_samples]
+        replay_irradiances = [period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_samples]
         replay_irr_array = np.array(replay_irradiances)
         replay_stats["mean_irradiance"] = float(np.mean(replay_irr_array))
         replay_stats["std_irradiance"] = float(np.std(replay_irr_array))
@@ -638,14 +483,12 @@ def run_local_training(
 
     results = []
     all_predictions_data = []
-    replay_buffer, replay_dist_stats = _build_initial_replay_buffer(
-        dataset_path=dataset_path,
-        replay_size=adapt_replay_buffer_size,
-    )
+    folsom_path = dataset_path.parent / "folsom_prepared"
+    replay_buffer, replay_dist_stats = build_folsom_replay_buffer(folsom_path, adapt_replay_buffer_size)
     if len(replay_buffer) > 0:
         print(f"Initialized replay buffer from Folsom with {len(replay_buffer)} samples")
         print(
-            f"  Irradiance distribution: μ={replay_dist_stats['mean']:.2f}, σ={replay_dist_stats['std']:.2f}, max={replay_dist_stats['max']:.2f}\n"  # noqa: RUF001
+            f"  Irradiance distribution: μ={replay_dist_stats['mean']:.2f}, σ={replay_dist_stats['std']:.2f}, max={replay_dist_stats['max']:.2f}\n"
         )
         # Compute full replay buffer distribution for later comparison
         full_buffer_dist = _compute_sample_distribution(replay_buffer)
@@ -691,7 +534,7 @@ def run_local_training(
         # Calculate number of replay samples based on ratio of current day samples
         num_replay_samples = max(0, int(round(len(day_indices) * adapt_replay_ratio)))
 
-        day_replay_samples = _sample_replay_for_day(
+        day_replay_samples = sample_replay_for_day(
             replay_buffer,
             num_replay_samples,
             seed=day_seed,
@@ -748,7 +591,7 @@ def run_local_training(
         print(
             f"  Replay: n={replay_stats['count']:<4} "
             f"μ={replay_stats['mean_irradiance']:<7.2f} "
-            f"σ={replay_stats['std_irradiance']:<7.2f} "  # noqa: RUF001
+            f"σ={replay_stats['std_irradiance']:<7.2f} "
             f"[{replay_stats['min_irradiance']:.2f}, {replay_stats['max_irradiance']:.2f}]"
         )
 
@@ -956,73 +799,53 @@ def main(
     print(f"Completed {len(results)} days of training")
     print(f"{'='*78}\n")
 
-    print("Overall Metrics:")
-    print(f"  MAE:   {overall_metrics['mae']:.7f}")
-    print(f"  RMSE:  {overall_metrics['rmse']:.7f}")
-    print(f"  MAPE:  {overall_metrics['mape']:.2%}")
-    print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
-    print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
-    print(f"  Samples: {overall_metrics['count']}\n")
+    print_overall_metrics(overall_metrics, tag=dataset_name)
 
-    # Save results if requested
     if save_results:
-        # Add LoRA info to filename if used
         if use_dual_lora:
             suffix = f"_dual_lora_e{encoder_rank}_h{head_rank}"
         elif use_lora:
             suffix = f"_lora_r{lora_rank}"
         else:
             suffix = ""
-        results_file = f"{dataset_name}_local_training{suffix}_results.txt"
         predictions_file = f"{dataset_name}_local_training{suffix}_predictions.csv"
+        results_file = f"{dataset_name}_local_training{suffix}_results.txt"
 
-        # Save predictions to CSV
-        df_predictions = pd.DataFrame(predictions_data)
-        df_predictions.to_csv(predictions_file, index=False)
+        save_predictions_csv(predictions_data, predictions_file)
         print(f"\nPredictions saved to {predictions_file}")
 
-        # Save results to text file
-        with Path(results_file).open("w") as f:
-            f.write(f"Local Training Results: {dataset_name}\n")
-            f.write(f"Checkpoint: {checkpoint}\n")
-            f.write(f"Dataset: {dataset_path}\n")
-            if use_dual_lora:
-                f.write("Dual-LoRA Configuration:\n")
-                f.write(f"  Encoder: rank={encoder_rank}, alpha={encoder_alpha}, lr={encoder_lr}\n")
-                f.write(f"  Head:    rank={head_rank}, alpha={head_alpha}, lr={head_lr}\n")
-            elif use_lora:
-                f.write(f"LoRA: rank={lora_rank}, alpha={lora_alpha}\n")
-            f.write("=" * 78 + "\n\n")
-
-            f.write("Overall Metrics:\n")
-            f.write(f"  MAE:   {overall_metrics['mae']:.7f}\n")
-            f.write(f"  RMSE:  {overall_metrics['rmse']:.7f}\n")
-            f.write(f"  MAPE:  {overall_metrics['mape']:.2f}%\n")
-            f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
-            f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
-            f.write(f"  Samples: {overall_metrics['count']}\n\n")
-
-            f.write("Per-Day Metrics:\n")
-            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
-            f.write("-" * 78 + "\n")
-            for day_key, metrics in per_day_metrics.items():
-                f.write(
-                    f"{day_key:<6} {metrics['mae']:<10.4f} {metrics['rmse']:<10.4f} "
-                    f"{metrics['mape']:<16.2%} {metrics['wape']:<10.2f} {metrics['smape']:<10.2f} "
-                    f"{metrics['count']:<8}\n"
-                )
-
+        extra_lines: list[str] = []
+        if use_dual_lora:
+            extra_lines += [
+                "Dual-LoRA Configuration:",
+                f"  Encoder: rank={encoder_rank}, alpha={encoder_alpha}, lr={encoder_lr}",
+                f"  Head:    rank={head_rank}, alpha={head_alpha}, lr={head_lr}",
+            ]
+        elif use_lora:
+            extra_lines.append(f"LoRA: rank={lora_rank}, alpha={lora_alpha}")
+        save_metrics_report(
+            tag="local_training" + suffix,
+            dataset_name=dataset_name,
+            checkpoint=checkpoint,
+            dataset_path=dataset_path,
+            overall_metrics=overall_metrics,
+            per_day_metrics=per_day_metrics,
+            path=results_file,
+            extra_lines=extra_lines,
+        )
+        # Append per-day training results section (unique to this script)
+        with Path(results_file).open("a") as f:
             f.write("\n" + "=" * 78 + "\n")
             f.write("Per-Day Training Results:\n")
             f.write(f"{'Day':<6} {'Samples':<10} {'MAE':<12} {'RMSE':<12} {'Train Loss':<14}\n")
             f.write("-" * 60 + "\n")
             for result in results:
-                mae = result["metrics"]["mae"]
-                rmse = result["metrics"]["rmse"]
-                train_loss = result["training_loss"]
-
-                f.write(f"{result['day']:<6} {result['n_samples']:<10} {mae:<12.4f} " f"{rmse:<12.4f} {train_loss:<14.6f}\n")
-
+                f.write(
+                    f"{result['day']:<6} {result['n_samples']:<10} "
+                    f"{result['metrics']['mae']:<12.4f} "
+                    f"{result['metrics']['rmse']:<12.4f} "
+                    f"{result['training_loss']:<14.6f}\n"
+                )
         print(f"Results saved to {results_file}")
 
 
