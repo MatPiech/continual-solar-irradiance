@@ -182,8 +182,8 @@ def main(
     dataset_name = dataset_path.name.split("_")[0]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print("Loading model...")
-    model = load_forecaster_from_checkpoint(checkpoint, device=device, strict=False)
+    print(f"Loading model from {checkpoint}...")
+    model = load_forecaster_from_checkpoint(checkpoint, device=device, use_hparams=True)
 
     print(f"Loading dataset from {dataset_path}...")
     test_dataset = load_dataset(dataset_path, split="test")

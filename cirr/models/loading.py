@@ -26,7 +26,6 @@ _DEFAULT_HPARAMS: dict = {
 def load_forecaster_from_checkpoint(
     checkpoint_path: Path,
     device: str = "cpu",
-    strict: bool = True,
     use_hparams: bool = False,
 ) -> Forecaster:
     """Instantiate a :class:`Forecaster` and load weights from *checkpoint_path*.
@@ -37,9 +36,6 @@ def load_forecaster_from_checkpoint(
         Path to the ``.ckpt`` checkpoint file produced by PyTorch Lightning.
     device : str
         Target device (``"cuda"`` or ``"cpu"``).
-    strict : bool
-        Passed to ``load_state_dict``.  Use ``False`` when the checkpoint
-        contains extra keys (e.g. stale fc weights from older timm versions).
     use_hparams : bool
         When ``True`` the model is constructed from the ``hyper_parameters``
         stored inside the checkpoint (useful when the architecture may differ
@@ -65,5 +61,5 @@ def load_forecaster_from_checkpoint(
         lr_patience=hp.get("lr_patience", 5),
     ).to(device)
 
-    model.load_state_dict(data["state_dict"], strict=strict)
+    model.load_state_dict(data["state_dict"], strict=False)
     return model
