@@ -400,8 +400,9 @@ class DualPhaseAdapter(nn.Module):
         if self.ogd_scope == "head_and_encoder":
             encoder_children = list(self.base_model.image_encoder.children())
             if encoder_children:
-                for param in encoder_children[-1].parameters():
-                    param.requires_grad_(True)
+                for i in range(-2, 0):  # last two children ([-1] is the deepest block, [-2] is its immediate predecessor)
+                    for param in encoder_children[i].parameters():
+                        param.requires_grad_(True)
 
         # Keep BN layers in eval mode so running statistics are not corrupted
         # by single-sample batches.  The head (Linear layers) has no BN, so
@@ -454,7 +455,8 @@ class DualPhaseAdapter(nn.Module):
         if self.ogd_scope == "head_and_encoder":
             encoder_children = list(self.base_model.image_encoder.children())
             if encoder_children:
-                params.extend(encoder_children[-1].parameters())
+                for i in range(-2, 0):
+                    params.extend(encoder_children[i].parameters())
         return torch.optim.SGD(
             params,
             lr=self.lr_ogd,
