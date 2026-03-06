@@ -92,10 +92,11 @@ python scripts/evaluate_dual_phase.py \\
 from collections import deque
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import click
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -151,6 +152,51 @@ class OnlineAffineCalibrator:
         self.b = float(np.clip(self.b, -0.5, 0.5))
 
 
+def _load_clear_sky_lookup(dataset_path: Path) -> dict[str, float]:
+    """Load clear-sky irradiance indexed by ``YYYYMMDD_HHMMSS`` timestamp.
+
+    Returns values scaled to ``kW/m^2`` to match dataset target scaling.
+    """
+    clear_sky_files = sorted(dataset_path.glob("*_clear_sky.csv"))
+    if not clear_sky_files:
+        return {}
+
+    clear_sky_path = clear_sky_files[0]
+    frame = pd.read_csv(clear_sky_path)
+    if "datetime" not in frame.columns or "ghi_clear" not in frame.columns:
+        raise ValueError(f"Invalid clear-sky file format: {clear_sky_path}")
+
+    dt = pd.to_datetime(frame["datetime"], errors="coerce")
+    ghi_kw = frame["ghi_clear"].astype(float) / 1000.0
+    valid = ~dt.isna() & ghi_kw.notna()
+
+    keys = dt.loc[valid].dt.strftime("%Y%m%d_%H%M%S")
+    values = ghi_kw.loc[valid].astype(float)
+    return dict(zip(keys.tolist(), values.tolist(), strict=False))
+
+
+def _resolve_clear_sky_value(clear_sky_lookup: dict[str, float], timestamp: str) -> float | None:
+    """Resolve clear-sky value for a sample timestamp.
+
+    Image timestamps are second-level; clear-sky tables are often 1-minute.
+    Tries exact key first, then falls back to ``...SS=00`` for the same minute.
+    """
+    value = clear_sky_lookup.get(timestamp)
+    if value is not None:
+        return value
+
+    if len(timestamp) >= 15:
+        minute_key = f"{timestamp[:-2]}00"
+        return clear_sky_lookup.get(minute_key)
+
+    return None
+
+
+def _is_in_learning_zone(error_value: float, low: float, high: float) -> bool:
+    """Return ``True`` when error lies inside the configured update band."""
+    return low <= error_value <= high
+
+
 # ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
@@ -163,6 +209,11 @@ def evaluate(
     days_to_eval: list[str],
     device: str,
     horizon_steps: int,
+    ogd_gating: Literal["none", "raw", "csi"],
+    ogd_gating_low: float,
+    ogd_gating_high: float,
+    clear_sky_lookup: dict[str, float],
+    csi_min_clear_sky: float,
     use_online_calibrator: bool,
     cal_lr: float,
     cal_l2: float,
@@ -197,8 +248,16 @@ def evaluate(
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
     per_day_metrics: dict[str, dict[str, float]] = {}
-    causal_queue: deque[dict[str, torch.Tensor]] = deque()
+    causal_queue: deque[dict[str, Any]] = deque()
     calibrator = OnlineAffineCalibrator(lr=cal_lr, l2=cal_l2) if use_online_calibrator else None
+    update_stats = {
+        "considered": 0,
+        "updated": 0,
+        "skipped_below_low": 0,
+        "skipped_above_high": 0,
+        "skipped_no_clear_sky": 0,
+        "skipped_low_clear_sky": 0,
+    }
 
     print_metrics_header()
 
@@ -227,17 +286,50 @@ def evaluate(
                     "history": irradiance_history,  # [hist_len]
                     "gt": target_irradiance.unsqueeze(0),  # [1, 1]
                     "raw_pred": None,
+                    "timestamp": image_name,
                 }
             )
 
             # B: pop the oldest sample once the horizon lag has elapsed.
             if len(causal_queue) > horizon_steps:
                 oldest = causal_queue.popleft()
-                adapter.update(
-                    oldest["image"].to(device),
-                    oldest["history"].to(device),
-                    oldest["gt"].to(device),
-                )
+                should_update = True
+                update_stats["considered"] += 1
+
+                if ogd_gating != "none" and oldest["raw_pred"] is not None:
+                    gt_value = float(oldest["gt"].view(-1)[0].item())
+                    raw_error = abs(float(oldest["raw_pred"]) - gt_value)
+
+                    if ogd_gating == "raw":
+                        error_value = raw_error
+                    else:
+                        clear_sky = _resolve_clear_sky_value(clear_sky_lookup, str(oldest["timestamp"]))
+                        if clear_sky is None:
+                            should_update = False
+                            update_stats["skipped_no_clear_sky"] += 1
+                            error_value = None
+                        elif clear_sky < csi_min_clear_sky:
+                            should_update = False
+                            update_stats["skipped_low_clear_sky"] += 1
+                            error_value = None
+                        else:
+                            error_value = raw_error / clear_sky
+
+                    if error_value is not None and not _is_in_learning_zone(error_value, ogd_gating_low, ogd_gating_high):
+                        should_update = False
+                        if error_value < ogd_gating_low:
+                            update_stats["skipped_below_low"] += 1
+                        else:
+                            update_stats["skipped_above_high"] += 1
+
+                if should_update:
+                    adapter.update(
+                        oldest["image"].to(device),
+                        oldest["history"].to(device),
+                        oldest["gt"].to(device),
+                    )
+                    update_stats["updated"] += 1
+
                 if calibrator is not None and oldest["raw_pred"] is not None:
                     delayed_target = float(oldest["gt"].view(-1)[0].item())
                     calibrator.update(float(oldest["raw_pred"]), delayed_target)
@@ -282,6 +374,19 @@ def evaluate(
         causal_queue.clear()
 
     overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
+    if ogd_gating == "none":
+        print("\nOGD gating: disabled (all causally-available samples were updated).", flush=True)
+    else:
+        print(
+            "\nOGD gating stats: "
+            f"considered={update_stats['considered']}  "
+            f"updated={update_stats['updated']}  "
+            f"below_low={update_stats['skipped_below_low']}  "
+            f"above_high={update_stats['skipped_above_high']}  "
+            f"no_clear_sky={update_stats['skipped_no_clear_sky']}  "
+            f"low_clear_sky={update_stats['skipped_low_clear_sky']}",
+            flush=True,
+        )
     return overall_metrics, per_day_metrics, predictions_data
 
 
@@ -413,6 +518,38 @@ def evaluate(
     show_default=True,
     help="L2 regularization of calibrator toward identity (a=1, b=0).",
 )
+@click.option(
+    "--ogd-gating",
+    type=click.Choice(["none", "raw", "csi"], case_sensitive=False),
+    default="none",
+    show_default=True,
+    help=(
+        "Selective OGD updates by delayed error thresholds: "
+        "'none' (always update), 'raw' (|y_pred-y_gt|), "
+        "'csi' (|y_pred-y_gt| / clear_sky)."
+    ),
+)
+@click.option(
+    "--ogd-gating-low",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Lower threshold for the OGD learning zone (inclusive).",
+)
+@click.option(
+    "--ogd-gating-high",
+    type=float,
+    default=1e9,
+    show_default=True,
+    help="Upper threshold for the OGD learning zone (inclusive).",
+)
+@click.option(
+    "--csi-min-clear-sky",
+    type=float,
+    default=0.01,
+    show_default=True,
+    help="For csi gating: skip updates when clear sky is below this value (kW/m^2).",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
@@ -432,6 +569,10 @@ def main(
     use_online_calibrator: bool,
     cal_lr: float,
     cal_l2: float,
+    ogd_gating: str,
+    ogd_gating_low: float,
+    ogd_gating_high: float,
+    csi_min_clear_sky: float,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -441,7 +582,17 @@ def main(
 
     dataset_name = dataset_path.name.split("_")[0]
     cal_tag = "cal" if use_online_calibrator else "nocal"
-    method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}"
+    gating_tag = f"gate_{ogd_gating}"
+    method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}_{gating_tag}"
+
+    if ogd_gating_low > ogd_gating_high:
+        raise ValueError(f"Invalid OGD gating range: low={ogd_gating_low} > high={ogd_gating_high}.")
+
+    clear_sky_lookup: dict[str, float] = {}
+    if ogd_gating == "csi":
+        clear_sky_lookup = _load_clear_sky_lookup(dataset_path)
+        if not clear_sky_lookup:
+            raise ValueError("CSI gating requested, but no '*_clear_sky.csv' file was found in dataset path.")
 
     # ------------------------------------------------------------------
     # Load model
@@ -494,6 +645,16 @@ def main(
     total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
     print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
     print(f"Total samples: {total_samples}\n")
+    if ogd_gating == "none":
+        print("OGD gating: disabled (all delayed samples update base model).\n")
+    elif ogd_gating == "raw":
+        print(f"OGD gating: raw absolute error band [{ogd_gating_low}, {ogd_gating_high}] (inclusive).\n")
+    else:
+        print(
+            "OGD gating: CSI-normalized error band "
+            f"[{ogd_gating_low}, {ogd_gating_high}] (inclusive), "
+            f"min clear sky={csi_min_clear_sky} kW/m^2.\n"
+        )
 
     # ------------------------------------------------------------------
     # Run evaluation
@@ -507,6 +668,11 @@ def main(
         days_to_eval=days_to_eval,
         device=device,
         horizon_steps=horizon_steps,
+        ogd_gating=ogd_gating,
+        ogd_gating_low=ogd_gating_low,
+        ogd_gating_high=ogd_gating_high,
+        clear_sky_lookup=clear_sky_lookup,
+        csi_min_clear_sky=csi_min_clear_sky,
         use_online_calibrator=use_online_calibrator,
         cal_lr=cal_lr,
         cal_l2=cal_l2,
@@ -526,6 +692,9 @@ def main(
             f"  niter={niter}  note_buffer_size={note_buffer_size}"
             f"  use_online_calibrator={use_online_calibrator}"
             f"  cal_lr={cal_lr}  cal_l2={cal_l2}"
+            f"  ogd_gating={ogd_gating}"
+            f"  ogd_gating_low={ogd_gating_low}  ogd_gating_high={ogd_gating_high}"
+            f"  csi_min_clear_sky={csi_min_clear_sky}"
         ]
         save_metrics_report(
             tag=method_tag,
