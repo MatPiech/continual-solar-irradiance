@@ -108,6 +108,50 @@ from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
 # ---------------------------------------------------------------------------
+# Online calibration
+# ---------------------------------------------------------------------------
+
+
+class OnlineAffineCalibrator:
+    """Online affine calibrator for absolute predictions: y' = a*y + b.
+
+    Parameters
+    ----------
+    lr : float
+        SGD-style learning rate for online updates.
+    l2 : float
+        L2 regularization strength toward identity calibration
+        (a -> 1, b -> 0).
+    """
+
+    def __init__(self, lr: float = 1e-3, l2: float = 1e-4) -> None:
+        self.lr = lr
+        self.l2 = l2
+        self.a = 1.0
+        self.b = 0.0
+
+    def apply(self, pred: torch.Tensor) -> torch.Tensor:
+        """Apply calibration to a tensor prediction."""
+        calibrated = self.a * pred + self.b
+        return torch.clamp(calibrated, min=0.0)
+
+    def update(self, pred_raw: float, target: float) -> None:
+        """Update calibrator params using a delayed-label sample."""
+        pred_cal = self.a * pred_raw + self.b
+        error = pred_cal - target
+
+        grad_a = 2.0 * error * pred_raw + 2.0 * self.l2 * (self.a - 1.0)
+        grad_b = 2.0 * error + 2.0 * self.l2 * self.b
+
+        self.a -= self.lr * grad_a
+        self.b -= self.lr * grad_b
+
+        # Keep calibration stable and physically sensible.
+        self.a = float(np.clip(self.a, 0.5, 1.5))
+        self.b = float(np.clip(self.b, -0.5, 0.5))
+
+
+# ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
 
@@ -119,6 +163,9 @@ def evaluate(
     days_to_eval: list[str],
     device: str,
     horizon_steps: int,
+    use_online_calibrator: bool,
+    cal_lr: float,
+    cal_l2: float,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Run the day-by-day online evaluation loop with DualPhaseAdapter.
 
@@ -151,6 +198,7 @@ def evaluate(
     predictions_data: list[dict[str, Any]] = []
     per_day_metrics: dict[str, dict[str, float]] = {}
     causal_queue: deque[dict[str, torch.Tensor]] = deque()
+    calibrator = OnlineAffineCalibrator(lr=cal_lr, l2=cal_l2) if use_online_calibrator else None
 
     print_metrics_header()
 
@@ -178,6 +226,7 @@ def evaluate(
                     "image": image_input,  # [C, H, W]
                     "history": irradiance_history,  # [hist_len]
                     "gt": target_irradiance.unsqueeze(0),  # [1, 1]
+                    "raw_pred": None,
                 }
             )
 
@@ -189,9 +238,16 @@ def evaluate(
                     oldest["history"].to(device),
                     oldest["gt"].to(device),
                 )
+                if calibrator is not None and oldest["raw_pred"] is not None:
+                    delayed_target = float(oldest["gt"].view(-1)[0].item())
+                    calibrator.update(float(oldest["raw_pred"]), delayed_target)
 
             # C+D: TTA-adapt a deepcopy and predict with it.
-            mean, _ = adapter.predict(images, irr_history)
+            mean_raw, _ = adapter.predict(images, irr_history)
+            mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
+
+            # Store raw prediction for delayed-label calibrator updates.
+            causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
 
             pred_np = mean.detach().cpu().numpy().flatten()
             target_np = target.cpu().numpy().flatten()
@@ -337,6 +393,26 @@ def evaluate(
     default=False,
     help="Save per-day metrics report and predictions CSV to disk.",
 )
+@click.option(
+    "--use-online-calibrator/--no-online-calibrator",
+    default=True,
+    show_default=True,
+    help="Apply delayed-label affine calibration: y' = a*y + b.",
+)
+@click.option(
+    "--cal-lr",
+    type=float,
+    default=1e-3,
+    show_default=True,
+    help="Learning rate for online affine calibrator updates.",
+)
+@click.option(
+    "--cal-l2",
+    type=float,
+    default=1e-4,
+    show_default=True,
+    help="L2 regularization of calibrator toward identity (a=1, b=0).",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
@@ -353,6 +429,9 @@ def main(
     start_day: str,
     device: str,
     save_results: bool,
+    use_online_calibrator: bool,
+    cal_lr: float,
+    cal_l2: float,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -361,7 +440,8 @@ def main(
         device = "cpu"
 
     dataset_name = dataset_path.name.split("_")[0]
-    method_tag = f"dual_{tta_method}_{ogd_scope}"
+    cal_tag = "cal" if use_online_calibrator else "nocal"
+    method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}"
 
     # ------------------------------------------------------------------
     # Load model
@@ -427,6 +507,9 @@ def main(
         days_to_eval=days_to_eval,
         device=device,
         horizon_steps=horizon_steps,
+        use_online_calibrator=use_online_calibrator,
+        cal_lr=cal_lr,
+        cal_l2=cal_l2,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -441,6 +524,8 @@ def main(
             f"  horizon_steps={horizon_steps}  ogd_lr={ogd_lr}  ogd_scope={ogd_scope}"
             f"  ogd_loss={ogd_loss}  lr_tta={lr_tta}  n_aug={n_augmentations}"
             f"  niter={niter}  note_buffer_size={note_buffer_size}"
+            f"  use_online_calibrator={use_online_calibrator}"
+            f"  cal_lr={cal_lr}  cal_l2={cal_l2}"
         ]
         save_metrics_report(
             tag=method_tag,
