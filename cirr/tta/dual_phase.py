@@ -403,7 +403,10 @@ class DualPhaseAdapter(nn.Module):
                 for param in encoder_children[-1].parameters():
                     param.requires_grad_(True)
 
-        self.base_model.train()
+        # Keep BN layers in eval mode so running statistics are not corrupted
+        # by single-sample batches.  The head (Linear layers) has no BN, so
+        # eval mode has no negative effect on OGD gradient quality.
+        self.base_model.eval()
 
     @staticmethod
     def _set_tta_mode(model: nn.Module) -> None:
