@@ -30,6 +30,9 @@ Design properties
     (episodic, no memory).
     ``tta_method='note'`` — variance minimisation on a persistent FIFO buffer
     of recent ``(image, history)`` pairs, giving richer BN batch statistics.
+    ``tta_method='none'`` — skip TTA entirely; ``predict()`` runs a plain
+    eval forward pass on ``base_model``.  Useful baseline to isolate whether
+    OGD alone helps or hurts.
 
 Architecture assumptions
 ------------------------
@@ -86,10 +89,11 @@ class DualPhaseAdapter(nn.Module):
     lr_tta : float, optional
         Learning rate for the ephemeral unsupervised TTA optimizer, by
         default ``1e-4``.
-    tta_method : {'memo', 'note'}, optional
+    tta_method : {'memo', 'note', 'none'}, optional
         Unsupervised TTA variant, by default ``'memo'``.
         - ``'memo'`` — per-sample augmented-view variance minimisation.
         - ``'note'`` — buffer-based variance minimisation.
+        - ``'none'`` — no TTA; plain eval inference on ``base_model``.
     ogd_scope : {'head_only', 'head_and_encoder'}, optional
         Parameters permanently updated by OGD.
         - ``'head_only'`` — only the regression head.
@@ -121,7 +125,7 @@ class DualPhaseAdapter(nn.Module):
         base_model: nn.Module,
         lr_ogd: float = 1e-4,
         lr_tta: float = 1e-4,
-        tta_method: Literal["memo", "note"] = "memo",
+        tta_method: Literal["memo", "note", "none"] = "memo",
         ogd_scope: Literal["head_only", "head_and_encoder"] = "head_only",
         ogd_loss: Literal["berhu", "huber", "mse"] = "berhu",
         ogd_momentum: float = 0.9,
@@ -225,6 +229,14 @@ class DualPhaseAdapter(nn.Module):
         device = image.device
         img = image if image.dim() == 4 else image.unsqueeze(0)  # [1, C, H, W]
         hist = history if history.dim() == 2 else history.unsqueeze(0)  # [1, hist_len]
+
+        if self.tta_method == "none":
+            self.base_model.eval()
+            with torch.no_grad():
+                output = self.base_model(img.to(device), hist.to(device))
+            mean = output[0] if isinstance(output, tuple) else output
+            variance = output[1] if isinstance(output, tuple) else None
+            return mean, variance
 
         # Phase C: Create an ephemeral deep copy and adapt its norm-layer affines.
         tta_model = deepcopy(self.base_model).to(device)

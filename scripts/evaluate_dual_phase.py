@@ -249,10 +249,10 @@ def evaluate(
 )
 @click.option(
     "--tta-method",
-    type=click.Choice(["memo", "note"], case_sensitive=False),
+    type=click.Choice(["memo", "note", "none"], case_sensitive=False),
     default="memo",
     show_default=True,
-    help="Unsupervised TTA variant applied to the ephemeral model copy.",
+    help="Unsupervised TTA variant. 'none' = OGD-only (no ephemeral TTA).",
 )
 @click.option(
     "--horizon-steps",
