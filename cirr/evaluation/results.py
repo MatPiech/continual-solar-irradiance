@@ -69,17 +69,15 @@ def save_metrics_report(
         f.write("Overall Metrics:\n")
         f.write(f"  MAE:   {overall_metrics['mae']:.8f}\n")
         f.write(f"  RMSE:  {overall_metrics['rmse']:.8f}\n")
-        f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
         f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
         f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
         f.write(f"  Samples: {overall_metrics['count']}\n\n")
 
         f.write("Per-Day Metrics:\n")
-        f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} " f"{'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+        f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
         f.write("-" * 78 + "\n")
         for day_key, m in per_day_metrics.items():
             f.write(
                 f"{day_key:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} "
-                f"{m['mape']:<16.2%} {m['wape']:<10.2f}% {m['smape']:<10.2f}% "
-                f"{m['count']:<8}\n"
+                f"{m['wape']:<10.2f}% {m['smape']:<10.2f}% {m['count']:<8}\n"
             )

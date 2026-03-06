@@ -95,8 +95,8 @@ def evaluate_smart_persistence_model(
     current_day_targets = []
     naive_count = 0
 
-    print("Day    MAE        RMSE       MAPE       WAPE       SMAPE      Samples ")
-    print("------------------------------------------------------------------------")
+    print("Day    MAE        RMSE       WAPE       SMAPE      Samples ")
+    print("-----------------------------------------------------------")
 
     for p in test_periods:
         # Get the last observed irradiance and its clear sky value
@@ -160,8 +160,7 @@ def evaluate_smart_persistence_model(
                 )
                 print(
                     f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-                    f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
-                    f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
+                    f"{day_metrics['rmse']:<10.4f} {day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
                     f"{day_metrics['count']:<8}"
                 )
                 current_day = day_key
@@ -179,8 +178,7 @@ def evaluate_smart_persistence_model(
         )
         print(
             f"{current_day:<6} {day_metrics['mae']:<10.4f} "
-            f"{day_metrics['rmse']:<10.4f} {day_metrics['mape']:<16.2%} "
-            f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
+            f"{day_metrics['rmse']:<10.4f} {day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% "
             f"{day_metrics['count']:<8}"
         )
 
@@ -206,7 +204,6 @@ def evaluate_smart_persistence_model(
     print("Overall Metrics:")
     print(f"  MAE:   {overall_metrics['mae']:.8f}")
     print(f"  RMSE:  {overall_metrics['rmse']:.8f}")
-    print(f"  MAPE:  {overall_metrics['mape']:.2%}")
     print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
     print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
     print(f"  Samples: {overall_metrics['count']}")
@@ -233,19 +230,17 @@ def evaluate_smart_persistence_model(
             f.write("Overall Metrics:\n")
             f.write(f"  MAE:   {overall_metrics['mae']:.4f}\n")
             f.write(f"  RMSE:  {overall_metrics['rmse']:.4f}\n")
-            f.write(f"  MAPE:  {overall_metrics['mape']:.4f}%\n")
             f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
             f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
             f.write(f"  Samples: {overall_metrics['count']}\n\n")
 
             f.write("Per-Day Metrics:\n")
-            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
-            f.write("-" * 78 + "\n")
+            f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+            f.write("-" * 62 + "\n")
             for day_key, metrics in per_day_metrics.items():
                 f.write(
                     f"{day_key:<6} {metrics['mae']:<10.4f} "
-                    f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
-                    f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
+                    f"{metrics['rmse']:<10.4f} {metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
                     f"{metrics['count']:<8}\n"
                 )
 

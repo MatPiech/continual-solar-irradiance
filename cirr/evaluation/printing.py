@@ -8,7 +8,7 @@ from cirr.utils.metrics import compute_metrics
 # Table layout
 # ---------------------------------------------------------------------------
 
-_HEADER = "Day    MAE        RMSE       MAPE       WAPE       SMAPE      Samples "
+_HEADER = "Day    MAE        RMSE       WAPE       SMAPE      Samples "
 _SEPARATOR = "-" * len(_HEADER)
 
 
@@ -31,10 +31,7 @@ def print_day_metrics(day: str, preds: list[float], targets: list[float]) -> Non
         Ground-truth values for this day.
     """
     m = compute_metrics(np.array(preds), np.array(targets))
-    print(
-        f"{day:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} "
-        f"{m['mape']:<16.2%} {m['wape']:<10.2f}% {m['smape']:<10.2f}% {m['count']:<8}"
-    )
+    print(f"{day:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} " f"{m['wape']:<10.2f}% {m['smape']:<10.2f}% {m['count']:<8}")
 
 
 def print_overall_metrics(overall_metrics: dict[str, float], tag: str = "") -> None:
@@ -56,7 +53,6 @@ def print_overall_metrics(overall_metrics: dict[str, float], tag: str = "") -> N
     print("Overall Metrics:")
     print(f"  MAE:   {overall_metrics['mae']:.8f}")
     print(f"  RMSE:  {overall_metrics['rmse']:.8f}")
-    print(f"  MAPE:  {overall_metrics['mape']:.2%}")
     print(f"  WAPE:  {overall_metrics['wape']:.2f}%")
     print(f"  SMAPE: {overall_metrics['smape']:.2f}%")
     print(f"  Samples: {overall_metrics['count']}")

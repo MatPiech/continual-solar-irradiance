@@ -1352,15 +1352,14 @@ def run_fl_benchmark(
     print(f"\n{'='*80}")
     print(f"  Final Results — {algorithm.upper()}  (FL rounds fired: {fl_round_idx})")
     print(f"{'='*80}")
-    print(f"  {'Client':<{_nw}}  {'MAE':>9}  {'RMSE':>9}  {'MAPE':>8}  {'WAPE':>8}  {'SMAPE':>8}  {'Count':>8}")
-    print(f"  {'-'*_nw}  {'-'*9}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*8}")
+    print(f"  {'Client':<{_nw}}  {'MAE':>9}  {'RMSE':>9}  {'WAPE':>8}  {'SMAPE':>8}  {'Count':>8}")
+    print(f"  {'-'*_nw}  {'-'*9}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*8}")
     for name in client_names:
         m = overall_metrics[name]
         print(
             f"  {name:<{_nw}}  "
             f"{m.get('mae', float('nan')):>9.5f}  "
             f"{m.get('rmse', float('nan')):>9.5f}  "
-            f"{m.get('mape', float('nan')):>8.2%}  "
             f"{m.get('wape', float('nan')):>7.2f}%  "
             f"{m.get('smape', float('nan')):>7.2f}%  "
             f"{m.get('count', 0):>8}"
