@@ -30,22 +30,21 @@ python scripts/evaluate_tta.py \\
     --no-tta
 """
 
-from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import click
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from cirr.datamodules.loading import load_dataset
-from cirr.evaluation.printing import print_day_metrics, print_metrics_header, print_overall_metrics
+from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.tta import MEMOReg
-from cirr.utils.dataset_utils import build_subset_loader, group_indices_by_day
+from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
 # ---------------------------------------------------------------------------
@@ -56,10 +55,12 @@ from cirr.utils.metrics import compute_metrics
 def evaluate_with_tta(
     tta_model: MEMOReg | None,
     base_model: Forecaster,
-    test_loader: DataLoader,
+    dataset: Any,
+    day_index_map: dict[str, list[int]],
+    days_to_eval: list[str],
     device: str,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
-    """Run the full evaluation loop with (or without) TTA.
+    """Run the full evaluation loop with (or without) TTA, processing day by day.
 
     Parameters
     ----------
@@ -67,8 +68,12 @@ def evaluate_with_tta(
         Wrapped TTA model.  Pass ``None`` to run baseline inference.
     base_model : Forecaster
         Original model (used for baseline when ``tta_model`` is ``None``).
-    test_loader : DataLoader
-        DataLoader over the test set (batch_size=1 recommended).
+    dataset : SkyImageDataset
+        Test dataset containing periods.
+    day_index_map : dict[str, list[int]]
+        Dictionary mapping MMDD to list of period indices.
+    days_to_eval : list[str]
+        List of day keys (MMDD) to evaluate.
     device : str
         Target device.
 
@@ -84,84 +89,74 @@ def evaluate_with_tta(
     all_predictions: list[float] = []
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
-    day_predictions: dict[str, list[float]] = defaultdict(list)
-    day_targets: dict[str, list[float]] = defaultdict(list)
-
-    current_day: str | None = None
-    current_day_preds: list[float] = []
-    current_day_targets: list[float] = []
+    per_day_metrics: dict[str, dict[str, float]] = {}
 
     print_metrics_header()
 
-    for batch_idx, batch in enumerate(test_loader):
-        if not (isinstance(batch, list | tuple) and len(batch) == 4):
-            print(f"Unexpected batch format at index {batch_idx}, skipping...")
+    # Process each day sequentially
+    for day_key in days_to_eval:
+        day_indices = day_index_map.get(day_key, [])
+
+        if len(day_indices) == 0:
             continue
 
-        images = batch[0].to(device)  # [1, C, H, W]
-        irr_history = batch[1].to(device)  # [1, history_len]
-        target = batch[2].to(device)  # [1, 1]
-        image_name = batch[3][0] if isinstance(batch[3], list) else batch[3]
+        day_preds: list[float] = []
+        day_targets: list[float] = []
 
-        if isinstance(image_name, bytes):
-            image_name = image_name.decode("utf-8")
+        for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False):
+            # Get sample from dataset
+            image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
 
-        # Forward (with or without TTA)
-        if tta_model is not None:
-            mean, _ = tta_model(images, irr_history)
-        else:
-            with torch.no_grad():
-                output = base_model(images, irr_history)
-                mean = output[0] if isinstance(output, tuple) else output
+            # Move to device and add batch dimension
+            images = image_input.unsqueeze(0).to(device)  # [1, C, H, W]
+            irr_history = irradiance_history.unsqueeze(0).to(device)  # [1, history_len]
+            target = target_irradiance.unsqueeze(0).to(device)  # [1, 1] or [1]
 
-        pred_np = mean.detach().cpu().numpy().flatten()
-        target_np = target.cpu().numpy().flatten()
+            if isinstance(image_name, bytes):
+                image_name = image_name.decode("utf-8")
 
-        all_predictions.extend(pred_np)
-        all_targets.extend(target_np)
+            # Forward (with or without TTA)
+            if tta_model is not None:
+                mean, _ = tta_model(images, irr_history)
+            else:
+                with torch.no_grad():
+                    output = base_model(images, irr_history)
+                    mean = output[0] if isinstance(output, tuple) else output
 
-        # Day key extraction (MMDD)
-        day_key: str | None = None
-        timestamp: str | None = None
-        if isinstance(image_name, str) and len(image_name) >= 8:
-            day_key = image_name[4:8]
-            timestamp = image_name
+            pred_np = mean.detach().cpu().numpy().flatten()
+            target_np = target.cpu().numpy().flatten()
 
-        predictions_data.append(
-            {
-                "timestamp": timestamp,
-                "day": day_key,
-                "prediction": pred_np[0] if len(pred_np) == 1 else pred_np,
-                "target": target_np[0] if len(target_np) == 1 else target_np,
-                "error": float(pred_np[0] - target_np[0]),
-                "absolute_error": float(abs(pred_np[0] - target_np[0])),
-            }
-        )
+            day_preds.extend(pred_np)
+            day_targets.extend(target_np)
+            all_predictions.extend(pred_np)
+            all_targets.extend(target_np)
 
-        if day_key is not None:
-            day_predictions[day_key].extend(pred_np)
-            day_targets[day_key].extend(target_np)
+            # Extract timestamp
+            timestamp = image_name if isinstance(image_name, str) else None
 
-            if current_day is None:
-                current_day = day_key
+            predictions_data.append(
+                {
+                    "timestamp": timestamp,
+                    "day": day_key,
+                    "prediction": pred_np[0] if len(pred_np) == 1 else pred_np,
+                    "target": target_np[0] if len(target_np) == 1 else target_np,
+                    "error": float(pred_np[0] - target_np[0]),
+                    "absolute_error": float(abs(pred_np[0] - target_np[0])),
+                }
+            )
 
-            if day_key != current_day:
-                print_day_metrics(current_day, current_day_preds, current_day_targets)
-                current_day = day_key
-                current_day_preds = []
-                current_day_targets = []
-
-            current_day_preds.extend(pred_np)
-            current_day_targets.extend(target_np)
-
-    if current_day is not None and current_day_preds:
-        print_day_metrics(current_day, current_day_preds, current_day_targets)
+        # Compute and print metrics for this day
+        if len(day_preds) > 0:
+            day_metrics = compute_metrics(np.array(day_preds), np.array(day_targets))
+            per_day_metrics[day_key] = day_metrics
+            print(
+                f"{day_key:<6} {day_metrics['mae']:<10.4f} {day_metrics['rmse']:<10.4f} "
+                f"{day_metrics['mape']:<16.2%} {day_metrics['wape']:<10.2f}% "
+                f"{day_metrics['smape']:<10.2f}% {day_metrics['count']:<8}",
+                flush=True,
+            )
 
     overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
-    per_day_metrics = {
-        day_key: compute_metrics(np.array(day_predictions[day_key]), np.array(day_targets[day_key]))
-        for day_key in sorted(day_predictions)
-    }
     return overall_metrics, per_day_metrics, predictions_data
 
 
@@ -216,44 +211,16 @@ def evaluate_with_tta(
 @click.option(
     "--lr",
     type=float,
-    default=1e-4,
+    default=1e-5,
     show_default=True,
     help="Adaptation learning rate.",
 )
 @click.option(
     "--weight-decay",
     type=float,
-    default=0.0,
+    default=0.01,
     show_default=True,
     help="Optimizer weight decay.",
-)
-@click.option(
-    "--max-rotation",
-    type=float,
-    default=10.0,
-    show_default=True,
-    help="Maximum rotation angle (degrees) — matches training default of 10°.",
-)
-@click.option(
-    "--translate-percent",
-    type=float,
-    default=0.10,
-    show_default=True,
-    help="Max translation as fraction of image size — matches training default of 0.10.",
-)
-@click.option(
-    "--scale-min",
-    type=float,
-    default=0.9,
-    show_default=True,
-    help="Minimum affine scale factor — matches training default of 0.9.",
-)
-@click.option(
-    "--scale-max",
-    type=float,
-    default=1.1,
-    show_default=True,
-    help="Maximum affine scale factor — matches training default of 1.1.",
 )
 @click.option(
     "--num-days",
@@ -291,10 +258,6 @@ def main(
     niter: int,
     lr: float,
     weight_decay: float,
-    max_rotation: float,
-    translate_percent: float,
-    scale_min: float,
-    scale_max: float,
     num_days: int,
     start_day: str,
     device: str,
@@ -312,9 +275,10 @@ def main(
     # ------------------------------------------------------------------
     # Load model
     # ------------------------------------------------------------------
-    print("Loading model...")
-    model = load_forecaster_from_checkpoint(checkpoint, device=device, strict=False)
-    # Ensure the ResNet fc is Identity (as it was during training).
+    print(f"Loading model from {checkpoint}...")
+    model = load_forecaster_from_checkpoint(checkpoint, device=device, use_hparams=True)
+    # For ResNet checkpoints built with an older timm where fc was not replaced
+    # with Identity, correct it now so the encoder outputs features, not logits.
     if hasattr(model.image_encoder, "fc") and not isinstance(model.image_encoder.fc, torch.nn.Identity):
         model.image_encoder.fc = torch.nn.Identity()
 
@@ -337,16 +301,12 @@ def main(
             niter=niter,
             episodic=True,
             adapt_mode=adapt_mode,
-            max_rotation=max_rotation,
-            translate_percent=translate_percent,
-            scale_min=scale_min,
-            scale_max=scale_max,
         ).to(device)
     else:
         print("TTA disabled — running baseline inference.")
 
     # ------------------------------------------------------------------
-    # Load dataset and build loader
+    # Load dataset and determine days to evaluate
     # ------------------------------------------------------------------
     print(f"Loading dataset from {dataset_path}...")
     test_dataset = load_dataset(dataset_path, split="test")
@@ -354,12 +314,20 @@ def main(
     print(f"Test set size: {len(test_dataset)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
 
-    test_loader, indices = build_subset_loader(test_dataset, day_index_map, num_days, start_day)
-    if indices:
-        print(f"Evaluating {num_days} days starting from {start_day}")
-        print(f"Total samples: {len(indices)}\n")
-    else:
-        print("Evaluating all days\n")
+    # Generate list of days to evaluate
+    all_days = generate_year_days()
+    if start_day not in all_days:
+        raise ValueError(f"Invalid start_day: {start_day}")
+    start_idx = all_days.index(start_day)
+
+    days_to_eval = all_days[start_idx : start_idx + num_days] if num_days > 0 else all_days[start_idx:]
+
+    # Filter to only days that exist in the dataset
+    days_to_eval = [day for day in days_to_eval if day in day_index_map]
+
+    total_samples = sum(len(day_index_map[day]) for day in days_to_eval)
+    print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
+    print(f"Total samples: {total_samples}\n")
 
     # ------------------------------------------------------------------
     # Run evaluation
@@ -368,7 +336,9 @@ def main(
     overall_metrics, per_day_metrics, predictions_data = evaluate_with_tta(
         tta_model=tta_model,
         base_model=model,
-        test_loader=test_loader,
+        dataset=test_dataset,
+        day_index_map=day_index_map,
+        days_to_eval=days_to_eval,
         device=device,
     )
 

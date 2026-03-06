@@ -28,24 +28,22 @@ class Forecaster(pl.LightningModule):
         # 1. Flag to check if we are doing Uncertainty Quantification
         self.is_probabilistic = loss_function == "GNLL"
 
-        # 2. Image Encoder
+        # 2. Image Encoder — num_classes=0 returns the pooled feature vector
+        # without any classification head, making num_features reliable across
+        # timm versions and model families (ResNet, EfficientViT, …).
         self.image_encoder = timm.create_model(
             model_name.replace("timm-", ""),
             pretrained=pretrained,
-            num_classes=1,  # num_classes=0 removes the final classification layer automatically in newer timm versions
+            num_classes=0,
             in_chans=input_channels,
         )
 
-        # Handling timm version differences for retrieving feature dim
-        if hasattr(self.image_encoder, "num_features"):
-            self.num_features = self.image_encoder.num_features
-        elif "resnet" in model_name:
-            # Fallback for some models
-            self.num_features = self.image_encoder.fc.in_features
-            self.image_encoder.fc = torch.nn.Identity()
-        elif "efficientvit" in model_name:
-            self.num_features = self.image_encoder.head.classifier[-1].in_features
-            self.image_encoder.head.classifier[-1] = torch.nn.Identity()
+        # num_features from timm is not always reliable (e.g. EfficientViT in some
+        # versions reports the internal embedding dim rather than the actual pooled
+        # feature dim).  Run a dummy forward pass to get the true output size.
+        with torch.no_grad():
+            _dummy = torch.zeros(1, input_channels, 128, 128)
+            self.num_features = self.image_encoder(_dummy).shape[-1]
 
         # 3. Dynamic Head Construction
         # If Probabilistic (GNLL), we need 2 outputs [Mean, Var].
