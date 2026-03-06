@@ -1,44 +1,51 @@
-"""Dual-Phase Online Adaptation for solar irradiance forecasting.
+"""Dual-Phase Online Adaptation — OGD-supervised + TTA-calibrated forecasting.
 
-Combines two complementary adaptation signals at every time step:
+This module provides :class:`DualPhaseAdapter`, the core Dual-Phase online
+adaptation implementation.  The adapter combines a persistent base model
+updated via online gradient descent (OGD) with ephemeral zero-lag test-time
+adaptation (TTA) at inference time.
 
-Phase 1 — Lagged Supervised Online Gradient Descent (OGD)
-----------------------------------------------------------
-When the true irradiance y_t arrives (after the 15-minute prediction horizon),
-the matching inputs (I_{t-15}, H_{t-15}) are retrieved from a FIFO cache and
-used for one supervised gradient step with BerHu (or Huber) loss.
+The adapter exposes two public methods:
 
-Update scope: the regression head, and optionally the last block of the image
-encoder (``ogd_scope='head_and_encoder'``).
+* :meth:`update` — Phase B: one supervised OGD gradient step on ``base_model``
+  using a ``(image, history, gt)`` triple whose label has already been observed.
+* :meth:`predict` — Phases C+D: creates an ephemeral deepcopy of ``base_model``,
+  adapts its normalisation-layer affines via MEMO or NOTE, then returns the
+  prediction; the copy is discarded immediately.
 
-Phase 2 — Zero-Lag Unsupervised TTA (MEMO-Reg)
-------------------------------------------------
-Immediately after OGD the *current* image I_t is augmented N times.  The
-variance of the resulting predictions drives one unsupervised gradient step:
+The causal firewall simulation (FIFO quarantine queue, horizon_steps) is the
+responsibility of the evaluation driver (``evaluate_dual_phase.py``), keeping
+this class free of simulation-specific concerns.  See that script's module
+docstring for the full A→B→C→D data-flow diagram.
 
-    Loss_TTA = Var({ŷ_i}_{i=1..N})
+Design properties
+-----------------
+**Ephemeral TTA**
+    Phase C uses a ``copy.deepcopy(base_model)`` created and discarded each
+    step.  TTA gradients therefore **never accumulate** in ``base_model``;
+    only Phase B (OGD) persistently updates model weights.
 
-Update scope: affine parameters (γ, β) of all BatchNorm / LayerNorm layers
-only, leaving all conv / attention weights frozen.
-
-Phase 3 — Final Inference + Cache
------------------------------------
-The original (unaugmented) inputs are forwarded through the fully-updated
-model to yield the final forecast ŷ_{t+15}.  The current inputs are pushed
-into the FIFO queue for use in 15 minutes' time.
-
-Algorithm reference
---------------------
-.. [1] Zhang et al. "MEMO: Test Time Robustness via Adaptation and
-       Augmentation." NeurIPS 2022. https://arxiv.org/abs/2110.09506
+**Pluggable unsupervised TTA**
+    ``tta_method='memo'`` — per-sample augmented-view variance minimisation
+    (episodic, no memory).
+    ``tta_method='note'`` — variance minimisation on a persistent FIFO buffer
+    of recent ``(image, history)`` pairs, giving richer BN batch statistics.
 
 Architecture assumptions
--------------------------
-The wrapped model must expose:
-* ``model.network_head``   — nn.Sequential regression head
-* ``model.image_encoder``  — timm image encoder
+------------------------
+The wrapped ``base_model`` must expose:
+
+* ``base_model.network_head``   — ``nn.Sequential`` regression head
+* ``base_model.image_encoder``  — timm image encoder with ``.children()``
 
 These are satisfied by :class:`cirr.models.forecaster.Forecaster`.
+
+References
+----------
+.. [1] Zhang et al. "MEMO: Test Time Robustness via Adaptation and
+       Augmentation." NeurIPS 2022. https://arxiv.org/abs/2110.09506
+.. [2] Gong et al. "NOTE: Robust Continual Test-time Adaptation Against
+       Temporal Correlation." NeurIPS 2022. https://arxiv.org/abs/2208.05117
 """
 
 from collections import deque
@@ -52,284 +59,404 @@ from cirr.losses import MeanAdaptiveBerHuLoss
 from cirr.tta.memo_reg import _random_augment, prediction_variance_loss
 
 # ---------------------------------------------------------------------------
-# Dual-Phase Adapter
+# Constants
+# ---------------------------------------------------------------------------
+
+# Minimum number of samples in the NOTE buffer before TTA adaptation is
+# triggered; below this threshold BN batch statistics are unreliable.
+_MIN_NOTE_BUFFER: int = 4
+
+
+# ---------------------------------------------------------------------------
+# DualPhaseAdapter
 # ---------------------------------------------------------------------------
 
 
 class DualPhaseAdapter(nn.Module):
-    """Dual-Phase Online Adaptation: Lagged OGD + Zero-Lag TTA.
+    """Dual-Phase Online Adapter: persistent OGD + ephemeral TTA.
 
     Parameters
     ----------
-    model : nn.Module
+    base_model : nn.Module
         A :class:`~cirr.models.forecaster.Forecaster` instance (or any model
         with ``network_head`` and ``image_encoder`` attributes).
-    cache_size : int, optional
-        FIFO depth in time steps.  With 5-minute data intervals and a
-        15-minute prediction horizon set this to ``3``, by default 3.
-    ogd_lr : float, optional
-        Learning rate for the supervised OGD optimizer, by default 1e-4.
-    ogd_momentum : float, optional
-        SGD momentum for OGD, by default 0.9.
-    ogd_weight_decay : float, optional
-        Weight decay for OGD, by default 1e-4.
+    lr_ogd : float, optional
+        Learning rate for the persistent supervised OGD optimizer, by
+        default ``1e-4``.
+    lr_tta : float, optional
+        Learning rate for the ephemeral unsupervised TTA optimizer, by
+        default ``1e-4``.
+    tta_method : {'memo', 'note'}, optional
+        Unsupervised TTA variant, by default ``'memo'``.
+        - ``'memo'`` — per-sample augmented-view variance minimisation.
+        - ``'note'`` — buffer-based variance minimisation.
     ogd_scope : {'head_only', 'head_and_encoder'}, optional
-        Parameters updated by OGD.
-        - ``'head_only'``: only the regression head.
-        - ``'head_and_encoder'``: head + the last top-level child module of
-          the image encoder (typically the deepest residual/attention block).
+        Parameters permanently updated by OGD.
+        - ``'head_only'`` — only the regression head.
+        - ``'head_and_encoder'`` — head + the last child of ``image_encoder``.
         By default ``'head_only'``.
-    ogd_loss : {'berhu', 'huber'}, optional
-        Supervised loss for OGD.  ``'berhu'`` uses
-        :class:`~cirr.losses.MeanAdaptiveBerHuLoss`; ``'huber'`` uses
-        ``torch.nn.HuberLoss``, by default ``'berhu'``.
-    tta_lr : float, optional
-        Learning rate for the unsupervised TTA optimizer, by default 1e-5.
+    ogd_loss : {'berhu', 'huber', 'mse'}, optional
+        Supervised loss function used during Phase 1 OGD, by default
+        ``'berhu'``.
+    ogd_momentum : float, optional
+        SGD momentum for the OGD optimizer, by default ``0.9``.
+    ogd_weight_decay : float, optional
+        Weight decay for the OGD optimizer, by default ``1e-4``.
     tta_weight_decay : float, optional
-        Weight decay for TTA, by default 0.0.
+        Weight decay for the ephemeral TTA AdamW optimizer, by default
+        ``0.0``.
     n_augmentations : int, optional
-        Number of augmented views for the TTA variance loss, by default 8.
+        (MEMO) Number of augmented views generated per time step, by
+        default ``8``.
     niter_tta : int, optional
-        Number of TTA gradient steps per time step, by default 1.
+        Number of TTA gradient steps applied to the deep copy per time
+        step, by default ``1``.
+    note_buffer_size : int, optional
+        (NOTE) Maximum capacity of the persistent sample buffer, by
+        default ``64``.
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        cache_size: int = 3,
-        ogd_lr: float = 1e-4,
+        base_model: nn.Module,
+        lr_ogd: float = 1e-4,
+        lr_tta: float = 1e-4,
+        tta_method: Literal["memo", "note"] = "memo",
+        ogd_scope: Literal["head_only", "head_and_encoder"] = "head_only",
+        ogd_loss: Literal["berhu", "huber", "mse"] = "berhu",
         ogd_momentum: float = 0.9,
         ogd_weight_decay: float = 1e-4,
-        ogd_scope: Literal["head_only", "head_and_encoder"] = "head_only",
-        ogd_loss: Literal["berhu", "huber"] = "berhu",
-        tta_lr: float = 1e-5,
         tta_weight_decay: float = 0.0,
         n_augmentations: int = 8,
         niter_tta: int = 1,
-    ):
+        note_buffer_size: int = 64,
+    ) -> None:
         super().__init__()
 
-        self.model = model
-        self.cache_size = cache_size
-        self.ogd_lr = ogd_lr
+        self.base_model = base_model
+        self.lr_ogd = lr_ogd
+        self.lr_tta = lr_tta
+        self.tta_method = tta_method
+        self.ogd_scope = ogd_scope
         self.ogd_momentum = ogd_momentum
         self.ogd_weight_decay = ogd_weight_decay
-        self.ogd_scope = ogd_scope
-        self.tta_lr = tta_lr
         self.tta_weight_decay = tta_weight_decay
         self.n_augmentations = n_augmentations
         self.niter_tta = niter_tta
+        self.note_buffer_size = note_buffer_size
 
-        # Supervised loss for OGD
+        # ── Supervised OGD loss ──────────────────────────────────────────────
         if ogd_loss == "berhu":
             self._ogd_loss_fn: nn.Module = MeanAdaptiveBerHuLoss()
-        else:
+        elif ogd_loss == "huber":
             self._ogd_loss_fn = nn.HuberLoss()
+        else:  # mse
+            self._ogd_loss_fn = nn.MSELoss()
 
-        # FIFO input cache: stores CPU tensors (image, history)
-        self._cache: deque[tuple[torch.Tensor, torch.Tensor]] = deque(maxlen=cache_size)
+        # ── NOTE persistent sample buffer ───────────────────────────────────
+        # Stores (image [C,H,W], history [hist_len]) CPU tensor pairs.
+        # Accumulates across steps (and optionally days) to provide a richer
+        # batch for normalisation-layer adaptation.
+        self._note_buffer: deque[tuple[torch.Tensor, torch.Tensor]] = deque(maxlen=note_buffer_size)
 
-        # Save initial weights for full reset
-        self._initial_model_state = deepcopy(model.state_dict())
+        # ── Snapshot for resets ──────────────────────────────────────────────
+        # Saved before the OGD optimizer is built so that reset() can
+        # restore the original weights.
+        self._initial_model_state = deepcopy(base_model.state_dict())
 
-        # Build both optimizers (after saving initial state)
-        self._ogd_optimizer = self._make_ogd_optimizer()
-        self._tta_optimizer = self._make_tta_optimizer()
+        # ── Persistent OGD optimizer (updates base_model in-place) ──────────
+        # Built once; the same parameter objects are referenced throughout.
+        self._ogd_optimizer: torch.optim.Optimizer = self._make_ogd_optimizer()
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Public interface
-    # ------------------------------------------------------------------
+    # =========================================================================
 
-    def forward(
+    def reset(self) -> None:
+        """Restore base_model to its initial checkpoint state.
+
+        Also clears the NOTE sample buffer and recreates the OGD optimizer
+        with a fresh state.
+        """
+        self.base_model.load_state_dict(self._initial_model_state, strict=True)
+        self._note_buffer.clear()
+        self._ogd_optimizer = self._make_ogd_optimizer()
+
+    def update(
         self,
-        images: torch.Tensor,
-        irradiance_history: torch.Tensor,
-        ground_truth: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Online forward pass: adapt then predict.
-
-        Call this once per arriving sample in chronological order.
+        image: torch.Tensor,  # [C, H, W]
+        history: torch.Tensor,  # [hist_len]
+        gt: torch.Tensor,  # [1, 1]
+    ) -> None:
+        """Phase B: one supervised OGD gradient step on base_model.
 
         Parameters
         ----------
-        images : torch.Tensor
-            Current sky image batch ``[1, C, H, W]`` (batch_size=1 for online).
-        irradiance_history : torch.Tensor
-            Current irradiance history ``[1, history_len]``.
-        ground_truth : torch.Tensor or None, optional
-            True irradiance value ``[1, 1]`` for the *current* time step (i.e.
-            the label that was predicted 15 minutes ago).  When provided and
-            the cache is full, triggers Phase 1 OGD.
+        image : torch.Tensor, shape ``[C, H, W]``
+            Sky image from the lagged observation.
+        history : torch.Tensor, shape ``[hist_len]``
+            Irradiance history vector from the lagged observation.
+        gt : torch.Tensor, shape ``[1, 1]``
+            Ground-truth label that is now causally observable.
+        """
+        self._ogd_step(image=image, history=history, gt=gt)
+
+    def predict(
+        self,
+        image: torch.Tensor,  # [1, C, H, W]
+        history: torch.Tensor,  # [1, hist_len]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Phases C+D: TTA on an ephemeral deepcopy, then final inference.
+
+        Parameters
+        ----------
+        image : torch.Tensor, shape ``[1, C, H, W]``
+            Current sky image (batch_size = 1 for online evaluation).
+        history : torch.Tensor, shape ``[1, hist_len]``
+            Current irradiance history vector.
 
         Returns
         -------
-        means : torch.Tensor, shape ``[1, 1]``
-        variances : torch.Tensor or None, shape ``[1, 1]``
+        mean : torch.Tensor, shape ``[1, 1]``
+            Final calibrated forecast.
+        variance : torch.Tensor or None, shape ``[1, 1]``
+            Predictive variance if the model is probabilistic, else ``None``.
         """
-        device = images.device
+        device = image.device
+        img = image if image.dim() == 4 else image.unsqueeze(0)  # [1, C, H, W]
+        hist = history if history.dim() == 2 else history.unsqueeze(0)  # [1, hist_len]
 
-        # ── Phase 1: Lagged Supervised OGD ──────────────────────────────
-        # Requires: (a) ground truth available, (b) cache has a lagged entry
-        if ground_truth is not None and len(self._cache) == self._cache.maxlen:
-            cached_img, cached_hist = self._cache[0]  # oldest = t - cache_size steps
-            self._ogd_step(
-                cached_img.to(device),
-                cached_hist.to(device),
-                ground_truth.to(device),
-            )
+        # Phase C: Create an ephemeral deep copy and adapt its norm-layer affines.
+        tta_model = deepcopy(self.base_model).to(device)
+        tta_optimizer = self._make_tta_optimizer(tta_model)
 
-        # ── Phase 2: Zero-Lag Unsupervised TTA ─────────────────────────
-        img_single = images[0]  # [C, H, W]
-        hist_single = irradiance_history  # [1, history_len]
-        self._tta_step(img_single, hist_single, device)
+        if self.tta_method == "memo":
+            self._memo_tta_step(tta_model, tta_optimizer, img[0], hist, device)
+        else:
+            # NOTE: update the persistent buffer first, then adapt on the batch.
+            self._note_buffer.append((img[0].detach().cpu(), hist[0].detach().cpu()))
+            self._note_tta_step(tta_model, tta_optimizer, device)
 
-        # ── Phase 3: Final Inference ────────────────────────────────────
-        mean, variance = self._predict(images, irradiance_history, device)
+        # Phase D: Final inference with the TTA-calibrated copy.
+        tta_model.eval()
+        with torch.no_grad():
+            output = tta_model(img.to(device), hist.to(device))
 
-        # ── Cache current inputs (for OGD 15 min from now) ─────────────
-        self._cache.append((images[0].detach().cpu(), irradiance_history[0].detach().cpu()))
+        del tta_model, tta_optimizer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        return mean, variance
-
-    def reset(self) -> None:
-        """Restore model to initial checkpoint state and clear the input cache."""
-        self.model.load_state_dict(self._initial_model_state, strict=True)
-        self._cache.clear()
-        self._ogd_optimizer = self._make_ogd_optimizer()
-        self._tta_optimizer = self._make_tta_optimizer()
-
-    # ------------------------------------------------------------------
-    # Phase implementations
-    # ------------------------------------------------------------------
-
-    @torch.enable_grad()
-    def _ogd_step(
-        self,
-        cached_img: torch.Tensor,
-        cached_hist: torch.Tensor,
-        ground_truth: torch.Tensor,
-    ) -> None:
-        """Phase 1: one supervised gradient step with lagged inputs."""
-        self._set_ogd_mode()
-
-        images_batch = cached_img.unsqueeze(0)  # [1, C, H, W]
-        hist_batch = cached_hist.unsqueeze(0)  # [1, history_len]
-
-        self._ogd_optimizer.zero_grad()
-        output = self.model(images_batch, hist_batch)
-        pred = output[0] if isinstance(output, tuple) else output  # [1, 1]
-
-        gt = ground_truth.view_as(pred)
-        loss = self._ogd_loss_fn(pred, gt)
-        loss.backward()
-        self._ogd_optimizer.step()
-
-    @torch.enable_grad()
-    def _tta_step(
-        self,
-        img: torch.Tensor,
-        hist: torch.Tensor,
-        device: torch.device,
-    ) -> None:
-        """Phase 2: one unsupervised variance-minimisation step."""
-        self._set_tta_mode()
-
-        for _ in range(self.niter_tta):
-            aug_imgs = torch.stack([_random_augment(img) for _ in range(self.n_augmentations)], dim=0).to(
-                device
-            )  # [N, C, H, W]
-            aug_hist = hist.expand(self.n_augmentations, -1)  # [N, history_len]
-
-            self._tta_optimizer.zero_grad()
-            output = self.model(aug_imgs, aug_hist)
-            preds = output[0] if isinstance(output, tuple) else output  # [N, 1]
-            loss = prediction_variance_loss(preds)
-            loss.backward()
-            self._tta_optimizer.step()
-
-    @torch.no_grad()
-    def _predict(
-        self,
-        images: torch.Tensor,
-        irradiance_history: torch.Tensor,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Phase 3: final inference on the original unaugmented input."""
-        self.model.eval()
-        x = images.to(device)
-        h = irradiance_history.to(device)
-        output = self.model(x, h)
         if isinstance(output, tuple):
             mean, variance = output
         else:
             mean, variance = output, None
+
         return mean, variance
 
-    # ------------------------------------------------------------------
-    # Mode configuration helpers
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # Phase implementations
+    # =========================================================================
 
-    def _set_ogd_mode(self) -> None:
-        """Freeze everything; unfreeze only OGD-scope parameters."""
-        for param in self.model.parameters():
+    @torch.enable_grad()
+    def _ogd_step(
+        self,
+        image: torch.Tensor,  # [C, H, W]
+        history: torch.Tensor,  # [hist_len]
+        gt: torch.Tensor,  # [1, 1]
+    ) -> None:
+        """Phase 1 — one supervised gradient step on base_model.
+
+        Configures the gradient flow so only OGD-scoped parameters receive
+        gradients; all other parameters stay frozen.  Restores
+        ``requires_grad=False`` on all params after stepping to prevent
+        accidental gradient accumulation during the subsequent deepcopy.
+        """
+        self._set_ogd_mode()
+
+        # Restore batch dimension (popped items are stored as [C,H,W] / [hist])
+        imgs_batch = image.unsqueeze(0)  # [1, C, H, W]
+        hist_batch = history.unsqueeze(0)  # [1, hist_len]
+
+        self._ogd_optimizer.zero_grad()
+        output = self.base_model(imgs_batch, hist_batch)
+        pred = output[0] if isinstance(output, tuple) else output  # [1, 1]
+
+        loss = self._ogd_loss_fn(pred, gt.view_as(pred))
+        loss.backward()
+        self._ogd_optimizer.step()
+
+        # Freeze all params again so the subsequent deepcopy does not carry
+        # an active computation graph into the TTA copy.
+        for param in self.base_model.parameters():
             param.requires_grad_(False)
 
-        # Always adapt the regression head
-        for param in self.model.network_head.parameters():
+    @torch.enable_grad()
+    def _memo_tta_step(
+        self,
+        tta_model: nn.Module,
+        tta_optimizer: torch.optim.Optimizer,
+        img_single: torch.Tensor,  # [C, H, W]
+        hist: torch.Tensor,  # [1, hist_len]
+        device: torch.device,
+    ) -> None:
+        """Phase 2 (MEMO) — variance minimisation on N augmented views.
+
+        Adapts the norm-layer affine parameters of ``tta_model`` (a deepcopy
+        of ``base_model``) using the standard MEMO-Reg objective:
+
+            L_TTA = Var({ŷ_i : i = 1..N})
+
+        Generation of augmented views mirrors the training-time pipeline
+        (random flip + affine ± 10°, ± 10% translate, ± 10% scale).
+        """
+        self._set_tta_mode(tta_model)
+
+        for _ in range(self.niter_tta):
+            # Stack N independently-augmented views from the single image.
+            aug_imgs = torch.stack(
+                [_random_augment(img_single) for _ in range(self.n_augmentations)],
+                dim=0,
+            ).to(device)  # [N, C, H, W]
+
+            # Repeat the irradiance history for each augmented view.
+            aug_hist = hist.expand(self.n_augmentations, -1).to(device)  # [N, hist_len]
+
+            tta_optimizer.zero_grad()
+            output = tta_model(aug_imgs, aug_hist)
+            preds = output[0] if isinstance(output, tuple) else output  # [N, 1]
+            loss = prediction_variance_loss(preds)
+            loss.backward()
+            tta_optimizer.step()
+
+    @torch.enable_grad()
+    def _note_tta_step(
+        self,
+        tta_model: nn.Module,
+        tta_optimizer: torch.optim.Optimizer,
+        device: torch.device,
+    ) -> None:
+        """Phase 2 (NOTE) — variance minimisation on the persistent sample buffer.
+
+        Adapts norm-layer affine parameters of ``tta_model`` using the full
+        accumulated buffer as a batch.  The persistent buffer provides richer
+        BN batch statistics than a single-sample augmentation approach,
+        especially useful for non-i.i.d. temporal streams.
+
+        Adaptation is skipped if the buffer holds fewer than
+        :data:`_MIN_NOTE_BUFFER` samples, as BN running statistics are
+        unreliable on very small batches.
+        """
+        if len(self._note_buffer) < _MIN_NOTE_BUFFER:
+            # Too few samples for stable batch normalisation; skip this step.
+            return
+
+        self._set_tta_mode(tta_model)
+
+        # Collate the buffer into a single tensor batch.
+        buf_imgs = torch.stack([entry[0] for entry in self._note_buffer], dim=0).to(device)  # [B, C, H, W]
+        buf_hist = torch.stack([entry[1] for entry in self._note_buffer], dim=0).to(device)  # [B, hist_len]
+
+        for _ in range(self.niter_tta):
+            tta_optimizer.zero_grad()
+            output = tta_model(buf_imgs, buf_hist)
+            preds = output[0] if isinstance(output, tuple) else output  # [B, 1]
+            loss = prediction_variance_loss(preds)
+            loss.backward()
+            tta_optimizer.step()
+
+    # =========================================================================
+    # Mode helpers
+    # =========================================================================
+
+    def _set_ogd_mode(self) -> None:
+        """Configure gradient flow on base_model for Phase 1 OGD.
+
+        Freezes all parameters, then selectively unfreezes the regression head
+        and (if ``ogd_scope='head_and_encoder'``) the deepest child of
+        ``image_encoder``.  Puts ``base_model`` into train mode so BN layers
+        update their running statistics during the supervised forward pass.
+        """
+        # Freeze all parameters to establish a clean baseline.
+        for param in self.base_model.parameters():
+            param.requires_grad_(False)
+
+        # Always include the regression head.
+        for param in self.base_model.network_head.parameters():
             param.requires_grad_(True)
 
-        # Optionally adapt the deepest encoder block
+        # Optionally include the deepest encoder block (last child of encoder).
         if self.ogd_scope == "head_and_encoder":
-            encoder_children = list(self.model.image_encoder.children())
+            encoder_children = list(self.base_model.image_encoder.children())
             if encoder_children:
                 for param in encoder_children[-1].parameters():
                     param.requires_grad_(True)
 
-        self.model.train()
+        self.base_model.train()
 
-    def _set_tta_mode(self) -> None:
-        """Freeze everything; unfreeze only norm layer affine params (γ, β)."""
-        for param in self.model.parameters():
+    @staticmethod
+    def _set_tta_mode(model: nn.Module) -> None:
+        """Configure gradient flow on a (deep-copied) model for Phase 2 TTA.
+
+        Freezes all parameters, then unfreezes only the affine parameters
+        (weight γ and bias β) of every BatchNorm1d / BatchNorm2d / LayerNorm
+        module.  Puts the model in ``.eval()`` globally, then overrides each
+        norm module back to ``.train()`` so that BN layers compute
+        per-batch statistics from the augmented views rather than using stale
+        running statistics.
+        """
+        # Freeze everything in the copy.
+        for param in model.parameters():
             param.requires_grad_(False)
 
-        for m in self.model.modules():
+        # Selectively unfreeze affine params of normalisation layers.
+        for m in model.modules():
             if isinstance(m, nn.BatchNorm1d | nn.BatchNorm2d | nn.LayerNorm):
-                if m.affine if hasattr(m, "affine") else (m.weight is not None):
+                affine = m.affine if hasattr(m, "affine") else (m.weight is not None)
+                if affine:
                     if m.weight is not None:
                         m.weight.requires_grad_(True)
                     if m.bias is not None:
                         m.bias.requires_grad_(True)
-                # Keep BN in train mode so it updates / uses batch statistics
-                m.train()
 
-        # All other sub-modules stay in eval mode
-        self.model.eval()
-        for m in self.model.modules():
+        # Global eval (disables dropout etc.) then re-enable norm train mode.
+        model.eval()
+        for m in model.modules():
             if isinstance(m, nn.BatchNorm1d | nn.BatchNorm2d | nn.LayerNorm):
                 m.train()
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Optimizer factories
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _make_ogd_optimizer(self) -> torch.optim.Optimizer:
-        """Create a fresh SGD optimizer for OGD-scope parameters."""
-        params = list(self.model.network_head.parameters())
+        """Build the persistent SGD optimizer for OGD-scoped base_model params.
+
+        The optimizer references the *same* parameter tensor objects that live
+        in ``base_model``, so it remains valid for the lifetime of the adapter
+        without requiring a rebuild after each step.
+        """
+        params = list(self.base_model.network_head.parameters())
         if self.ogd_scope == "head_and_encoder":
-            encoder_children = list(self.model.image_encoder.children())
+            encoder_children = list(self.base_model.image_encoder.children())
             if encoder_children:
                 params.extend(encoder_children[-1].parameters())
         return torch.optim.SGD(
             params,
-            lr=self.ogd_lr,
+            lr=self.lr_ogd,
             momentum=self.ogd_momentum,
             weight_decay=self.ogd_weight_decay,
         )
 
-    def _make_tta_optimizer(self) -> torch.optim.Optimizer:
-        """Create a fresh Adam optimizer for norm-layer affine parameters."""
+    def _make_tta_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
+        """Build a fresh AdamW optimizer for norm-layer affine params of model.
+
+        Always constructs a new optimizer pointing at the affine parameters of
+        the provided (deep-copied) model.  AdamW is preferred over plain Adam
+        for norm-layer-only adaptation: the decoupled weight decay provides a
+        mild regularising pull toward the pre-TTA affine values.
+        """
         params: list[nn.Parameter] = []
-        for m in self.model.modules():
+        for m in model.modules():
             if isinstance(m, nn.BatchNorm1d | nn.BatchNorm2d | nn.LayerNorm):
                 affine = m.affine if hasattr(m, "affine") else (m.weight is not None)
                 if affine:
@@ -337,20 +464,24 @@ class DualPhaseAdapter(nn.Module):
                         params.append(m.weight)
                     if m.bias is not None:
                         params.append(m.bias)
-        if not params:
-            # Fallback: if no norm layers exist, adapt all head params via TTA too
-            params = list(self.model.network_head.parameters())
-        return torch.optim.Adam(params, lr=self.tta_lr, weight_decay=self.tta_weight_decay)
 
-    # ------------------------------------------------------------------
+        if not params:
+            # No normalisation layers found — fall back to the regression head
+            # so the TTA step is always well-defined.
+            params = list(model.network_head.parameters())
+
+        return torch.optim.AdamW(params, lr=self.lr_tta, weight_decay=self.tta_weight_decay)
+
+    # =========================================================================
     # Repr
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def __repr__(self) -> str:
         return (
             f"DualPhaseAdapter("
-            f"cache_size={self.cache_size}, "
-            f"ogd_lr={self.ogd_lr}, ogd_scope={self.ogd_scope!r}, "
-            f"tta_lr={self.tta_lr}, n_augmentations={self.n_augmentations}, "
+            f"tta_method={self.tta_method!r}, "
+            f"ogd_scope={self.ogd_scope!r}, "
+            f"lr_ogd={self.lr_ogd}, lr_tta={self.lr_tta}, "
+            f"n_augmentations={self.n_augmentations}, "
             f"niter_tta={self.niter_tta})"
         )

@@ -1,6 +1,7 @@
 """Evaluate solar irradiance forecasting model on test datasets.
 
-Supports plain baseline inference and two test-time adaptation (TTA) methods:
+Supports plain baseline inference and two test-time adaptation (TTA) methods.
+For the Dual-Phase OGD+TTA method see ``scripts/evaluate_dual_phase.py``.
 
 MEMO-Reg  (``--method memo``)
     Per-sample episodic adaptation: minimises prediction variance across *N*
@@ -45,7 +46,7 @@ from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
-from cirr.tta import DualPhaseAdapter, MEMOReg, NOTEReg
+from cirr.tta import MEMOReg, NOTEReg
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
@@ -55,7 +56,7 @@ from cirr.utils.metrics import compute_metrics
 
 
 def evaluate(
-    tta_model: MEMOReg | NOTEReg | DualPhaseAdapter | None,
+    tta_model: MEMOReg | NOTEReg | None,
     base_model: Forecaster,
     dataset: Any,
     day_index_map: dict[str, list[int]],
@@ -117,11 +118,7 @@ def evaluate(
                 image_name = image_name.decode("utf-8")
 
             if tta_model is not None:
-                # DualPhaseAdapter consumes the ground truth for lagged OGD
-                if isinstance(tta_model, DualPhaseAdapter):
-                    mean, _ = tta_model(images, irr_history, ground_truth=target)
-                else:
-                    mean, _ = tta_model(images, irr_history)
+                mean, _ = tta_model(images, irr_history)
             else:
                 with torch.no_grad():
                     output = base_model(images, irr_history)
@@ -183,10 +180,10 @@ def evaluate(
 )
 @click.option(
     "--method",
-    type=click.Choice(["none", "memo", "note", "dual"], case_sensitive=False),
+    type=click.Choice(["none", "memo", "note"], case_sensitive=False),
     default="none",
     show_default=True,
-    help="TTA method: 'none'=baseline, 'memo'=MEMO-Reg, 'note'=NOTE-Reg, 'dual'=Dual-Phase OGD+TTA.",
+    help="TTA method: 'none'=baseline, 'memo'=MEMO-Reg, 'note'=NOTE-Reg. For dual-phase use evaluate_dual_phase.py.",
 )
 @click.option(
     "--adapt-mode",
@@ -272,34 +269,6 @@ def evaluate(
     help="Save evaluation results and predictions CSV to disk.",
 )
 @click.option(
-    "--cache-size",
-    type=int,
-    default=3,
-    show_default=True,
-    help="(Dual) FIFO cache depth in time steps (15 min / 5 min interval = 3).",
-)
-@click.option(
-    "--ogd-lr",
-    type=float,
-    default=1e-4,
-    show_default=True,
-    help="(Dual) Learning rate for the supervised OGD optimizer.",
-)
-@click.option(
-    "--ogd-scope",
-    type=click.Choice(["head_only", "head_and_encoder"], case_sensitive=False),
-    default="head_only",
-    show_default=True,
-    help="(Dual) OGD update scope: 'head_only' or 'head_and_encoder' (last encoder block).",
-)
-@click.option(
-    "--ogd-loss",
-    type=click.Choice(["berhu", "huber"], case_sensitive=False),
-    default="berhu",
-    show_default=True,
-    help="(Dual) Supervised loss used in the OGD phase.",
-)
-@click.option(
     "--reset-per-day",
     is_flag=True,
     default=False,
@@ -317,10 +286,6 @@ def main(
     niter: int,
     lr: float,
     weight_decay: float,
-    cache_size: int,
-    ogd_lr: float,
-    ogd_scope: str,
-    ogd_loss: str,
     num_days: int,
     start_day: str,
     device: str,
@@ -347,7 +312,7 @@ def main(
     # ------------------------------------------------------------------
     # Wrap with TTA (if requested)
     # ------------------------------------------------------------------
-    tta_model: MEMOReg | NOTEReg | DualPhaseAdapter | None = None
+    tta_model: MEMOReg | NOTEReg | None = None
     if method == "memo":
         print(
             f"Wrapping model with MEMOReg ("
@@ -379,24 +344,6 @@ def main(
             use_learned_stats=use_learned_stats,
             bn_momentum=bn_momentum,
         ).to(device)
-    elif method == "dual":
-        print(
-            f"Wrapping model with DualPhaseAdapter ("
-            f"cache_size={cache_size}, "
-            f"ogd_lr={ogd_lr}, ogd_scope={ogd_scope!r}, ogd_loss={ogd_loss!r}, "
-            f"tta_lr={lr}, n_augmentations={n_augmentations}, niter_tta={niter})..."
-        )
-        tta_model = DualPhaseAdapter(
-            model=model,
-            cache_size=cache_size,
-            ogd_lr=ogd_lr,
-            ogd_scope=ogd_scope,
-            ogd_loss=ogd_loss,
-            tta_lr=lr,
-            tta_weight_decay=weight_decay,
-            n_augmentations=n_augmentations,
-            niter_tta=niter,
-        ).to(device)
     else:
         print("No TTA — running baseline inference.")
 
@@ -424,7 +371,7 @@ def main(
     # ------------------------------------------------------------------
     # Run evaluation
     # ------------------------------------------------------------------
-    method_labels = {"none": "baseline", "memo": "MEMO-Reg TTA", "note": "NOTE-Reg TTA", "dual": "Dual-Phase TTA"}
+    method_labels = {"none": "baseline", "memo": "MEMO-Reg TTA", "note": "NOTE-Reg TTA"}
     print(f"Running {method_labels[method]} evaluation...\n")
 
     overall_metrics, per_day_metrics, predictions_data = evaluate(
@@ -455,13 +402,6 @@ def main(
                 f"TTA: NOTEReg  adapt_mode={adapt_mode}  update_every_x={update_every_x}"
                 f"  niter={niter}  lr={lr}  use_learned_stats={use_learned_stats}"
                 f"  bn_momentum={bn_momentum}  reset_per_day={reset_per_day}"
-            )
-        elif method == "dual":
-            extra.append(
-                f"TTA: DualPhaseAdapter  cache_size={cache_size}"
-                f"  ogd_lr={ogd_lr}  ogd_scope={ogd_scope}  ogd_loss={ogd_loss}"
-                f"  tta_lr={lr}  n_aug={n_augmentations}  niter_tta={niter}"
-                f"  reset_per_day={reset_per_day}"
             )
         save_metrics_report(
             tag=method_tag,
