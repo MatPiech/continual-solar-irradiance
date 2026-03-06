@@ -1,27 +1,30 @@
-"""Evaluate solar irradiance forecasting with MEMO-Reg test-time adaptation.
+"""Evaluate solar irradiance forecasting with test-time adaptation (TTA).
 
-MEMO-Reg (Prediction Variance Minimisation) adapts the model at inference time
-for each sky image by minimising the variance of predictions across N augmented
-views, then returning the prediction on the original unaugmented image.
+Supported methods
+-----------------
+MEMO-Reg  (default ``--method memo``)
+    Per-sample adaptation: minimises prediction variance across *N* augmented
+    views of each sky image; episodically resets weights before every sample.
+
+NOTE-Reg  (``--method note``)
+    Online buffer-based adaptation: collects recent samples in a FIFO deque
+    and updates BN (or full-model) params via prediction variance loss every
+    ``--update-every-x`` samples.  Non-episodic — weights accumulate over
+    the test stream.
 
 Usage examples
 --------------
-# Basic TTA evaluation on Poznan dataset:
-python scripts/evaluate_tta.py \\
-    --checkpoint checkpoints/epoch_012.ckpt \\
-    --dataset-path data/poznan_prepared
-
-# BN-only adaptation, more augmentations:
-python scripts/evaluate_tta.py \\
-    --checkpoint checkpoints/epoch_012.ckpt \\
-    --dataset-path data/poznan_prepared \\
-    --adapt-mode bn_only --n-augmentations 16
-
-# Smoke test (3 days, fast):
+# MEMO-Reg (default), smoke test:
 python scripts/evaluate_tta.py \\
     --checkpoint checkpoints/epoch_012.ckpt \\
     --dataset-path data/poznan_prepared \\
     --num-days 3 --n-augmentations 4 --niter 1
+
+# NOTE-Reg, BN-only, buffer of 32:
+python scripts/evaluate_tta.py \\
+    --checkpoint checkpoints/epoch_012.ckpt \\
+    --dataset-path data/poznan_prepared \\
+    --method note --adapt-mode bn_only --update-every-x 32
 
 # Disable TTA for baseline comparison:
 python scripts/evaluate_tta.py \\
@@ -43,7 +46,7 @@ from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
-from cirr.tta import MEMOReg
+from cirr.tta import MEMOReg, NOTEReg
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
@@ -59,6 +62,7 @@ def evaluate_with_tta(
     day_index_map: dict[str, list[int]],
     days_to_eval: list[str],
     device: str,
+    reset_per_day: bool = False,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Run the full evaluation loop with (or without) TTA, processing day by day.
 
@@ -76,6 +80,9 @@ def evaluate_with_tta(
         List of day keys (MMDD) to evaluate.
     device : str
         Target device.
+    reset_per_day : bool, optional
+        If True, reset model weights to the initial checkpoint state after each
+        evaluated day.
 
     Returns
     -------
@@ -156,6 +163,10 @@ def evaluate_with_tta(
                 flush=True,
             )
 
+        # Per-day reset is only meaningful for TTA runs.
+        if reset_per_day and tta_model is not None:
+            tta_model.reset()
+
     overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
     return overall_metrics, per_day_metrics, predictions_data
 
@@ -185,6 +196,13 @@ def evaluate_with_tta(
     help="Disable TTA and run plain inference (baseline comparison).",
 )
 @click.option(
+    "--method",
+    type=click.Choice(["memo", "note"], case_sensitive=False),
+    default="memo",
+    show_default=True,
+    help="TTA method: 'memo' (per-sample, episodic) or 'note' (online buffer-based).",
+)
+@click.option(
     "--adapt-mode",
     type=click.Choice(["all", "bn_only"], case_sensitive=False),
     default="all",
@@ -199,14 +217,34 @@ def evaluate_with_tta(
     type=int,
     default=8,
     show_default=True,
-    help="Number of augmented views per test image.",
+    help="(MEMO) Number of augmented views per test image.",
+)
+@click.option(
+    "--update-every-x",
+    type=int,
+    default=64,
+    show_default=True,
+    help="(NOTE) FIFO buffer capacity and adaptation trigger interval (samples).",
+)
+@click.option(
+    "--use-learned-stats",
+    is_flag=True,
+    default=False,
+    help="(NOTE) Use BN running statistics (with momentum) instead of per-batch stats.",
+)
+@click.option(
+    "--bn-momentum",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="(NOTE) Momentum for BN running stats when --use-learned-stats is set.",
 )
 @click.option(
     "--niter",
     type=int,
     default=1,
     show_default=True,
-    help="Number of gradient steps per test image.",
+    help="Number of gradient steps per adaptation trigger.",
 )
 @click.option(
     "--lr",
@@ -249,12 +287,22 @@ def evaluate_with_tta(
     default=False,
     help="Save evaluation results and predictions CSV to disk.",
 )
+@click.option(
+    "--reset-per-day",
+    is_flag=True,
+    default=False,
+    help="Reset model weights to the initial checkpoint state after each day.",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
     no_tta: bool,
+    method: str,
     adapt_mode: str,
     n_augmentations: int,
+    update_every_x: int,
+    use_learned_stats: bool,
+    bn_momentum: float,
     niter: int,
     lr: float,
     weight_decay: float,
@@ -262,15 +310,16 @@ def main(
     start_day: str,
     device: str,
     save_results: bool,
+    reset_per_day: bool,
 ) -> None:
-    """Evaluate with MEMO-Reg Test-Time Adaptation on a sky-image dataset."""
+    """Evaluate a TTA method (MEMO-Reg or NOTE-Reg) on a sky-image dataset."""
 
     if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU.")
         device = "cpu"
 
     dataset_name = dataset_path.name.split("_")[0]
-    method_tag = "baseline" if no_tta else f"memo_reg_{adapt_mode}"
+    method_tag = "baseline" if no_tta else f"{method}_reg_{adapt_mode}"
 
     # ------------------------------------------------------------------
     # Load model
@@ -285,23 +334,42 @@ def main(
     # ------------------------------------------------------------------
     # Wrap with TTA
     # ------------------------------------------------------------------
-    tta_model: MEMOReg | None = None
+    tta_model: MEMOReg | NOTEReg | None = None
     if not no_tta:
-        print(
-            f"Wrapping model with MEMOReg ("
-            f"adapt_mode={adapt_mode!r}, "
-            f"n_augmentations={n_augmentations}, "
-            f"niter={niter}, lr={lr})..."
-        )
-        tta_model = MEMOReg(
-            model=model,
-            lr=lr,
-            weight_decay=weight_decay,
-            n_augmentations=n_augmentations,
-            niter=niter,
-            episodic=True,
-            adapt_mode=adapt_mode,
-        ).to(device)
+        if method == "memo":
+            print(
+                f"Wrapping model with MEMOReg ("
+                f"adapt_mode={adapt_mode!r}, "
+                f"n_augmentations={n_augmentations}, "
+                f"niter={niter}, lr={lr})..."
+            )
+            tta_model = MEMOReg(
+                model=model,
+                lr=lr,
+                weight_decay=weight_decay,
+                n_augmentations=n_augmentations,
+                niter=niter,
+                episodic=True,
+                adapt_mode=adapt_mode,
+            ).to(device)
+        else:  # note
+            print(
+                f"Wrapping model with NOTEReg ("
+                f"adapt_mode={adapt_mode!r}, "
+                f"update_every_x={update_every_x}, "
+                f"niter={niter}, lr={lr}, "
+                f"use_learned_stats={use_learned_stats})..."
+            )
+            tta_model = NOTEReg(
+                model=model,
+                lr=lr,
+                weight_decay=weight_decay,
+                update_every_x=update_every_x,
+                niter=niter,
+                adapt_mode=adapt_mode,
+                use_learned_stats=use_learned_stats,
+                bn_momentum=bn_momentum,
+            ).to(device)
     else:
         print("TTA disabled — running baseline inference.")
 
@@ -332,7 +400,8 @@ def main(
     # ------------------------------------------------------------------
     # Run evaluation
     # ------------------------------------------------------------------
-    print(f"Running {'MEMO-Reg TTA' if not no_tta else 'baseline'} evaluation...\n")
+    method_label = {"memo": "MEMO-Reg", "note": "NOTE-Reg"}.get(method, method.upper())
+    print(f"Running {method_label + ' TTA' if not no_tta else 'baseline'} evaluation...\n")
     overall_metrics, per_day_metrics, predictions_data = evaluate_with_tta(
         tta_model=tta_model,
         base_model=model,
@@ -340,6 +409,7 @@ def main(
         day_index_map=day_index_map,
         days_to_eval=days_to_eval,
         device=device,
+        reset_per_day=reset_per_day,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -351,7 +421,17 @@ def main(
         print(f"\nPredictions saved to {csv_path}")
         extra: list[str] = []
         if not no_tta:
-            extra.append(f"TTA: MEMOReg  adapt_mode={adapt_mode}  n_aug={n_augmentations}  niter={niter}  lr={lr}")
+            if method == "memo":
+                extra.append(
+                    f"TTA: MEMOReg  adapt_mode={adapt_mode}  n_aug={n_augmentations}"
+                    f"  niter={niter}  lr={lr}  reset_per_day={reset_per_day}"
+                )
+            else:
+                extra.append(
+                    f"TTA: NOTEReg  adapt_mode={adapt_mode}  update_every_x={update_every_x}"
+                    f"  niter={niter}  lr={lr}  use_learned_stats={use_learned_stats}"
+                    f"  bn_momentum={bn_momentum}  reset_per_day={reset_per_day}"
+                )
         save_metrics_report(
             tag=method_tag,
             dataset_name=dataset_name,
