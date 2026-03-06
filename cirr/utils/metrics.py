@@ -1,7 +1,7 @@
 """Metrics for evaluating models."""
 
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, root_mean_squared_error
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 
 def robust_wape(targets: np.ndarray, predictions: np.ndarray) -> float:
@@ -23,17 +23,15 @@ def robust_smape(targets: np.ndarray, predictions: np.ndarray) -> float:
 
 
 def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> dict[str, float]:
-    """Compute MAE, RMSE, MAPE, WAPE, SMAPE, and sample count."""
+    """Compute MAE, RMSE, WAPE, SMAPE, and sample count."""
     mae = mean_absolute_error(targets, predictions)
     rmse = root_mean_squared_error(targets, predictions)
-    mape = mean_absolute_percentage_error(targets, predictions)
     wape = robust_wape(targets, predictions)
     smape = robust_smape(targets, predictions)
 
     return {
         "mae": float(mae),
         "rmse": float(rmse),
-        "mape": float(mape),
         "wape": float(wape),
         "smape": float(smape),
         "count": len(predictions),

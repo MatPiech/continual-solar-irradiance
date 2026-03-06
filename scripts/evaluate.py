@@ -152,8 +152,7 @@ def evaluate(
             per_day_metrics[day_key] = day_metrics
             print(
                 f"{day_key:<6} {day_metrics['mae']:<10.4f} {day_metrics['rmse']:<10.4f} "
-                f"{day_metrics['mape']:<16.2%} {day_metrics['wape']:<10.2f}% "
-                f"{day_metrics['smape']:<10.2f}% {day_metrics['count']:<8}",
+                f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% {day_metrics['count']:<8}",
                 flush=True,
             )
 

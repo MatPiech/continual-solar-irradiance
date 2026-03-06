@@ -444,7 +444,7 @@ def run_local_training(
     predictions_data : list[dict[str, Any]]
         List of dictionaries with predictions, targets, and timestamps.
     overall_metrics : dict[str, float]
-        Overall metrics (MAE, RMSE, MAPE, WAPE, SMAPE, count).
+        Overall metrics (MAE, RMSE, WAPE, SMAPE, count).
     per_day_metrics : dict[str, dict[str, float]]
         Per-day metrics with MMDD as keys.
     """
@@ -496,7 +496,7 @@ def run_local_training(
         full_buffer_dist = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
     print(
-        f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'MAPE':<16} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8} {'Train Loss':<12} {'Replay Dist Match':<18}"
+        f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8} {'Train Loss':<12} {'Replay Dist Match':<18}"
     )
     print("-" * 130)
 
@@ -584,8 +584,7 @@ def run_local_training(
 
         print(
             f"{day_key:<6} {metrics['mae']:<10.4f} "
-            f"{metrics['rmse']:<10.4f} {metrics['mape']:<16.2%} "
-            f"{metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
+            f"{metrics['rmse']:<10.4f} {metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
             f"{metrics['count']:<8} {train_loss:<12.4f}  {dist_match_str:<16}"
         )
         print(
