@@ -75,12 +75,13 @@ python scripts/evaluate_dual_phase.py \\
     --checkpoint checkpoints/epoch_024.ckpt \\
     --dataset-path data/poznan_prepared
 
-# NOTE-style TTA, 5-day window, encoder OGD scope:
+# NOTE-style TTA, 5-day window, encoder OGD scope, Ramp Weighted loss enabled:
 python scripts/evaluate_dual_phase.py \\
     --checkpoint checkpoints/epoch_024.ckpt \\
     --dataset-path data/poznan_prepared \\
     --tta-method note --note-buffer-size 32 \\
-    --ogd-scope head_and_encoder --num-days 5
+    --ogd-scope head_and_encoder --num-days 5 \\
+    --ogd-ramp-penalty 3.0
 
 # Save per-day report:
 python scripts/evaluate_dual_phase.py \\
@@ -222,32 +223,7 @@ def evaluate(
     lr_decay_steps: int,
     persistence_weight: float,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
-    """Run the day-by-day online evaluation loop with DualPhaseAdapter.
-
-    This function owns the causal simulation: a ``deque`` queue withholds each
-    ground-truth label for ``horizon_steps`` time steps before releasing it to
-    :meth:`~cirr.tta.DualPhaseAdapter.update`.  The queue is flushed at every
-    day boundary to prevent overnight ground-truth leakage.
-
-    Parameters
-    ----------
-    adapter : DualPhaseAdapter
-        Configured adapter (already moved to ``device``).
-    dataset : SkyImageDataset
-        Test dataset; items are ``(image, history, target, name)``.
-    day_index_map : dict[str, list[int]]
-        Maps MMDD keys to dataset indices for that day.
-    days_to_eval : list[str]
-        Ordered MMDD keys to evaluate.
-    device : str
-        Target device string (``'cuda'`` or ``'cpu'``).
-    horizon_steps : int
-        Causal queue depth: labels are withheld for this many steps.
-
-    Returns
-    -------
-    overall_metrics, per_day_metrics, predictions_data
-    """
+    """Run the day-by-day online evaluation loop with DualPhaseAdapter."""
     all_predictions: list[float] = []
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
@@ -471,6 +447,13 @@ def evaluate(
     help="Supervised loss function used in the OGD phase.",
 )
 @click.option(
+    "--ogd-ramp-penalty",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Multiplier for OGD loss based on true irradiance delta. (0.0 = disabled)",
+)
+@click.option(
     "--lr-tta",
     type=float,
     default=1e-5,
@@ -613,6 +596,7 @@ def main(
     ogd_lr: float,
     ogd_scope: str,
     ogd_loss: str,
+    ogd_ramp_penalty: float,
     lr_tta: float,
     n_augmentations: int,
     niter: int,
@@ -668,7 +652,8 @@ def main(
         f"Building DualPhaseAdapter ("
         f"tta_method={tta_method!r}, horizon_steps={horizon_steps}, "
         f"ogd_lr={ogd_lr}, ogd_scope={ogd_scope!r}, ogd_loss={ogd_loss!r}, "
-        f"lr_tta={lr_tta}, n_augmentations={n_augmentations}, niter={niter}, "
+        f"ogd_ramp_penalty={ogd_ramp_penalty}, lr_tta={lr_tta}, "
+        f"n_augmentations={n_augmentations}, niter={niter}, "
         f"note_buffer_size={note_buffer_size})..."
     )
     adapter = DualPhaseAdapter(
@@ -678,6 +663,7 @@ def main(
         tta_method=tta_method,
         ogd_scope=ogd_scope,
         ogd_loss=ogd_loss,
+        ogd_ramp_penalty=ogd_ramp_penalty,
         tta_weight_decay=0.0,
         n_augmentations=n_augmentations,
         niter_tta=niter,
@@ -751,7 +737,8 @@ def main(
         extra = [
             f"TTA: DualPhaseAdapter  tta_method={tta_method}"
             f"  horizon_steps={horizon_steps}  ogd_lr={ogd_lr}  ogd_scope={ogd_scope}"
-            f"  ogd_loss={ogd_loss}  lr_tta={lr_tta}  n_aug={n_augmentations}"
+            f"  ogd_loss={ogd_loss}  ogd_ramp_penalty={ogd_ramp_penalty}"
+            f"  lr_tta={lr_tta}  n_aug={n_augmentations}"
             f"  niter={niter}  note_buffer_size={note_buffer_size}"
             f"  use_online_calibrator={use_online_calibrator}"
             f"  cal_lr={cal_lr}  cal_l2={cal_l2}"
