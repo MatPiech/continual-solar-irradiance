@@ -217,6 +217,10 @@ def evaluate(
     use_online_calibrator: bool,
     cal_lr: float,
     cal_l2: float,
+    warmup_samples: int,
+    lr_decay_rate: float,
+    lr_decay_steps: int,
+    persistence_weight: float,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     """Run the day-by-day online evaluation loop with DualPhaseAdapter.
 
@@ -257,7 +261,10 @@ def evaluate(
         "skipped_above_high": 0,
         "skipped_no_clear_sky": 0,
         "skipped_low_clear_sky": 0,
+        "skipped_warmup": 0,
     }
+    total_samples_processed = 0
+    ogd_lr_current = adapter.lr_ogd
 
     print_metrics_header()
 
@@ -295,6 +302,12 @@ def evaluate(
                 oldest = causal_queue.popleft()
                 should_update = True
                 update_stats["considered"] += 1
+                total_samples_processed += 1
+
+                # Warm-up: skip adaptation for initial samples
+                if warmup_samples > 0 and total_samples_processed <= warmup_samples:
+                    should_update = False
+                    update_stats["skipped_warmup"] += 1
 
                 if ogd_gating != "none" and oldest["raw_pred"] is not None:
                     gt_value = float(oldest["gt"].view(-1)[0].item())
@@ -323,6 +336,12 @@ def evaluate(
                             update_stats["skipped_above_high"] += 1
 
                 if should_update:
+                    # Apply learning rate decay
+                    if lr_decay_rate > 0 and lr_decay_steps > 0 and total_samples_processed % lr_decay_steps == 0:
+                        ogd_lr_current *= 1.0 - lr_decay_rate
+                        for param_group in adapter._ogd_optimizer.param_groups:
+                            param_group["lr"] = ogd_lr_current
+
                     adapter.update(
                         oldest["image"].to(device),
                         oldest["history"].to(device),
@@ -337,6 +356,11 @@ def evaluate(
             # C+D: TTA-adapt a deepcopy and predict with it.
             mean_raw, _ = adapter.predict(images, irr_history)
             mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
+
+            # Optional: blend with persistence (smart persistence = last irradiance value)
+            if persistence_weight > 0.0:
+                persistence_pred = irradiance_history[-1].unsqueeze(0).to(device)  # [1]
+                mean = (1.0 - persistence_weight) * mean + persistence_weight * persistence_pred
 
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
@@ -374,19 +398,22 @@ def evaluate(
         causal_queue.clear()
 
     overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
-    if ogd_gating == "none":
+    if ogd_gating == "none" and warmup_samples == 0:
         print("\nOGD gating: disabled (all causally-available samples were updated).", flush=True)
     else:
         print(
             "\nOGD gating stats: "
             f"considered={update_stats['considered']}  "
             f"updated={update_stats['updated']}  "
+            f"warmup={update_stats['skipped_warmup']}  "
             f"below_low={update_stats['skipped_below_low']}  "
             f"above_high={update_stats['skipped_above_high']}  "
             f"no_clear_sky={update_stats['skipped_no_clear_sky']}  "
             f"low_clear_sky={update_stats['skipped_low_clear_sky']}",
             flush=True,
         )
+    if lr_decay_rate > 0:
+        print(f"Final OGD learning rate: {ogd_lr_current:.2e}", flush=True)
     return overall_metrics, per_day_metrics, predictions_data
 
 
@@ -550,6 +577,34 @@ def evaluate(
     show_default=True,
     help="For csi gating: skip updates when clear sky is below this value (kW/m^2).",
 )
+@click.option(
+    "--warmup-samples",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Number of initial samples to skip OGD updates (warm-up period).",
+)
+@click.option(
+    "--lr-decay-rate",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Learning rate decay rate per decay-steps (0.0 = no decay).",
+)
+@click.option(
+    "--lr-decay-steps",
+    type=int,
+    default=1000,
+    show_default=True,
+    help="Number of OGD updates between learning rate decay applications.",
+)
+@click.option(
+    "--persistence-weight",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Weight for smart persistence ensemble: pred = (1-w)*model + w*last_irr (0.0 = model only).",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
@@ -573,6 +628,10 @@ def main(
     ogd_gating_low: float,
     ogd_gating_high: float,
     csi_min_clear_sky: float,
+    warmup_samples: int,
+    lr_decay_rate: float,
+    lr_decay_steps: int,
+    persistence_weight: float,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -676,6 +735,10 @@ def main(
         use_online_calibrator=use_online_calibrator,
         cal_lr=cal_lr,
         cal_l2=cal_l2,
+        warmup_samples=warmup_samples,
+        lr_decay_rate=lr_decay_rate,
+        lr_decay_steps=lr_decay_steps,
+        persistence_weight=persistence_weight,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -695,6 +758,9 @@ def main(
             f"  ogd_gating={ogd_gating}"
             f"  ogd_gating_low={ogd_gating_low}  ogd_gating_high={ogd_gating_high}"
             f"  csi_min_clear_sky={csi_min_clear_sky}"
+            f"  warmup_samples={warmup_samples}"
+            f"  lr_decay_rate={lr_decay_rate}  lr_decay_steps={lr_decay_steps}"
+            f"  persistence_weight={persistence_weight}"
         ]
         save_metrics_report(
             tag=method_tag,
