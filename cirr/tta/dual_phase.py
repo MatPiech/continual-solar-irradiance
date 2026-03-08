@@ -106,6 +106,9 @@ class DualPhaseAdapter(nn.Module):
         SGD momentum for the OGD optimizer, by default ``0.9``.
     ogd_weight_decay : float, optional
         Weight decay for the OGD optimizer, by default ``1e-4``.
+    ogd_ramp_penalty : float, optional
+        Multiplier for dynamic OGD loss scaling based on true irradiance
+        delta. (0.0 = disabled), by default ``0.0``.
     tta_weight_decay : float, optional
         Weight decay for the ephemeral TTA AdamW optimizer, by default
         ``0.0``.
@@ -130,6 +133,7 @@ class DualPhaseAdapter(nn.Module):
         ogd_loss: Literal["berhu", "huber", "mse"] = "berhu",
         ogd_momentum: float = 0.9,
         ogd_weight_decay: float = 1e-4,
+        ogd_ramp_penalty: float = 0.0,
         tta_weight_decay: float = 0.0,
         n_augmentations: int = 8,
         niter_tta: int = 1,
@@ -144,6 +148,7 @@ class DualPhaseAdapter(nn.Module):
         self.ogd_scope = ogd_scope
         self.ogd_momentum = ogd_momentum
         self.ogd_weight_decay = ogd_weight_decay
+        self.ogd_ramp_penalty = ogd_ramp_penalty
         self.tta_weight_decay = tta_weight_decay
         self.n_augmentations = n_augmentations
         self.niter_tta = niter_tta
@@ -255,8 +260,6 @@ class DualPhaseAdapter(nn.Module):
             output = tta_model(img.to(device), hist.to(device))
 
         del tta_model, tta_optimizer
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         if isinstance(output, tuple):
             mean, variance = output
@@ -276,7 +279,7 @@ class DualPhaseAdapter(nn.Module):
         history: torch.Tensor,  # [hist_len]
         gt: torch.Tensor,  # [1, 1]
     ) -> None:
-        """Phase 1 — one supervised gradient step on base_model.
+        """Phase 1 — one supervised gradient step on base_model with Ramp Weighting.
 
         Configures the gradient flow so only OGD-scoped parameters receive
         gradients; all other parameters stay frozen.  Restores
@@ -293,7 +296,25 @@ class DualPhaseAdapter(nn.Module):
         output = self.base_model(imgs_batch, hist_batch)
         pred = output[0] if isinstance(output, tuple) else output  # [1, 1]
 
+        # 1. Base loss calculation
         loss = self._ogd_loss_fn(pred, gt.view_as(pred))
+
+        # 2. Ramp-Weighted Penalty (Adaptive loss scaling)
+        if self.ogd_ramp_penalty > 0.0:
+            # history[-1] is the most recent known irradiance (time t)
+            # gt is the actual arrived irradiance (time t+H)
+            current_irr = history[-1]
+            gt_val = gt.view(-1)[0]
+
+            # How much did the weather actually change in the real world?
+            actual_delta = torch.abs(gt_val - current_irr)
+
+            # Scale the loss dynamically
+            ramp_weight = 1.0 + (actual_delta * self.ogd_ramp_penalty)
+
+            # Apply the dynamic weight (detach to prevent graph issues)
+            loss = loss * ramp_weight.detach()
+
         loss.backward()
         self._ogd_optimizer.step()
 
@@ -499,6 +520,7 @@ class DualPhaseAdapter(nn.Module):
             f"tta_method={self.tta_method!r}, "
             f"ogd_scope={self.ogd_scope!r}, "
             f"lr_ogd={self.lr_ogd}, lr_tta={self.lr_tta}, "
+            f"ogd_ramp_penalty={self.ogd_ramp_penalty}, "
             f"n_augmentations={self.n_augmentations}, "
             f"niter_tta={self.niter_tta})"
         )
