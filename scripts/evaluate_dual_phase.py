@@ -242,9 +242,9 @@ def evaluate(
                     delayed_target = float(oldest["gt"].view(-1)[0].item())
                     calibrator.update(float(oldest["raw_pred"]), delayed_target)
 
-            # C+D: TTA-adapt a deepcopy and predict with it.
-            mean_raw, _ = adapter.predict(images, irr_history)
-            mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
+            # Decide routing first so we can skip expensive TTA in Regime 1.
+            dyn_weight = 0.0
+            smart_persistence_pred = None
 
             # -----------------------------------------------------------------
             # DYNAMIC REGIME-AWARE ENSEMBLE (CSI-BASED)
@@ -267,7 +267,7 @@ def evaluate(
                 else:
                     smart_persistence_val = current_irr_val
 
-                smart_persistence_pred = torch.tensor([[smart_persistence_val]], dtype=mean.dtype, device=device)
+                smart_persistence_pred = torch.tensor([[smart_persistence_val]], dtype=target.dtype, device=device)
 
                 # 2. Calculate CSI Variance to determine the Weather Regime
                 if current_cs is not None and current_cs > 0:
@@ -279,7 +279,7 @@ def evaluate(
                         # Fallback to current_cs if a history clear sky value is missing
                         cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
 
-                    cs_history_tensor = torch.tensor(cs_history_vals, dtype=mean.dtype, device=device)
+                    cs_history_tensor = torch.tensor(cs_history_vals, dtype=target.dtype, device=device)
                     recent_csi = irr_history[0, -4:] / cs_history_tensor
                     csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
                 else:
@@ -296,12 +296,19 @@ def evaluate(
                     # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
                     dyn_weight = 0.0
                     day_regime2_count += 1
-
-                mean = (1.0 - dyn_weight) * mean + dyn_weight * smart_persistence_pred
             else:
                 # Dynamic routing is disabled, so all predictions come from the model path.
                 day_regime2_count += 1
             # -----------------------------------------------------------------
+
+            if use_dynamic_ensemble and dyn_weight == 1.0 and smart_persistence_pred is not None:
+                # Regime 1: serve Smart Persistence directly and avoid TTA compute.
+                mean_raw, _ = adapter.predict_base(images, irr_history)
+                mean = smart_persistence_pred
+            else:
+                # Regime 2 (or dynamic routing disabled): run full Dual-Phase prediction.
+                mean_raw, _ = adapter.predict(images, irr_history)
+                mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
 
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
