@@ -188,6 +188,27 @@ class DualPhaseAdapter(nn.Module):
 
         return mean, variance
 
+    @torch.no_grad()
+    def predict_base(
+        self,
+        image: torch.Tensor,  # [1, C, H, W]
+        history: torch.Tensor,  # [1, hist_len]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run base_model inference without any TTA adaptation.
+
+        Useful for lightweight online signals (e.g. delayed gating/calibration)
+        when the final served prediction is produced by another branch.
+        """
+        device = image.device
+        img = image if image.dim() == 4 else image.unsqueeze(0)
+        hist = history if history.dim() == 2 else history.unsqueeze(0)
+
+        self.base_model.eval()
+        output = self.base_model(img.to(device), hist.to(device))
+        mean = output[0] if isinstance(output, tuple) else output
+        variance = output[1] if isinstance(output, tuple) else None
+        return mean, variance
+
     # =========================================================================
     # Phase implementations
     # =========================================================================
