@@ -450,6 +450,42 @@ class Forecaster(pl.LightningModule):
             out = F.softplus(out)
             return out, None
 
+    def forward_with_encoder_features(
+        self,
+        x: torch.Tensor,
+        irradiance_history: torch.Tensor,
+        clear_sky_current: float | None = None,
+        update_clear_sky_stats: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Forward pass that also returns encoder features before ``network_head``.
+
+        Returns
+        -------
+        mean : Tensor
+            Predicted irradiance (after softplus).
+        variance : Tensor or None
+            Predicted variance (probabilistic mode) or None.
+        encoder_features : Tensor
+            1D feature vector from ``image_encoder`` used as MLP head input.
+        """
+        img_feats = self._encode_image_features(
+            x,
+            irradiance_history,
+            clear_sky_current=clear_sky_current,
+            update_clear_sky_stats=update_clear_sky_stats,
+        )
+
+        fused = torch.cat([img_feats, irradiance_history], dim=1)
+        out = self.network_head(fused)
+
+        if self.is_probabilistic:
+            mean = F.softplus(out[:, 0].unsqueeze(1))
+            variance = F.softplus(out[:, 1].unsqueeze(1)) + 1e-6
+            return mean, variance, img_feats
+
+        out = F.softplus(out)
+        return out, None, img_feats
+
     def extract_proto_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract prototype features from the deep attention stage.
 

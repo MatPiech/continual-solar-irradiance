@@ -93,6 +93,43 @@ class OnlineARErrorFilter:
         """Return a copy of current AR coefficients."""
         return self._coeffs.copy()
 
+
+class ResidualKNNMemory:
+    """Rolling feature-space memory for retrieval-augmented residual correction."""
+
+    def __init__(self, bank_size: int = 500, k: int = 3, min_samples: int = 30) -> None:
+        self.bank_size = bank_size
+        self.k = k
+        self.min_samples = min_samples
+        self._features: deque[np.ndarray] = deque(maxlen=bank_size)
+        self._errors: deque[float] = deque(maxlen=bank_size)
+
+    def add(self, feature_vec: np.ndarray, error_value: float) -> None:
+        vec = feature_vec.astype(np.float64, copy=False).reshape(-1)
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1e-12:
+            return
+        self._features.append(vec / norm)
+        self._errors.append(float(error_value))
+
+    def predict_correction(self, feature_vec: np.ndarray) -> float:
+        if len(self._features) < max(self.min_samples, self.k):
+            return 0.0
+
+        query = feature_vec.astype(np.float64, copy=False).reshape(-1)
+        query_norm = float(np.linalg.norm(query))
+        if query_norm <= 1e-12:
+            return 0.0
+        query = query / query_norm
+
+        feature_matrix = np.stack(list(self._features), axis=0)
+        sims = feature_matrix @ query
+
+        k_eff = min(self.k, sims.shape[0])
+        top_idx = np.argpartition(sims, -k_eff)[-k_eff:]
+        top_errors = np.asarray(list(self._errors), dtype=np.float64)[top_idx]
+        return float(np.mean(top_errors))
+
     def _fit_ar_coeffs(self) -> np.ndarray | None:
         errors = np.asarray(self._errors, dtype=np.float64)
         n = len(errors)
@@ -199,6 +236,10 @@ def evaluate(
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
     use_adain_feature_norm: bool,
+    use_knn_residual: bool,
+    knn_bank_size: int,
+    knn_k: int,
+    knn_min_samples: int,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     all_predictions: list[float] = []
     all_targets: list[float] = []
@@ -216,6 +257,7 @@ def evaluate(
         if use_ar_error_filter
         else None
     )
+    knn_memory = ResidualKNNMemory(bank_size=knn_bank_size, k=knn_k, min_samples=knn_min_samples) if use_knn_residual else None
     update_stats = {
         "considered": 0,
         "updated": 0,
@@ -318,6 +360,11 @@ def evaluate(
                     delayed_target = float(oldest["gt"].view(-1)[0].item())
                     error_filter.update(float(oldest["raw_pred"]), delayed_target)
 
+                if knn_memory is not None and oldest["raw_pred"] is not None and oldest.get("feature_vec") is not None:
+                    delayed_target = float(oldest["gt"].view(-1)[0].item())
+                    delayed_error = delayed_target - float(oldest["raw_pred"])
+                    knn_memory.add(np.asarray(oldest["feature_vec"], dtype=np.float64), delayed_error)
+
             # Decide routing first so we can skip expensive TTA in Regime 1.
             dyn_weight = 0.0
             smart_persistence_pred = None
@@ -376,7 +423,7 @@ def evaluate(
 
             if use_dynamic_ensemble and dyn_weight == 1.0 and smart_persistence_pred is not None:
                 # Regime 1: serve Smart Persistence directly and avoid TTA compute.
-                mean_raw, _ = adapter.predict_base(
+                mean_raw, _, feature_vec = adapter.predict_base_with_features(
                     images,
                     irr_history,
                     clear_sky_current=current_cs,
@@ -385,7 +432,7 @@ def evaluate(
                 mean = smart_persistence_pred
             else:
                 # Regime 2 (or dynamic routing disabled): run full Dual-Phase prediction.
-                mean_raw, _ = adapter.predict(
+                mean_raw, _, feature_vec = adapter.predict_with_features(
                     images,
                     irr_history,
                     clear_sky_current=current_cs,
@@ -393,8 +440,17 @@ def evaluate(
                 )
                 mean = error_filter.apply(mean_raw) if error_filter is not None else mean_raw
 
+                if knn_memory is not None and feature_vec is not None:
+                    feat_np = feature_vec.detach().cpu().view(-1).numpy()
+                    knn_correction = knn_memory.predict_correction(feat_np)
+                    mean = torch.clamp(mean + knn_correction, min=0.0)
+
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
+            if feature_vec is not None:
+                causal_queue[-1]["feature_vec"] = feature_vec.detach().cpu().view(-1).numpy()
+            else:
+                causal_queue[-1]["feature_vec"] = None
 
             pred_np = mean.detach().cpu().numpy().flatten()
             target_np = target.cpu().numpy().flatten()
@@ -686,6 +742,33 @@ def evaluate(
     help="Enable gradient-free AdaIN feature normalization with clear-sky EMA stats.",
 )
 @click.option(
+    "--use-knn-residual/--no-knn-residual",
+    default=False,
+    show_default=True,
+    help="Enable retrieval-augmented residual correction using feature-space k-NN.",
+)
+@click.option(
+    "--knn-bank-size",
+    type=click.IntRange(min=10),
+    default=500,
+    show_default=True,
+    help="Rolling memory bank size for feature/error tuples.",
+)
+@click.option(
+    "--knn-k",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="Number of nearest neighbors used for residual correction.",
+)
+@click.option(
+    "--knn-min-samples",
+    type=click.IntRange(min=1),
+    default=30,
+    show_default=True,
+    help="Minimum memory-bank size before k-NN corrections are applied.",
+)
+@click.option(
     "--adain-ema-decay",
     type=click.FloatRange(min=0.0, max=0.9999),
     default=0.98,
@@ -739,6 +822,10 @@ def main(
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
     use_adain_feature_norm: bool,
+    use_knn_residual: bool,
+    knn_bank_size: int,
+    knn_k: int,
+    knn_min_samples: int,
     adain_ema_decay: float,
     adain_csi_low: float,
     adain_csi_high: float,
@@ -862,6 +949,10 @@ def main(
         lr_decay_steps=lr_decay_steps,
         use_dynamic_ensemble=use_dynamic_ensemble,
         use_adain_feature_norm=use_adain_feature_norm,
+        use_knn_residual=use_knn_residual,
+        knn_bank_size=knn_bank_size,
+        knn_k=knn_k,
+        knn_min_samples=knn_min_samples,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -888,6 +979,8 @@ def main(
             f"  lr_decay_rate={lr_decay_rate}  lr_decay_steps={lr_decay_steps}"
             f"  use_dynamic_ensemble={use_dynamic_ensemble}"
             f"  use_adain_feature_norm={use_adain_feature_norm}"
+            f"  use_knn_residual={use_knn_residual}"
+            f"  knn_bank_size={knn_bank_size}  knn_k={knn_k}  knn_min_samples={knn_min_samples}"
             f"  adain_ema_decay={adain_ema_decay}"
             f"  adain_csi_low={adain_csi_low}  adain_csi_high={adain_csi_high}"
         ]
