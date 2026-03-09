@@ -1,1 +1,1 @@
-from .berhu import MeanAdaptiveBerHuLoss
+from .berhu import BerHuLoss, MeanAdaptiveBerHuLoss
