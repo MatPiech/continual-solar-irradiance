@@ -1,93 +1,8 @@
 """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation.
 
 Runs :class:`~cirr.tta.DualPhaseAdapter` in an online day-by-day loop over a
-prepared dataset.  This script owns the causal simulation: a FIFO quarantine
-queue withholds each ground-truth label for ``horizon_steps`` time steps before
-passing it to :meth:`~cirr.tta.DualPhaseAdapter.update`, faithfully reproducing
-the real-time lag between prediction and label arrival.
-
-Full data-flow graph (one time step *t*)::
-
-    (image_t, history_t, future_gt_t)
-                  │
-                  ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │  A  CAUSAL FIREWALL          [this script]                  │
-    │     Push {image_t, history_t, gt_t} → causal_queue  (CPU)   │
-    │     queue = [ ..., t-H+1, ..., t-1, t ]                     │
-    └─────────────────────────────────────────────────────────────┘
-                  │
-        ┌─────────┴──────────┐
-        │  len(queue) > H ?  │
-        └─────────┬──────────┘
-     YES │                    │ NO
-         ▼                    ▼
-    ┌──────────────────┐   (skip B)
-    │  B  LAGGED OGD   │   [this script calls adapter.update()]
-    │                  │
-    │  pop oldest ──►  │
-    │  (img_{t-H},     │
-    │   hist_{t-H},    │
-    │   gt_{t-H})      │
-    │                  │
-    │  ŷ = base_model( │
-    │        img_{t-H},│
-    │        hist_{t-H}│
-    │      )           │
-    │  loss = BerHu(   │
-    │    ŷ, gt_{t-H})  │
-    │                  │
-    │  SGD.step() ──►  │ base_model weights updated  (persists)
-    └──────────────────┘
-                  │
-                  ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │  C  ZERO-LAG TTA             [adapter.predict()]            │
-    │  (ephemeral — base_model never touched)                     │
-    │                                                             │
-    │  tta_model = deepcopy(base_model)                           │
-    │  freeze all  ►  unfreeze BN/LN affine params (γ, β) only    │
-    │                                                             │
-    │  MEMO:  N augmented views of image_t                        │
-    │         loss = Var({ tta_model(aug_i, history_t) })         │
-    │                                                             │
-    │  NOTE:  buffer of recent (image, history) pairs             │
-    │         loss = Var({ tta_model(buf_i,  hist_i ) })          │
-    │                                                             │
-    │  AdamW.step()    ►  tta_model updated  (base_model frozen)  │
-    └─────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │  D  FINAL INFERENCE          [adapter.predict()]            │
-    │     tta_model.eval() + torch.no_grad()                      │
-    │     prediction = tta_model(image_t, history_t)              │
-    │     del tta_model   ◄── GPU memory freed immediately        │
-    └─────────────────────────────────────────────────────────────┘
-                  │
-                  ▼
-            ŷ_{t+H}  returned to caller
-
-Usage examples
---------------
-# MEMO-style TTA, default settings (horizon=3, head-only OGD):
-python scripts/evaluate_dual_phase.py \\
-    --checkpoint checkpoints/epoch_024.ckpt \\
-    --dataset-path data/poznan_prepared
-
-# NOTE-style TTA, 5-day window, encoder OGD scope, Ramp Weighted loss enabled:
-python scripts/evaluate_dual_phase.py \\
-    --checkpoint checkpoints/epoch_024.ckpt \\
-    --dataset-path data/poznan_prepared \\
-    --tta-method note --note-buffer-size 32 \\
-    --ogd-scope head_and_encoder --num-days 5 \\
-    --ogd-ramp-penalty 3.0
-
-# Save per-day report:
-python scripts/evaluate_dual_phase.py \\
-    --checkpoint checkpoints/epoch_024.ckpt \\
-    --dataset-path data/poznan_prepared \\
-    --save-results
+prepared dataset. Includes Dynamic Regime-Aware Ensembling using the
+Clear Sky Index (CSI).
 """
 
 from collections import deque
@@ -158,7 +73,7 @@ def _load_clear_sky_lookup(dataset_path: Path) -> dict[str, float]:
 
     Returns values scaled to ``kW/m^2`` to match dataset target scaling.
     """
-    clear_sky_files = sorted(dataset_path.glob("*_clear_sky.csv"))
+    clear_sky_files = sorted(dataset_path.glob("*clear_sky.csv"))
     if not clear_sky_files:
         return {}
 
@@ -210,6 +125,7 @@ def evaluate(
     days_to_eval: list[str],
     device: str,
     horizon_steps: int,
+    forecasting_horizon: int,
     ogd_gating: Literal["none", "raw", "csi"],
     ogd_gating_low: float,
     ogd_gating_high: float,
@@ -221,9 +137,8 @@ def evaluate(
     warmup_samples: int,
     lr_decay_rate: float,
     lr_decay_steps: int,
-    persistence_weight: float,
+    use_dynamic_ensemble: bool,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
-    """Run the day-by-day online evaluation loop with DualPhaseAdapter."""
     all_predictions: list[float] = []
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
@@ -262,25 +177,22 @@ def evaluate(
             if isinstance(image_name, bytes):
                 image_name = image_name.decode("utf-8")
 
-            # A: push current sample into the causal queue (kept on CPU).
             causal_queue.append(
                 {
-                    "image": image_input,  # [C, H, W]
-                    "history": irradiance_history,  # [hist_len]
-                    "gt": target_irradiance.unsqueeze(0),  # [1, 1]
+                    "image": image_input,
+                    "history": irradiance_history,
+                    "gt": target_irradiance.unsqueeze(0),
                     "raw_pred": None,
                     "timestamp": image_name,
                 }
             )
 
-            # B: pop the oldest sample once the horizon lag has elapsed.
             if len(causal_queue) > horizon_steps:
                 oldest = causal_queue.popleft()
                 should_update = True
                 update_stats["considered"] += 1
                 total_samples_processed += 1
 
-                # Warm-up: skip adaptation for initial samples
                 if warmup_samples > 0 and total_samples_processed <= warmup_samples:
                     should_update = False
                     update_stats["skipped_warmup"] += 1
@@ -312,7 +224,6 @@ def evaluate(
                             update_stats["skipped_above_high"] += 1
 
                 if should_update:
-                    # Apply learning rate decay
                     if lr_decay_rate > 0 and lr_decay_steps > 0 and total_samples_processed % lr_decay_steps == 0:
                         ogd_lr_current *= 1.0 - lr_decay_rate
                         for param_group in adapter._ogd_optimizer.param_groups:
@@ -333,10 +244,44 @@ def evaluate(
             mean_raw, _ = adapter.predict(images, irr_history)
             mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
 
-            # Optional: blend with persistence (smart persistence = last irradiance value)
-            if persistence_weight > 0.0:
-                persistence_pred = irradiance_history[-1].unsqueeze(0).to(device)  # [1]
-                mean = (1.0 - persistence_weight) * mean + persistence_weight * persistence_pred
+            # -----------------------------------------------------------------
+            # DYNAMIC REGIME-AWARE ENSEMBLE (CSI-BASED)
+            # -----------------------------------------------------------------
+            if use_dynamic_ensemble:
+                current_irr_val = irr_history[0, -1].item()
+                timestamp_str = Path(str(image_name)).stem
+                current_dt = pd.to_datetime(timestamp_str, format="%Y%m%d_%H%M%S", errors="coerce")
+
+                target_dt = current_dt + pd.Timedelta(minutes=forecasting_horizon)
+
+                current_cs = _resolve_clear_sky_value(clear_sky_lookup, current_dt.strftime("%Y%m%d_%H%M%S"))
+                target_cs = _resolve_clear_sky_value(clear_sky_lookup, target_dt.strftime("%Y%m%d_%H%M%S"))
+
+                # 1. Calculate Smart Persistence Prediction
+                if current_cs is not None and target_cs is not None and current_cs > 0:
+                    kc_last = current_irr_val / current_cs
+                    kc_last = max(0.0, min(kc_last, 2.0))  # Clamp to [0, 2]
+                    smart_persistence_val = kc_last * target_cs
+                else:
+                    smart_persistence_val = current_irr_val
+
+                smart_persistence_pred = torch.tensor([[smart_persistence_val]], dtype=mean.dtype, device=device)
+
+                # 2. Calculate CSI Variance to determine the Weather Regime
+                if current_cs is not None and current_cs > 0:
+                    recent_csi = irr_history[0, -4:] / current_cs
+                    csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
+                else:
+                    csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
+
+                # 3. Dynamic Router (Blend)
+                csi_flat_threshold = 0.005
+                # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
+                # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
+                dyn_weight = 0.5 if csi_var < csi_flat_threshold else 0.0
+
+                mean = (1.0 - dyn_weight) * mean + dyn_weight * smart_persistence_pred
+            # -----------------------------------------------------------------
 
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
@@ -409,7 +354,7 @@ def evaluate(
     "--dataset-path",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="Path to prepared dataset directory (e.g. data/poznan_prepared).",
+    help="Path to prepared dataset directory (e.g. data/alpnach_prepared).",
 )
 @click.option(
     "--tta-method",
@@ -423,26 +368,33 @@ def evaluate(
     type=int,
     default=15,
     show_default=True,
-    help="Causal queue depth: time steps between prediction and label arrival. ",
+    help="Causal queue depth: time steps between prediction and label arrival.",
+)
+@click.option(
+    "--forecasting-horizon",
+    type=int,
+    default=15,
+    show_default=True,
+    help="Forecasting horizon in minutes, used by the clear-sky persistence ensemble.",
 )
 @click.option(
     "--ogd-lr",
     type=float,
     default=1e-5,
     show_default=True,
-    help="Learning rate for the persistent supervised OGD optimizer (SGD).",
+    help="Learning rate for the persistent supervised OGD optimizer.",
 )
 @click.option(
     "--ogd-scope",
     type=click.Choice(["head_only", "head_and_encoder"], case_sensitive=False),
     default="head_only",
     show_default=True,
-    help="Parameters updated by OGD: regression head only, or head + last encoder block.",
+    help="Parameters updated by OGD.",
 )
 @click.option(
     "--ogd-loss",
-    type=click.Choice(["berhu", "huber", "mse", "mae"], case_sensitive=False),
-    default="mse",
+    type=click.Choice(["berhu", "huber", "mse"], case_sensitive=False),
+    default="berhu",
     show_default=True,
     help="Supervised loss function used in the OGD phase.",
 )
@@ -451,14 +403,14 @@ def evaluate(
     type=float,
     default=0.0,
     show_default=True,
-    help="Multiplier for OGD loss based on true irradiance delta. (0.0 = disabled)",
+    help="Multiplier for OGD loss based on true irradiance delta.",
 )
 @click.option(
     "--lr-tta",
     type=float,
     default=1e-5,
     show_default=True,
-    help="Learning rate for the ephemeral TTA AdamW optimizer (norm-layer affines).",
+    help="Learning rate for the ephemeral TTA AdamW optimizer.",
 )
 @click.option(
     "--n-augmentations",
@@ -533,11 +485,7 @@ def evaluate(
     type=click.Choice(["none", "raw", "csi"], case_sensitive=False),
     default="none",
     show_default=True,
-    help=(
-        "Selective OGD updates by delayed error thresholds: "
-        "'none' (always update), 'raw' (|y_pred-y_gt|), "
-        "'csi' (|y_pred-y_gt| / clear_sky)."
-    ),
+    help="Selective OGD updates by delayed error thresholds.",
 )
 @click.option(
     "--ogd-gating-low",
@@ -582,17 +530,17 @@ def evaluate(
     help="Number of OGD updates between learning rate decay applications.",
 )
 @click.option(
-    "--persistence-weight",
-    type=float,
-    default=0.0,
+    "--use-dynamic-ensemble/--no-dynamic-ensemble",
+    default=True,
     show_default=True,
-    help="Weight for smart persistence ensemble: pred = (1-w)*model + w*last_irr (0.0 = model only).",
+    help="Use CSI-based variance to dynamically switch between Smart Persistence and Model.",
 )
 def main(
     checkpoint: Path,
     dataset_path: Path,
     tta_method: str,
     horizon_steps: int,
+    forecasting_horizon: int,
     ogd_lr: float,
     ogd_scope: str,
     ogd_loss: str,
@@ -615,7 +563,7 @@ def main(
     warmup_samples: int,
     lr_decay_rate: float,
     lr_decay_steps: int,
-    persistence_weight: float,
+    use_dynamic_ensemble: bool,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -631,11 +579,10 @@ def main(
     if ogd_gating_low > ogd_gating_high:
         raise ValueError(f"Invalid OGD gating range: low={ogd_gating_low} > high={ogd_gating_high}.")
 
-    clear_sky_lookup: dict[str, float] = {}
-    if ogd_gating == "csi":
-        clear_sky_lookup = _load_clear_sky_lookup(dataset_path)
-        if not clear_sky_lookup:
-            raise ValueError("CSI gating requested, but no '*_clear_sky.csv' file was found in dataset path.")
+    # Always load clear sky data (required by the CSI dynamic router)
+    clear_sky_lookup = _load_clear_sky_lookup(dataset_path)
+    if not clear_sky_lookup:
+        print("Warning: No '*clear_sky.csv' file was found. The CSI Router and Gating might fail.")
 
     # ------------------------------------------------------------------
     # Load model
@@ -713,6 +660,7 @@ def main(
         days_to_eval=days_to_eval,
         device=device,
         horizon_steps=horizon_steps,
+        forecasting_horizon=forecasting_horizon,
         ogd_gating=ogd_gating,
         ogd_gating_low=ogd_gating_low,
         ogd_gating_high=ogd_gating_high,
@@ -724,7 +672,7 @@ def main(
         warmup_samples=warmup_samples,
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,
-        persistence_weight=persistence_weight,
+        use_dynamic_ensemble=use_dynamic_ensemble,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -747,7 +695,7 @@ def main(
             f"  csi_min_clear_sky={csi_min_clear_sky}"
             f"  warmup_samples={warmup_samples}"
             f"  lr_decay_rate={lr_decay_rate}  lr_decay_steps={lr_decay_steps}"
-            f"  persistence_weight={persistence_weight}"
+            f"  use_dynamic_ensemble={use_dynamic_ensemble}"
         ]
         save_metrics_report(
             tag=method_tag,
