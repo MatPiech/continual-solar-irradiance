@@ -441,8 +441,8 @@ def evaluate(
 )
 @click.option(
     "--ogd-loss",
-    type=click.Choice(["berhu", "huber", "mse"], case_sensitive=False),
-    default="berhu",
+    type=click.Choice(["berhu", "huber", "mse", "mae"], case_sensitive=False),
+    default="mse",
     show_default=True,
     help="Supervised loss function used in the OGD phase.",
 )

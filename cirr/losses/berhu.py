@@ -34,3 +34,40 @@ class MeanAdaptiveBerHuLoss(torch.nn.Module):
         loss = torch.where(condition, case1_error, case2_error)
 
         return loss.mean()
+
+
+class BerHuLoss(torch.nn.Module):
+    """Classic BerHu loss function.
+    Acts as L1 loss when absolute error is <= threshold.
+    Acts as L2 loss when absolute error is > threshold.
+    Perfect for instance-based online learning where batch-adaptive thresholds fail.
+    """
+
+    def __init__(self, threshold: float = 30):
+        """Initializes the BerHuLoss.
+
+        Parameters
+        ----------
+        threshold : float, optional
+            The static transition point 'c' between L1 and L2 behavior, by default 30.
+        """
+        super().__init__()
+        self.threshold = threshold
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        assert pred.shape == target.shape, f"Shape mismatch: {pred.shape} vs {target.shape}"
+
+        error = torch.subtract(pred, target)
+        abs_error = torch.abs(error)
+
+        # Case 1: |e| <= c (L1 behavior)
+        case1_loss = abs_error
+
+        # Case 2: |e| > c (L2 behavior)
+        case2_loss = (error**2 + self.threshold**2) / (2.0 * self.threshold)
+
+        # Route the losses based on the static threshold
+        condition = abs_error <= self.threshold
+        loss = torch.where(condition, case1_loss, case2_loss)
+
+        return loss.mean()

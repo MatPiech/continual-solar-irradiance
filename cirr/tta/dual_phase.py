@@ -58,7 +58,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from cirr.losses import MeanAdaptiveBerHuLoss
+from cirr.losses import BerHuLoss
 from cirr.tta.memo_reg import _random_augment, prediction_variance_loss
 
 # ---------------------------------------------------------------------------
@@ -99,9 +99,9 @@ class DualPhaseAdapter(nn.Module):
         - ``'head_only'`` — only the regression head.
         - ``'head_and_encoder'`` — head + the last child of ``image_encoder``.
         By default ``'head_only'``.
-    ogd_loss : {'berhu', 'huber', 'mse'}, optional
+    ogd_loss : {'berhu', 'huber', 'mse', 'mae'}, optional
         Supervised loss function used during Phase 1 OGD, by default
-        ``'berhu'``.
+        ``'mse'``.
     ogd_momentum : float, optional
         SGD momentum for the OGD optimizer, by default ``0.9``.
     ogd_weight_decay : float, optional
@@ -130,7 +130,7 @@ class DualPhaseAdapter(nn.Module):
         lr_tta: float = 1e-4,
         tta_method: Literal["memo", "note", "none"] = "memo",
         ogd_scope: Literal["head_only", "head_and_encoder"] = "head_only",
-        ogd_loss: Literal["berhu", "huber", "mse"] = "berhu",
+        ogd_loss: Literal["berhu", "huber", "mse", "mae"] = "mse",
         ogd_momentum: float = 0.9,
         ogd_weight_decay: float = 1e-4,
         ogd_ramp_penalty: float = 0.0,
@@ -156,11 +156,15 @@ class DualPhaseAdapter(nn.Module):
 
         # ── Supervised OGD loss ──────────────────────────────────────────────
         if ogd_loss == "berhu":
-            self._ogd_loss_fn: nn.Module = MeanAdaptiveBerHuLoss()
+            self._ogd_loss_fn: nn.Module = BerHuLoss(threshold=30)
         elif ogd_loss == "huber":
             self._ogd_loss_fn = nn.HuberLoss()
-        else:  # mse
+        elif ogd_loss == "mse":
             self._ogd_loss_fn = nn.MSELoss()
+        elif ogd_loss == "mae":
+            self._ogd_loss_fn = nn.L1Loss()
+        else:
+            raise ValueError(f"Unsupported ogd_loss: {ogd_loss!r}")
 
         # ── NOTE persistent sample buffer ───────────────────────────────────
         # Stores (image [C,H,W], history [hist_len]) CPU tensor pairs.
@@ -296,8 +300,11 @@ class DualPhaseAdapter(nn.Module):
         output = self.base_model(imgs_batch, hist_batch)
         pred = output[0] if isinstance(output, tuple) else output  # [1, 1]
 
-        # 1. Base loss calculation
-        loss = self._ogd_loss_fn(pred, gt.view_as(pred))
+        # 1. Base loss calculation, for BerHu loss scale to W/m^2
+        if isinstance(self._ogd_loss_fn, BerHuLoss):
+            loss = self._ogd_loss_fn(pred, gt.view_as(pred)) * 1000.0
+        else:
+            loss = self._ogd_loss_fn(pred, gt.view_as(pred))
 
         # 2. Ramp-Weighted Penalty (Adaptive loss scaling)
         if self.ogd_ramp_penalty > 0.0:
