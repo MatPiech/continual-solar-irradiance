@@ -74,10 +74,17 @@ def save_metrics_report(
         f.write(f"  Samples: {overall_metrics['count']}\n\n")
 
         f.write("Per-Day Metrics:\n")
-        f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8}\n")
+        f.write(f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<24}\n")
         f.write("-" * 78 + "\n")
         for day_key, m in per_day_metrics.items():
+            regime1_count = m.get("regime1_count")
+            regime2_count = m.get("regime2_count")
+            if regime1_count is not None and regime2_count is not None:
+                samples_display = f"{m['count']} (R1:{regime1_count}; R2:{regime2_count})"
+            else:
+                samples_display = str(m["count"])
+
             f.write(
                 f"{day_key:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} "
-                f"{m['wape']:<10.2f}% {m['smape']:<10.2f}% {m['count']:<8}\n"
+                f"{m['wape']:<10.2f}% {m['smape']:<10.2f}% {samples_display:<24}\n"
             )
