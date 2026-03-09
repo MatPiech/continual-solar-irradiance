@@ -233,6 +233,110 @@ class DualPhaseAdapter(nn.Module):
         variance = output[1] if isinstance(output, tuple) else None
         return mean, variance
 
+    @torch.no_grad()
+    def predict_base_with_features(
+        self,
+        image: torch.Tensor,
+        history: torch.Tensor,
+        **model_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Run base_model inference without TTA and return encoder features."""
+        device = image.device
+        img = image if image.dim() == 4 else image.unsqueeze(0)
+        hist = history if history.dim() == 2 else history.unsqueeze(0)
+
+        self.base_model.eval()
+        if hasattr(self.base_model, "forward_with_encoder_features"):
+            mean, variance, features = self.base_model.forward_with_encoder_features(
+                img.to(device),
+                hist.to(device),
+                **model_kwargs,
+            )
+            return mean, variance, features
+
+        output = self.base_model(img.to(device), hist.to(device), **model_kwargs)
+        mean = output[0] if isinstance(output, tuple) else output
+        variance = output[1] if isinstance(output, tuple) else None
+        return mean, variance, None
+
+    def predict_with_features(
+        self,
+        image: torch.Tensor,
+        history: torch.Tensor,
+        **model_kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Run prediction and additionally return encoder features when available."""
+        device = image.device
+        img = image if image.dim() == 4 else image.unsqueeze(0)
+        hist = history if history.dim() == 2 else history.unsqueeze(0)
+
+        if self.tta_method == "none":
+            self.base_model.eval()
+            with torch.no_grad():
+                if hasattr(self.base_model, "forward_with_encoder_features"):
+                    mean, variance, features = self.base_model.forward_with_encoder_features(
+                        img.to(device),
+                        hist.to(device),
+                        **model_kwargs,
+                    )
+                else:
+                    output = self.base_model(img.to(device), hist.to(device), **model_kwargs)
+                    mean = output[0] if isinstance(output, tuple) else output
+                    variance = output[1] if isinstance(output, tuple) else None
+                    features = None
+            return mean, variance, features
+
+        if self.tta_method == "aug_ensemble":
+            self.base_model.eval()
+
+            aug_imgs = torch.stack(
+                [_random_augment(img[0]) for _ in range(self.n_augmentations)],
+                dim=0,
+            ).to(device)
+            aug_hist = hist.expand(self.n_augmentations, -1).to(device)
+
+            with torch.no_grad():
+                output = self.base_model(aug_imgs, aug_hist)
+                preds = output[0] if isinstance(output, tuple) else output
+                ensemble_mean = preds.mean(dim=0, keepdim=True)
+
+                if hasattr(self.base_model, "forward_with_encoder_features"):
+                    _, _, features = self.base_model.forward_with_encoder_features(
+                        img.to(device),
+                        hist.to(device),
+                        **model_kwargs,
+                    )
+                else:
+                    features = None
+
+            return ensemble_mean, None, features
+
+        tta_model = deepcopy(self.base_model).to(device)
+        tta_optimizer = self._make_tta_optimizer(tta_model)
+
+        if self.tta_method == "memo":
+            self._memo_tta_step(tta_model, tta_optimizer, img[0], hist, device)
+        else:
+            self._note_buffer.append((img[0].detach().cpu(), hist[0].detach().cpu()))
+            self._note_tta_step(tta_model, tta_optimizer, device)
+
+        tta_model.eval()
+        with torch.no_grad():
+            if hasattr(tta_model, "forward_with_encoder_features"):
+                mean, variance, features = tta_model.forward_with_encoder_features(
+                    img.to(device),
+                    hist.to(device),
+                    **model_kwargs,
+                )
+            else:
+                output = tta_model(img.to(device), hist.to(device), **model_kwargs)
+                mean = output[0] if isinstance(output, tuple) else output
+                variance = output[1] if isinstance(output, tuple) else None
+                features = None
+
+        del tta_model, tta_optimizer
+        return mean, variance, features
+
     # =========================================================================
     # Phase implementations
     # =========================================================================
