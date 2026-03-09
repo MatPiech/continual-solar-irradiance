@@ -166,6 +166,8 @@ def evaluate(
 
         day_preds: list[float] = []
         day_targets: list[float] = []
+        day_regime1_count = 0
+        day_regime2_count = 0
 
         for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
             image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
@@ -285,11 +287,20 @@ def evaluate(
 
                 # 3. Dynamic Router (Blend)
                 csi_flat_threshold = 0.015
-                # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
-                # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
-                dyn_weight = 1.0 if csi_var < csi_flat_threshold else 0.0
+
+                if csi_var < csi_flat_threshold:
+                    # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
+                    dyn_weight = 1.0
+                    day_regime1_count += 1
+                else:
+                    # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
+                    dyn_weight = 0.0
+                    day_regime2_count += 1
 
                 mean = (1.0 - dyn_weight) * mean + dyn_weight * smart_persistence_pred
+            else:
+                # Dynamic routing is disabled, so all predictions come from the model path.
+                day_regime2_count += 1
             # -----------------------------------------------------------------
 
             # Store raw prediction for delayed-label calibrator updates.
@@ -317,9 +328,10 @@ def evaluate(
         if day_preds:
             day_metrics = compute_metrics(np.array(day_preds), np.array(day_targets))
             per_day_metrics[day_key] = day_metrics
+            samples_with_regimes = f"{day_metrics['count']} (R1:{day_regime1_count}; R2:{day_regime2_count})"
             print(
                 f"{day_key:<6} {day_metrics['mae']:<10.4f} {day_metrics['rmse']:<10.4f} "
-                f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% {day_metrics['count']:<8}",
+                f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% {samples_with_regimes:<16}",
                 flush=True,
             )
 
