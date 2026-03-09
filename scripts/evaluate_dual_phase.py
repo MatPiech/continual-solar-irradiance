@@ -269,16 +269,25 @@ def evaluate(
 
                 # 2. Calculate CSI Variance to determine the Weather Regime
                 if current_cs is not None and current_cs > 0:
-                    recent_csi = irr_history[0, -4:] / current_cs
+                    cs_history_vals = []
+                    # Assuming 4 history steps are [t-15, t-10, t-5, t]
+                    for offset in [15, 10, 5, 0]:
+                        hist_dt = current_dt - pd.Timedelta(minutes=offset)
+                        hist_cs = _resolve_clear_sky_value(clear_sky_lookup, hist_dt.strftime("%Y%m%d_%H%M%S"))
+                        # Fallback to current_cs if a history clear sky value is missing
+                        cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
+
+                    cs_history_tensor = torch.tensor(cs_history_vals, dtype=mean.dtype, device=device)
+                    recent_csi = irr_history[0, -4:] / cs_history_tensor
                     csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
                 else:
                     csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
 
                 # 3. Dynamic Router (Blend)
-                csi_flat_threshold = 0.005
+                csi_flat_threshold = 0.015
                 # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
                 # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
-                dyn_weight = 0.5 if csi_var < csi_flat_threshold else 0.0
+                dyn_weight = 1.0 if csi_var < csi_flat_threshold else 0.0
 
                 mean = (1.0 - dyn_weight) * mean + dyn_weight * smart_persistence_pred
             # -----------------------------------------------------------------
