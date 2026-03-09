@@ -300,13 +300,10 @@ class DualPhaseAdapter(nn.Module):
         output = self.base_model(imgs_batch, hist_batch)
         pred = output[0] if isinstance(output, tuple) else output  # [1, 1]
 
-        # 1. Base loss calculation, for BerHu loss scale to W/m^2
-        if isinstance(self._ogd_loss_fn, BerHuLoss):
-            loss = self._ogd_loss_fn(pred, gt.view_as(pred)) * 1000.0
-        else:
-            loss = self._ogd_loss_fn(pred, gt.view_as(pred))
+        # 1. Base loss calculation
+        loss = self._ogd_loss_fn(pred, gt.view_as(pred))
 
-        # 2. Ramp-Weighted Penalty (Adaptive loss scaling)
+        # 2a. Ramp-Weighted Penalty (Adaptive loss scaling)
         if self.ogd_ramp_penalty > 0.0:
             # history[-1] is the most recent known irradiance (time t)
             # gt is the actual arrived irradiance (time t+H)
@@ -322,7 +319,25 @@ class DualPhaseAdapter(nn.Module):
             # Apply the dynamic weight (detach to prevent graph issues)
             loss = loss * ramp_weight.detach()
 
+        # 2b. Anti-smoothing volatility penalty
+        current_irr = history[-1]
+        scale_factor = 1000.0
+        true_delta = (gt.view(-1)[0] - current_irr) * scale_factor
+        pred_delta = (pred.view(-1)[0] - current_irr) * scale_factor
+
+        slope_error = torch.abs(pred_delta - true_delta)
+
+        history_phys = history * scale_factor
+        hist_var = torch.var(history_phys, unbiased=False)
+
+        volatility_multiplier = 0.09
+        dynamic_slope_weight = 1.0 + (hist_var.detach() * volatility_multiplier)
+        slope_loss = (slope_error * dynamic_slope_weight) / scale_factor
+
+        loss = loss + slope_loss
+
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), max_norm=1.0)
         self._ogd_optimizer.step()
 
         # Freeze all params again so the subsequent deepcopy does not carry

@@ -442,8 +442,6 @@ class Forecaster(pl.LightningModule):
             # Log uncertainty only if available and trainer is registered
             if hasattr(self, "_trainer") and self._trainer is not None:
                 self.log(f"{stage}_uncertainty_mean", pred_var.mean(), on_epoch=True, sync_dist=True)
-        elif self.loss_name == "Berhu":
-            loss = self.loss_fn(pred_mean * 1000, target_irradiances * 1000)  # Scale to W/m^2 for BerHu loss
         else:
             loss = self.loss_fn(pred_mean, target_irradiances)
 
