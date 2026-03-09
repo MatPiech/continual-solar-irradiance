@@ -44,13 +44,13 @@ class BerHuLoss(torch.nn.Module):
     Perfect for instance-based online learning where batch-adaptive thresholds fail.
     """
 
-    def __init__(self, threshold: float = 30, scale: int = 1000):
+    def __init__(self, threshold: float = 100, scale: int = 1000):
         """Initializes the BerHuLoss.
 
         Parameters
         ----------
         threshold : float, optional
-            The static transition point 'c' between L1 and L2 behavior, by default 30.
+            The static transition point 'c' between L1 and L2 behavior.
         """
         super().__init__()
         self.threshold = threshold

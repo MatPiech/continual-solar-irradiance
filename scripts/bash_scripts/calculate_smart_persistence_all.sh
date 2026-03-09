@@ -19,7 +19,9 @@ for location in folsom modena poznan karpicko alpnach bern1 bern2 neuchatel; do
     python scripts/smart_persistence_model.py \
         --periods-path "data/${location}_prepared/periods.pickle" \
         --clear-sky-path "data/${location}_prepared/${location}_clear_sky.csv" \
-        --forecasting-horizon $FORECASTING_HORIZON
+        --forecasting-horizon $FORECASTING_HORIZON \
+	--start-day 0101 \
+	--save-results
 done
 
 echo -e "\n============================================================"
