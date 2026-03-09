@@ -327,6 +327,8 @@ def evaluate(
 
         if day_preds:
             day_metrics = compute_metrics(np.array(day_preds), np.array(day_targets))
+            day_metrics["regime1_count"] = day_regime1_count
+            day_metrics["regime2_count"] = day_regime2_count
             per_day_metrics[day_key] = day_metrics
             samples_with_regimes = f"{day_metrics['count']} (R1:{day_regime1_count}; R2:{day_regime2_count})"
             print(
