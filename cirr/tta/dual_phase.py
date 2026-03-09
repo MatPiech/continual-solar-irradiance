@@ -50,7 +50,7 @@ class DualPhaseAdapter(nn.Module):
         base_model: nn.Module,
         lr_ogd: float = 1e-4,
         lr_tta: float = 1e-4,
-        tta_method: Literal["memo", "note", "none"] = "memo",
+        tta_method: Literal["memo", "note", "aug_ensemble", "none"] = "none",
         ogd_scope: Literal["head_only", "head_and_encoder"] = "head_only",
         ogd_loss: Literal["berhu", "huber", "mse"] = "berhu",
         ogd_momentum: float = 0.9,
@@ -162,6 +162,28 @@ class DualPhaseAdapter(nn.Module):
             mean = output[0] if isinstance(output, tuple) else output
             variance = output[1] if isinstance(output, tuple) else None
             return mean, variance
+
+        if self.tta_method == "aug_ensemble":
+            # 1. Pure Inference: No deepcopy, no gradients, no optimizers.
+            self.base_model.eval()
+
+            # 2. Generate augmented views
+            aug_imgs = torch.stack(
+                [_random_augment(img[0]) for _ in range(self.n_augmentations)],
+                dim=0,
+            ).to(device)
+            aug_hist = hist.expand(self.n_augmentations, -1).to(device)
+
+            # 3. Predict on all views and average the result
+            with torch.no_grad():
+                output = self.base_model(aug_imgs, aug_hist)
+                preds = output[0] if isinstance(output, tuple) else output
+
+                # The mean of the augmentations acts as a spatial low-pass filter
+                # smoothing out sensor noise without destroying the BN weights.
+                ensemble_mean = preds.mean(dim=0, keepdim=True)
+
+            return ensemble_mean, None
 
         # Phase C: Create an ephemeral deep copy and adapt its norm-layer affines.
         tta_model = deepcopy(self.base_model).to(device)

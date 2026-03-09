@@ -388,8 +388,8 @@ def evaluate(
 )
 @click.option(
     "--tta-method",
-    type=click.Choice(["memo", "note", "none"], case_sensitive=False),
-    default="memo",
+    type=click.Choice(["memo", "note", "aug_ensemble", "none"], case_sensitive=False),
+    default="none",
     show_default=True,
     help="Unsupervised TTA variant. 'none' = OGD-only (no ephemeral TTA).",
 )
