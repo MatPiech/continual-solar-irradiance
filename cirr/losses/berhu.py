@@ -7,9 +7,10 @@ import torch.nn
 
 
 class MeanAdaptiveBerHuLoss(torch.nn.Module):
-    def __init__(self, l1_thresh_factor=0.2):
+    def __init__(self, l1_thresh_factor=0.2, scale: int = 1000):
         super().__init__()
         self.l1_thresh_factor = l1_thresh_factor
+        self.scale = scale
 
     def forward(self, pred, target):
         """Computes BerHu loss function
@@ -20,7 +21,7 @@ class MeanAdaptiveBerHuLoss(torch.nn.Module):
         """
         assert pred.dim() == target.dim(), f"inconsistent dimensions, {pred.dim()} is not equal to {target.dim()}"
 
-        error = torch.subtract(pred, target)
+        error = torch.subtract(pred * self.scale, target * self.scale)
         abs_error = torch.abs(error)
 
         l1_thresh = torch.max(abs_error) * self.l1_thresh_factor
@@ -33,7 +34,7 @@ class MeanAdaptiveBerHuLoss(torch.nn.Module):
         condition = torch.less_equal(abs_error, l1_thresh)
         loss = torch.where(condition, case1_error, case2_error)
 
-        return loss.mean()
+        return (loss / self.scale).mean()
 
 
 class BerHuLoss(torch.nn.Module):
@@ -43,7 +44,7 @@ class BerHuLoss(torch.nn.Module):
     Perfect for instance-based online learning where batch-adaptive thresholds fail.
     """
 
-    def __init__(self, threshold: float = 30):
+    def __init__(self, threshold: float = 30, scale: int = 1000):
         """Initializes the BerHuLoss.
 
         Parameters
@@ -53,11 +54,12 @@ class BerHuLoss(torch.nn.Module):
         """
         super().__init__()
         self.threshold = threshold
+        self.scale = scale
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         assert pred.shape == target.shape, f"Shape mismatch: {pred.shape} vs {target.shape}"
 
-        error = torch.subtract(pred, target)
+        error = torch.subtract(pred * self.scale, target * self.scale)
         abs_error = torch.abs(error)
 
         # Case 1: |e| <= c (L1 behavior)
@@ -70,4 +72,4 @@ class BerHuLoss(torch.nn.Module):
         condition = abs_error <= self.threshold
         loss = torch.where(condition, case1_loss, case2_loss)
 
-        return loss.mean()
+        return (loss / self.scale).mean()
