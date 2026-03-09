@@ -198,6 +198,7 @@ def evaluate(
     lr_decay_rate: float,
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
+    use_adain_feature_norm: bool,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     all_predictions: list[float] = []
     all_targets: list[float] = []
@@ -249,6 +250,10 @@ def evaluate(
 
             if isinstance(image_name, bytes):
                 image_name = image_name.decode("utf-8")
+
+            timestamp_str = Path(str(image_name)).stem
+            current_dt = pd.to_datetime(timestamp_str, format="%Y%m%d_%H%M%S", errors="coerce")
+            current_cs = _resolve_clear_sky_value(clear_sky_lookup, current_dt.strftime("%Y%m%d_%H%M%S"))
 
             causal_queue.append(
                 {
@@ -322,12 +327,9 @@ def evaluate(
             # -----------------------------------------------------------------
             if use_dynamic_ensemble:
                 current_irr_val = irr_history[0, -1].item()
-                timestamp_str = Path(str(image_name)).stem
-                current_dt = pd.to_datetime(timestamp_str, format="%Y%m%d_%H%M%S", errors="coerce")
 
                 target_dt = current_dt + pd.Timedelta(minutes=forecasting_horizon)
 
-                current_cs = _resolve_clear_sky_value(clear_sky_lookup, current_dt.strftime("%Y%m%d_%H%M%S"))
                 target_cs = _resolve_clear_sky_value(clear_sky_lookup, target_dt.strftime("%Y%m%d_%H%M%S"))
 
                 # 1. Calculate Smart Persistence Prediction
@@ -374,11 +376,21 @@ def evaluate(
 
             if use_dynamic_ensemble and dyn_weight == 1.0 and smart_persistence_pred is not None:
                 # Regime 1: serve Smart Persistence directly and avoid TTA compute.
-                mean_raw, _ = adapter.predict_base(images, irr_history)
+                mean_raw, _ = adapter.predict_base(
+                    images,
+                    irr_history,
+                    clear_sky_current=current_cs,
+                    update_clear_sky_stats=use_adain_feature_norm,
+                )
                 mean = smart_persistence_pred
             else:
                 # Regime 2 (or dynamic routing disabled): run full Dual-Phase prediction.
-                mean_raw, _ = adapter.predict(images, irr_history)
+                mean_raw, _ = adapter.predict(
+                    images,
+                    irr_history,
+                    clear_sky_current=current_cs,
+                    update_clear_sky_stats=use_adain_feature_norm,
+                )
                 mean = error_filter.apply(mean_raw) if error_filter is not None else mean_raw
 
             # Store raw prediction for delayed-label calibrator updates.
@@ -667,6 +679,33 @@ def evaluate(
     show_default=True,
     help="Use CSI-based variance to dynamically switch between Smart Persistence and Model.",
 )
+@click.option(
+    "--use-adain-feature-norm/--no-adain-feature-norm",
+    default=False,
+    show_default=True,
+    help="Enable gradient-free AdaIN feature normalization with clear-sky EMA stats.",
+)
+@click.option(
+    "--adain-ema-decay",
+    type=click.FloatRange(min=0.0, max=0.9999),
+    default=0.98,
+    show_default=True,
+    help="EMA decay for clear-sky feature statistics.",
+)
+@click.option(
+    "--adain-csi-low",
+    type=float,
+    default=0.85,
+    show_default=True,
+    help="Lower CSI bound for clear-sky AdaIN stats updates.",
+)
+@click.option(
+    "--adain-csi-high",
+    type=float,
+    default=1.15,
+    show_default=True,
+    help="Upper CSI bound for clear-sky AdaIN stats updates.",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
@@ -699,6 +738,10 @@ def main(
     lr_decay_rate: float,
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
+    use_adain_feature_norm: bool,
+    adain_ema_decay: float,
+    adain_csi_low: float,
+    adain_csi_high: float,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -726,6 +769,13 @@ def main(
     model = load_forecaster_from_checkpoint(checkpoint, device=device, use_hparams=True)
     if hasattr(model.image_encoder, "fc") and not isinstance(model.image_encoder.fc, torch.nn.Identity):
         model.image_encoder.fc = torch.nn.Identity()
+
+    model.configure_adain_feature_norm(
+        enabled=use_adain_feature_norm,
+        ema_decay=adain_ema_decay,
+        csi_low=adain_csi_low,
+        csi_high=adain_csi_high,
+    )
 
     # ------------------------------------------------------------------
     # Build adapter
@@ -811,6 +861,7 @@ def main(
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,
         use_dynamic_ensemble=use_dynamic_ensemble,
+        use_adain_feature_norm=use_adain_feature_norm,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -836,6 +887,9 @@ def main(
             f"  warmup_samples={warmup_samples}"
             f"  lr_decay_rate={lr_decay_rate}  lr_decay_steps={lr_decay_steps}"
             f"  use_dynamic_ensemble={use_dynamic_ensemble}"
+            f"  use_adain_feature_norm={use_adain_feature_norm}"
+            f"  adain_ema_decay={adain_ema_decay}"
+            f"  adain_csi_low={adain_csi_low}  adain_csi_high={adain_csi_high}"
         ]
         save_metrics_report(
             tag=method_tag,

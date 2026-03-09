@@ -58,6 +58,17 @@ class Forecaster(pl.LightningModule):
             nn.Linear(256, output_dim),
         )
 
+        # Optional gradient-free feature normalization (AdaIN) for online
+        # robustness against exposure/glare shifts.
+        self.use_adain_feature_norm = False
+        self.adain_eps = 1e-6
+        self.adain_ema_decay = 0.98
+        self.adain_csi_low = 0.85
+        self.adain_csi_high = 1.15
+        self.register_buffer("_adain_mu_ema", torch.zeros(1, self.num_features))
+        self.register_buffer("_adain_sigma_ema", torch.ones(1, self.num_features))
+        self.register_buffer("_adain_is_initialized", torch.tensor(False, dtype=torch.bool))
+
         # 4. Initialize Loss & Metrics
         self.loss_fn = self._configure_loss(loss_function)
 
@@ -74,6 +85,95 @@ class Forecaster(pl.LightningModule):
         self.test_metrics = metrics.clone("test_")
 
         self.save_hyperparameters()
+
+    def configure_adain_feature_norm(
+        self,
+        enabled: bool,
+        ema_decay: float = 0.98,
+        csi_low: float = 0.85,
+        csi_high: float = 1.15,
+        eps: float = 1e-6,
+    ) -> None:
+        """Configure gradient-free AdaIN feature normalization.
+
+        Parameters
+        ----------
+        enabled : bool
+            Whether AdaIN-based feature normalization is active.
+        ema_decay : float
+            EMA decay for clear-sky feature statistics.
+        csi_low : float
+            Lower CSI bound for clear-sky stat updates.
+        csi_high : float
+            Upper CSI bound for clear-sky stat updates.
+        eps : float
+            Numerical epsilon used in channel standardization.
+        """
+        self.use_adain_feature_norm = enabled
+        self.adain_ema_decay = float(ema_decay)
+        self.adain_csi_low = float(csi_low)
+        self.adain_csi_high = float(csi_high)
+        self.adain_eps = float(eps)
+
+    def _encode_image_features(
+        self,
+        x: torch.Tensor,
+        irradiance_history: torch.Tensor,
+        clear_sky_current: float | None = None,
+        update_clear_sky_stats: bool = False,
+    ) -> torch.Tensor:
+        """Encode image and optionally apply AdaIN using clear-sky EMA stats."""
+        if (
+            not self.use_adain_feature_norm
+            or not hasattr(self.image_encoder, "forward_features")
+            or not hasattr(self.image_encoder, "forward_head")
+        ):
+            return self.image_encoder(x)
+
+        feat = self.image_encoder.forward_features(x)
+        if feat.dim() != 4:
+            # Fallback for encoder families that do not expose spatial maps.
+            return self.image_encoder(x)
+
+        # Per-sample, per-channel spatial statistics.
+        mu_current = feat.mean(dim=(-2, -1), keepdim=True)
+        sigma_current = feat.std(dim=(-2, -1), keepdim=True, unbiased=False)
+
+        if update_clear_sky_stats and clear_sky_current is not None:
+            clear_value = max(float(clear_sky_current), 1e-6)
+            clear_tensor = torch.full(
+                (irradiance_history.shape[0], 1),
+                fill_value=clear_value,
+                dtype=irradiance_history.dtype,
+                device=irradiance_history.device,
+            )
+            current_irr = irradiance_history[:, -1:].to(clear_tensor.dtype)
+            csi = current_irr / clear_tensor
+            clear_mask = (csi >= self.adain_csi_low) & (csi <= self.adain_csi_high)
+
+            if clear_mask.any():
+                selected = clear_mask.squeeze(1)
+                mu_batch = mu_current[selected].mean(dim=0).view(1, -1)
+                sigma_batch = sigma_current[selected].mean(dim=0).view(1, -1)
+
+                if not bool(self._adain_is_initialized.item()):
+                    self._adain_mu_ema.copy_(mu_batch)
+                    self._adain_sigma_ema.copy_(sigma_batch)
+                    self._adain_is_initialized.fill_(True)
+                else:
+                    decay = self.adain_ema_decay
+                    self._adain_mu_ema.mul_(decay).add_((1.0 - decay) * mu_batch)
+                    self._adain_sigma_ema.mul_(decay).add_((1.0 - decay) * sigma_batch)
+
+        if bool(self._adain_is_initialized.item()):
+            mu_ref = self._adain_mu_ema.view(1, -1, 1, 1)
+            sigma_ref = self._adain_sigma_ema.view(1, -1, 1, 1)
+            feat = sigma_ref * ((feat - mu_current) / (sigma_current + self.adain_eps)) + mu_ref
+
+        try:
+            return self.image_encoder.forward_head(feat, pre_logits=True)
+        except TypeError:
+            return self.image_encoder.forward_head(feat)
 
     def freeze_image_encoder(self) -> None:
         """Freeze all parameters in the image encoder."""
@@ -311,14 +411,25 @@ class Forecaster(pl.LightningModule):
         else:
             raise ValueError(f"Unsupported loss function: {loss_name}")
 
-    def forward(self, x: torch.Tensor, irradiance_history: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        irradiance_history: torch.Tensor,
+        clear_sky_current: float | None = None,
+        update_clear_sky_stats: bool = False,
+    ):
         """
         Unified forward pass.
         Returns: (mean, variance)
         Note: 'variance' will be None if using MSE/MAE.
         """
         # 1. Encode Image
-        img_feats = self.image_encoder(x)
+        img_feats = self._encode_image_features(
+            x,
+            irradiance_history,
+            clear_sky_current=clear_sky_current,
+            update_clear_sky_stats=update_clear_sky_stats,
+        )
 
         # 2. Fuse with History
         fused = torch.cat([img_feats, irradiance_history], dim=1)
@@ -371,7 +482,11 @@ class Forecaster(pl.LightningModule):
             return self.image_encoder(x)
 
     def forward_with_features(
-        self, x: torch.Tensor, irradiance_history: torch.Tensor
+        self,
+        x: torch.Tensor,
+        irradiance_history: torch.Tensor,
+        clear_sky_current: float | None = None,
+        update_clear_sky_stats: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Forward pass that also returns stage-3 prototype features.
 
@@ -409,7 +524,12 @@ class Forecaster(pl.LightningModule):
             _handle = self.image_encoder.stages[3].register_forward_hook(lambda _m, _i, o: _proto_holder.update({"feat": o}))
 
         try:
-            img_feats = self.image_encoder(x)  # [B, encoder_dim] — used for prediction
+            img_feats = self._encode_image_features(
+                x,
+                irradiance_history,
+                clear_sky_current=clear_sky_current,
+                update_clear_sky_stats=update_clear_sky_stats,
+            )  # [B, encoder_dim] — used for prediction
         finally:
             if hasattr(self.image_encoder, "stages"):
                 _handle.remove()

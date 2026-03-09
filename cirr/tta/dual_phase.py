@@ -134,6 +134,7 @@ class DualPhaseAdapter(nn.Module):
         self,
         image: torch.Tensor,  # [1, C, H, W]
         history: torch.Tensor,  # [1, hist_len]
+        **model_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Phases C+D: TTA on an ephemeral deepcopy, then final inference.
 
@@ -158,7 +159,7 @@ class DualPhaseAdapter(nn.Module):
         if self.tta_method == "none":
             self.base_model.eval()
             with torch.no_grad():
-                output = self.base_model(img.to(device), hist.to(device))
+                output = self.base_model(img.to(device), hist.to(device), **model_kwargs)
             mean = output[0] if isinstance(output, tuple) else output
             variance = output[1] if isinstance(output, tuple) else None
             return mean, variance
@@ -199,7 +200,7 @@ class DualPhaseAdapter(nn.Module):
         # Phase D: Final inference with the TTA-calibrated copy.
         tta_model.eval()
         with torch.no_grad():
-            output = tta_model(img.to(device), hist.to(device))
+            output = tta_model(img.to(device), hist.to(device), **model_kwargs)
 
         del tta_model, tta_optimizer
 
@@ -215,6 +216,7 @@ class DualPhaseAdapter(nn.Module):
         self,
         image: torch.Tensor,  # [1, C, H, W]
         history: torch.Tensor,  # [1, hist_len]
+        **model_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run base_model inference without any TTA adaptation.
 
@@ -226,7 +228,7 @@ class DualPhaseAdapter(nn.Module):
         hist = history if history.dim() == 2 else history.unsqueeze(0)
 
         self.base_model.eval()
-        output = self.base_model(img.to(device), hist.to(device))
+        output = self.base_model(img.to(device), hist.to(device), **model_kwargs)
         mean = output[0] if isinstance(output, tuple) else output
         variance = output[1] if isinstance(output, tuple) else None
         return mean, variance
