@@ -24,48 +24,105 @@ from cirr.tta import DualPhaseAdapter
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
-# ---------------------------------------------------------------------------
-# Online calibration
-# ---------------------------------------------------------------------------
 
+class OnlineARErrorFilter:
+    """Online autoregressive filter on delayed residuals.
 
-class OnlineAffineCalibrator:
-    """Online affine calibrator for absolute predictions: y' = a*y + b.
+    Residual is defined as ``e_t = y_hat_t - y_t``.
+    The filter fits AR(p) on observed delayed residuals and forecasts the
+    residual ``horizon_steps`` ahead to correct the current neural prediction:
 
-    Parameters
-    ----------
-    lr : float
-        SGD-style learning rate for online updates.
-    l2 : float
-        L2 regularization strength toward identity calibration
-        (a -> 1, b -> 0).
+        y_hat_corrected = y_hat_raw - e_hat_now
     """
 
-    def __init__(self, lr: float = 1e-3, l2: float = 1e-4) -> None:
-        self.lr = lr
-        self.l2 = l2
-        self.a = 1.0
-        self.b = 0.0
+    def __init__(
+        self,
+        order: int = 3,
+        horizon_steps: int = 15,
+        min_history: int = 32,
+        ridge: float = 1e-4,
+        history_maxlen: int = 4096,
+        max_abs_correction: float = 1.0,
+    ) -> None:
+        if order < 1:
+            raise ValueError(f"order must be >= 1, got {order}")
+        if horizon_steps < 1:
+            raise ValueError(f"horizon_steps must be >= 1, got {horizon_steps}")
 
-    def apply(self, pred: torch.Tensor) -> torch.Tensor:
-        """Apply calibration to a tensor prediction."""
-        calibrated = self.a * pred + self.b
-        return torch.clamp(calibrated, min=0.0)
+        self.order = order
+        self.horizon_steps = horizon_steps
+        self.min_history = max(min_history, order + 2)
+        self.ridge = ridge
+        self.max_abs_correction = max_abs_correction
+        self._errors: deque[float] = deque(maxlen=history_maxlen)
+        self._coeffs = np.zeros(self.order, dtype=np.float64)
+        self._is_fitted = False
 
     def update(self, pred_raw: float, target: float) -> None:
-        """Update calibrator params using a delayed-label sample."""
-        pred_cal = self.a * pred_raw + self.b
-        error = pred_cal - target
+        """Add one delayed residual sample and refit AR coefficients."""
+        residual = float(pred_raw - target)
+        self._errors.append(residual)
 
-        grad_a = 2.0 * error * pred_raw + 2.0 * self.l2 * (self.a - 1.0)
-        grad_b = 2.0 * error + 2.0 * self.l2 * self.b
+        if len(self._errors) < self.min_history:
+            self._is_fitted = False
+            return
 
-        self.a -= self.lr * grad_a
-        self.b -= self.lr * grad_b
+        coeffs = self._fit_ar_coeffs()
+        if coeffs is not None:
+            self._coeffs = coeffs
+            self._is_fitted = True
 
-        # Keep calibration stable and physically sensible.
-        self.a = float(np.clip(self.a, 0.5, 1.5))
-        self.b = float(np.clip(self.b, -0.5, 0.5))
+    def apply(self, pred_raw: torch.Tensor) -> torch.Tensor:
+        """Correct prediction by subtracting AR-forecasted current residual."""
+        residual_now = self.forecast_residual_now()
+        if residual_now is None:
+            return torch.clamp(pred_raw, min=0.0)
+
+        corrected = pred_raw - residual_now
+        return torch.clamp(corrected, min=0.0)
+
+    def forecast_residual_now(self) -> float | None:
+        """Return clipped residual forecast for current step or ``None`` if unavailable."""
+        if not self._is_fitted or len(self._errors) < self.order:
+            return None
+
+        residual_now = self._forecast_residual_now()
+        return float(np.clip(residual_now, -self.max_abs_correction, self.max_abs_correction))
+
+    def coefficients(self) -> np.ndarray:
+        """Return a copy of current AR coefficients."""
+        return self._coeffs.copy()
+
+    def _fit_ar_coeffs(self) -> np.ndarray | None:
+        errors = np.asarray(self._errors, dtype=np.float64)
+        n = len(errors)
+        rows = n - self.order
+        if rows <= 0:
+            return None
+
+        y = errors[self.order :]
+        x_cols = [errors[self.order - lag - 1 : n - lag - 1] for lag in range(self.order)]
+        x = np.stack(x_cols, axis=1)
+
+        xtx = x.T @ x
+        if self.ridge > 0:
+            xtx = xtx + self.ridge * np.eye(self.order, dtype=np.float64)
+        xty = x.T @ y
+
+        try:
+            coeffs = np.linalg.solve(xtx, xty)
+        except np.linalg.LinAlgError:
+            return None
+        return coeffs
+
+    def _forecast_residual_now(self) -> float:
+        # State = [e_{t-1}, e_{t-2}, ..., e_{t-p}]
+        state = [float(self._errors[-lag - 1]) for lag in range(self.order)]
+        forecast = 0.0
+        for _ in range(self.horizon_steps):
+            forecast = float(np.dot(self._coeffs, np.asarray(state, dtype=np.float64)))
+            state = [forecast, *state[:-1]]
+        return forecast
 
 
 def _load_clear_sky_lookup(dataset_path: Path) -> dict[str, float]:
@@ -131,9 +188,12 @@ def evaluate(
     ogd_gating_high: float,
     clear_sky_lookup: dict[str, float],
     csi_min_clear_sky: float,
-    use_online_calibrator: bool,
-    cal_lr: float,
-    cal_l2: float,
+    use_ar_error_filter: bool,
+    ar_order: int,
+    ar_min_history: int,
+    ar_ridge: float,
+    ar_max_abs_correction: float,
+    ar_debug_every: int,
     warmup_samples: int,
     lr_decay_rate: float,
     lr_decay_steps: int,
@@ -144,7 +204,17 @@ def evaluate(
     predictions_data: list[dict[str, Any]] = []
     per_day_metrics: dict[str, dict[str, float]] = {}
     causal_queue: deque[dict[str, Any]] = deque()
-    calibrator = OnlineAffineCalibrator(lr=cal_lr, l2=cal_l2) if use_online_calibrator else None
+    error_filter = (
+        OnlineARErrorFilter(
+            order=ar_order,
+            horizon_steps=horizon_steps,
+            min_history=ar_min_history,
+            ridge=ar_ridge,
+            max_abs_correction=ar_max_abs_correction,
+        )
+        if use_ar_error_filter
+        else None
+    )
     update_stats = {
         "considered": 0,
         "updated": 0,
@@ -155,6 +225,7 @@ def evaluate(
         "skipped_warmup": 0,
     }
     total_samples_processed = 0
+    total_predictions_made = 0
     ogd_lr_current = adapter.lr_ogd
 
     print_metrics_header()
@@ -238,9 +309,9 @@ def evaluate(
                     )
                     update_stats["updated"] += 1
 
-                if calibrator is not None and oldest["raw_pred"] is not None:
+                if error_filter is not None and oldest["raw_pred"] is not None:
                     delayed_target = float(oldest["gt"].view(-1)[0].item())
-                    calibrator.update(float(oldest["raw_pred"]), delayed_target)
+                    error_filter.update(float(oldest["raw_pred"]), delayed_target)
 
             # Decide routing first so we can skip expensive TTA in Regime 1.
             dyn_weight = 0.0
@@ -288,7 +359,7 @@ def evaluate(
                 # 3. Dynamic Router (Blend)
                 csi_flat_threshold = 0.015
 
-                if csi_var < csi_flat_threshold:
+                if csi_var < csi_flat_threshold or target_cs is None or target_cs < csi_min_clear_sky:
                     # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
                     dyn_weight = 1.0
                     day_regime1_count += 1
@@ -308,13 +379,23 @@ def evaluate(
             else:
                 # Regime 2 (or dynamic routing disabled): run full Dual-Phase prediction.
                 mean_raw, _ = adapter.predict(images, irr_history)
-                mean = calibrator.apply(mean_raw) if calibrator is not None else mean_raw
+                mean = error_filter.apply(mean_raw) if error_filter is not None else mean_raw
 
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
 
             pred_np = mean.detach().cpu().numpy().flatten()
             target_np = target.cpu().numpy().flatten()
+
+            total_predictions_made += 1
+            if error_filter is not None and ar_debug_every > 0 and total_predictions_made % ar_debug_every == 0:
+                coeffs = ", ".join(f"{coef:.4f}" for coef in error_filter.coefficients())
+                e_hat = error_filter.forecast_residual_now()
+                e_hat_str = f"{e_hat:.5f}" if e_hat is not None else "N/A"
+                print(
+                    f"AR debug @sample={total_predictions_made}: " f"e_hat={e_hat_str}  coeffs=[{coeffs}]",
+                    flush=True,
+                )
 
             day_preds.extend(pred_np)
             day_targets.extend(target_np)
@@ -491,24 +572,45 @@ def evaluate(
     help="Save per-day metrics report and predictions CSV to disk.",
 )
 @click.option(
-    "--use-online-calibrator/--no-online-calibrator",
+    "--use-ar-error-filter/--no-ar-error-filter",
     default=True,
     show_default=True,
-    help="Apply delayed-label affine calibration: y' = a*y + b.",
+    help="Apply delayed-label AR residual filtering on neural predictions.",
 )
 @click.option(
-    "--cal-lr",
-    type=float,
-    default=1e-3,
+    "--ar-order",
+    type=click.IntRange(min=1),
+    default=3,
     show_default=True,
-    help="Learning rate for online affine calibrator updates.",
+    help="Autoregressive order p for residual model AR(p).",
 )
 @click.option(
-    "--cal-l2",
+    "--ar-min-history",
+    type=click.IntRange(min=4),
+    default=32,
+    show_default=True,
+    help="Minimum delayed residual samples before fitting AR coefficients.",
+)
+@click.option(
+    "--ar-ridge",
     type=float,
     default=1e-4,
     show_default=True,
-    help="L2 regularization of calibrator toward identity (a=1, b=0).",
+    help="Ridge regularization for AR least-squares coefficient estimation.",
+)
+@click.option(
+    "--ar-max-abs-correction",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Absolute clamp for AR error correction in kW/m^2.",
+)
+@click.option(
+    "--ar-debug-every",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Print AR coefficients and e_hat every N predictions (0 disables).",
 )
 @click.option(
     "--ogd-gating",
@@ -583,9 +685,12 @@ def main(
     start_day: str,
     device: str,
     save_results: bool,
-    use_online_calibrator: bool,
-    cal_lr: float,
-    cal_l2: float,
+    use_ar_error_filter: bool,
+    ar_order: int,
+    ar_min_history: int,
+    ar_ridge: float,
+    ar_max_abs_correction: float,
+    ar_debug_every: int,
     ogd_gating: str,
     ogd_gating_low: float,
     ogd_gating_high: float,
@@ -602,7 +707,7 @@ def main(
         device = "cpu"
 
     dataset_name = dataset_path.name.split("_")[0]
-    cal_tag = "cal" if use_online_calibrator else "nocal"
+    cal_tag = "arcal" if use_ar_error_filter else "noarcal"
     gating_tag = f"gate_{ogd_gating}"
     method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}_{gating_tag}"
 
@@ -696,9 +801,12 @@ def main(
         ogd_gating_high=ogd_gating_high,
         clear_sky_lookup=clear_sky_lookup,
         csi_min_clear_sky=csi_min_clear_sky,
-        use_online_calibrator=use_online_calibrator,
-        cal_lr=cal_lr,
-        cal_l2=cal_l2,
+        use_ar_error_filter=use_ar_error_filter,
+        ar_order=ar_order,
+        ar_min_history=ar_min_history,
+        ar_ridge=ar_ridge,
+        ar_max_abs_correction=ar_max_abs_correction,
+        ar_debug_every=ar_debug_every,
         warmup_samples=warmup_samples,
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,
@@ -718,8 +826,10 @@ def main(
             f"  ogd_loss={ogd_loss}  ogd_ramp_penalty={ogd_ramp_penalty}"
             f"  lr_tta={lr_tta}  n_aug={n_augmentations}"
             f"  niter={niter}  note_buffer_size={note_buffer_size}"
-            f"  use_online_calibrator={use_online_calibrator}"
-            f"  cal_lr={cal_lr}  cal_l2={cal_l2}"
+            f"  use_ar_error_filter={use_ar_error_filter}"
+            f"  ar_order={ar_order}  ar_min_history={ar_min_history}"
+            f"  ar_ridge={ar_ridge}  ar_max_abs_correction={ar_max_abs_correction}"
+            f"  ar_debug_every={ar_debug_every}"
             f"  ogd_gating={ogd_gating}"
             f"  ogd_gating_low={ogd_gating_low}  ogd_gating_high={ogd_gating_high}"
             f"  csi_min_clear_sky={csi_min_clear_sky}"
