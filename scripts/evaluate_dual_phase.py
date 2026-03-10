@@ -750,7 +750,7 @@ def evaluate(
 @click.option(
     "--knn-bank-size",
     type=click.IntRange(min=10),
-    default=500,
+    default=5000,
     show_default=True,
     help="Rolling memory bank size for feature/error tuples.",
 )
@@ -764,7 +764,7 @@ def evaluate(
 @click.option(
     "--knn-min-samples",
     type=click.IntRange(min=1),
-    default=30,
+    default=300,
     show_default=True,
     help="Minimum memory-bank size before k-NN corrections are applied.",
 )
