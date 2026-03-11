@@ -128,9 +128,6 @@ def evaluate(
     horizon_steps: int,
     paper_t1: float,
     paper_t2: float,
-    lr_decay_rate: float,
-    lr_decay_steps: int,
-    max_samples_per_day: int,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
     all_predictions: list[float] = []
     all_targets: list[float] = []
@@ -144,8 +141,6 @@ def evaluate(
         "head": 0,
         "whole": 0,
     }
-    total_updates = 0
-    lr_current = optimizer.param_groups[0]["lr"]
 
     print_metrics_header()
 
@@ -157,8 +152,7 @@ def evaluate(
         day_preds: list[float] = []
         day_targets: list[float] = []
 
-        iter_indices = day_indices[:max_samples_per_day] if max_samples_per_day > 0 else day_indices
-        for idx in tqdm(iter_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
+        for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
             image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
 
             if isinstance(image_name, bytes):
@@ -207,11 +201,6 @@ def evaluate(
                         gt=oldest["gt"],
                         device=device,
                     )
-                    total_updates += 1
-                    if lr_decay_rate > 0 and lr_decay_steps > 0 and total_updates % lr_decay_steps == 0:
-                        lr_current *= 1.0 - lr_decay_rate
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = lr_current
                     if scope == "head_only":
                         update_stats["head"] += 1
                     else:
@@ -257,8 +246,6 @@ def evaluate(
         f"  whole={update_stats['whole']}",
         flush=True,
     )
-    if lr_decay_rate > 0:
-        print(f"Final learning rate: {lr_current:.2e}", flush=True)
 
     return overall_metrics, per_day_metrics, predictions_data
 
@@ -359,27 +346,6 @@ def evaluate(
     help="Device to run on ('cuda' or 'cpu').",
 )
 @click.option(
-    "--lr-decay-rate",
-    type=float,
-    default=0.0,
-    show_default=True,
-    help="Multiplicative LR decay rate per --lr-decay-steps updates (0.0 = no decay).",
-)
-@click.option(
-    "--lr-decay-steps",
-    type=int,
-    default=1000,
-    show_default=True,
-    help="Number of OGD updates between each LR decay application.",
-)
-@click.option(
-    "--max-samples-per-day",
-    type=int,
-    default=-1,
-    show_default=True,
-    help="Cap per-day sample count for smoke tests. -1 disables the cap.",
-)
-@click.option(
     "--save-results",
     is_flag=True,
     default=False,
@@ -399,9 +365,6 @@ def main(
     num_days: int,
     start_day: str,
     device: str,
-    lr_decay_rate: float,
-    lr_decay_steps: int,
-    max_samples_per_day: int,
     save_results: bool,
 ) -> None:
     """Evaluate paper-style Algorithm 1 lagged OGD continual adaptation."""
@@ -464,11 +427,7 @@ def main(
 
     total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
     print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
-    if max_samples_per_day > 0:
-        capped = sum(min(len(day_index_map[d]), max_samples_per_day) for d in days_to_eval)
-        print(f"Total samples (capped): {capped}\n")
-    else:
-        print(f"Total samples: {total_samples}\n")
+    print(f"Total samples: {total_samples}\n")
 
     # ------------------------------------------------------------------
     # Run evaluation
@@ -485,9 +444,6 @@ def main(
         horizon_steps=horizon_steps,
         paper_t1=t1,
         paper_t2=t2,
-        lr_decay_rate=lr_decay_rate,
-        lr_decay_steps=lr_decay_steps,
-        max_samples_per_day=max_samples_per_day,
     )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
@@ -507,8 +463,6 @@ def main(
             f"ogd_beta2={ogd_beta2}",
             f"ogd_weight_decay={ogd_weight_decay}",
             f"ogd_loss={ogd_loss}",
-            f"lr_decay_rate={lr_decay_rate}",
-            f"lr_decay_steps={lr_decay_steps}",
         ]
         save_metrics_report(
             tag=method_tag,
