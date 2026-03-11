@@ -106,7 +106,7 @@ def load_model_and_data(
         Test dataset object containing periods.
     """
     # Load model
-    model = load_forecaster_from_checkpoint(checkpoint_path, device=device)
+    model = load_forecaster_from_checkpoint(checkpoint_path, device=device, use_hparams=True)
 
     # Apply LoRA (dual-LoRA takes precedence)
     if use_dual_lora:
