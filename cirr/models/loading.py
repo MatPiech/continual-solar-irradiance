@@ -17,8 +17,8 @@ _DEFAULT_HPARAMS: dict = {
     "model_name": "timm-resnet50",
     "pretrained": False,
     "input_channels": 3,
-    "loss_function": "GNLL",
-    "lr": 1e-3,
+    "loss_function": "MSE",
+    "lr": 3e-4,
     "lr_patience": 5,
 }
 
@@ -26,7 +26,7 @@ _DEFAULT_HPARAMS: dict = {
 def load_forecaster_from_checkpoint(
     checkpoint_path: Path,
     device: str = "cpu",
-    use_hparams: bool = False,
+    use_hparams: bool = True,
 ) -> Forecaster:
     """Instantiate a :class:`Forecaster` and load weights from *checkpoint_path*.
 
@@ -56,8 +56,8 @@ def load_forecaster_from_checkpoint(
         model_name=hp.get("model_name", "timm-resnet50"),
         pretrained=hp.get("pretrained", False),
         input_channels=hp.get("input_channels", 3),
-        loss_function=hp.get("loss_function", "GNLL"),
-        lr=hp.get("lr", 1e-3),
+        loss_function=hp.get("loss_function", "MSE"),
+        lr=hp.get("lr", 3e-4),
         lr_patience=hp.get("lr_patience", 5),
     ).to(device)
 
