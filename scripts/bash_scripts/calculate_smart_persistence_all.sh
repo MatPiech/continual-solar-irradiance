@@ -13,7 +13,7 @@ echo "Calculating Smart Persistence baselines for all locations..."
 echo "============================================================"
 
 counter=0
-for location in folsom modena poznan karpicko alpnach bern1 bern2 neuchatel; do
+for location in folsom modena poznan karpicko alpnach bern1 bern2 ne; do
     counter=$((counter + 1))
     echo "Processing location [$counter/8]: ${location^^}"
     python scripts/smart_persistence_model.py \
