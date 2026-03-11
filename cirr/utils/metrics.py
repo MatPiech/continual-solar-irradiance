@@ -74,7 +74,7 @@ def robust_smape(targets: np.ndarray, predictions: np.ndarray, min_threshold: fl
     return float(100 * np.mean(smape_array))
 
 
-def compute_metrics(predictions: np.ndarray, targets: np.ndarray, min_threshold: float = 5.0) -> dict[str, float]:
+def compute_metrics(predictions: np.ndarray, targets: np.ndarray, min_threshold: float = 0.005) -> dict[str, float]:
     """Compute MAE, RMSE, WAPE, SMAPE, and sample count.
 
     Parameters
@@ -86,9 +86,7 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray, min_threshold:
     min_threshold : float, optional
         Minimum target value for computing percentage-based metrics (WAPE/SMAPE).
         Samples below this threshold are excluded from percentage calculations to
-        avoid very high values when targets are near zero. Default is 5.0 W/m²,
-        suitable for solar irradiance to exclude nighttime/twilight periods.
-        Set to 0.0 to disable filtering.
+        avoid very high values when targets are near zero.
 
     Returns
     -------

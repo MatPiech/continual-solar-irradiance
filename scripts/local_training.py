@@ -20,7 +20,7 @@ import torch
 
 from cirr.datamodules.loading import load_dataset
 from cirr.evaluation.printing import print_overall_metrics
-from cirr.evaluation.results import save_metrics_report, save_predictions_csv
+from cirr.evaluation.results import format_percentage_metric, save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.training.replay import build_folsom_replay_buffer, period_target_value, sample_replay_for_day
@@ -498,7 +498,7 @@ def run_local_training(
     print(
         f"{'Day':<6} {'MAE':<10} {'RMSE':<10} {'WAPE':<10} {'SMAPE':<10} {'Samples':<8} {'Train Loss':<12} {'Replay Dist Match':<18}"
     )
-    print("-" * 130)
+    print("-" * 100)
 
     for day_idx, day_key in enumerate(all_days):
         day_indices = day_index_map.get(day_key, [])
@@ -582,9 +582,12 @@ def run_local_training(
         else:
             dist_match_str = "N/A"
 
+        wape_str = format_percentage_metric(metrics["wape"])
+        smape_str = format_percentage_metric(metrics["smape"])
+
         print(
             f"{day_key:<6} {metrics['mae']:<10.4f} "
-            f"{metrics['rmse']:<10.4f} {metrics['wape']:<10.2f}% {metrics['smape']:<10.2f}% "
+            f"{metrics['rmse']:<10.4f} {wape_str} {smape_str} "
             f"{metrics['count']:<8} {train_loss:<12.4f}  {dist_match_str:<16}"
         )
         print(

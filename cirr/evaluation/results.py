@@ -8,6 +8,11 @@ from typing import Any
 import pandas as pd
 
 
+def format_percentage_metric(value: float, width: int = 10) -> str:
+    """Format a percentage metric, returning N/A for undefined values."""
+    return f"{value:<{width}.2f}%" if pd.notna(value) else f"{'N/A':<{width + 1}}"
+
+
 def save_predictions_csv(predictions_data: list[dict[str, Any]], path: Path | str) -> None:
     """Save *predictions_data* to a CSV file at *path*.
 
@@ -69,8 +74,8 @@ def save_metrics_report(
         f.write("Overall Metrics:\n")
         f.write(f"  MAE:   {overall_metrics['mae']:.8f}\n")
         f.write(f"  RMSE:  {overall_metrics['rmse']:.8f}\n")
-        f.write(f"  WAPE:  {overall_metrics['wape']:.2f}%\n")
-        f.write(f"  SMAPE: {overall_metrics['smape']:.2f}%\n")
+        f.write(f"  WAPE:  {format_percentage_metric(overall_metrics['wape'], width=0).strip()}\n")
+        f.write(f"  SMAPE: {format_percentage_metric(overall_metrics['smape'], width=0).strip()}\n")
         f.write(f"  Samples: {overall_metrics['count']}\n\n")
 
         f.write("Per-Day Metrics:\n")
@@ -86,5 +91,5 @@ def save_metrics_report(
 
             f.write(
                 f"{day_key:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} "
-                f"{m['wape']:<10.2f}% {m['smape']:<10.2f}% {samples_display:<24}\n"
+                f"{format_percentage_metric(m['wape'])} {format_percentage_metric(m['smape'])} {samples_display:<24}\n"
             )
