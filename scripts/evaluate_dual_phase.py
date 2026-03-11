@@ -406,7 +406,8 @@ def evaluate(
                     csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
 
                 # 3. Dynamic Router (Blend)
-                csi_flat_threshold = 0.015
+                csi_flat_threshold = 0.0158
+                # max_csi_var = 0.0876
 
                 if csi_var < csi_flat_threshold or target_cs is None or target_cs < csi_min_clear_sky:
                     # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
@@ -414,7 +415,9 @@ def evaluate(
                     day_regime1_count += 1
                 else:
                     # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
-                    dyn_weight = 0.0
+                    dyn_weight = 0.25
+                    # volatility_factor = max(0.0, min((csi_var - csi_flat_threshold) / (max_csi_var - csi_flat_threshold), 1.0))
+                    # dyn_weight = volatility_factor * 1.0
                     day_regime2_count += 1
             else:
                 # Dynamic routing is disabled, so all predictions come from the model path.
