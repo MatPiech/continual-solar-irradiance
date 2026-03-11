@@ -128,11 +128,18 @@ def evaluate(
     horizon_steps: int,
     paper_t1: float,
     paper_t2: float,
-) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, float],
+    dict[str, dict[str, float]],
+    list[dict[str, Any]],
+    dict[str, dict[str, int]],
+    dict[str, int],
+]:
     all_predictions: list[float] = []
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
     per_day_metrics: dict[str, dict[str, float]] = {}
+    per_day_adaptation: dict[str, dict[str, int]] = {}
     causal_queue: deque[dict[str, Any]] = deque()
 
     update_stats: dict[str, int] = {
@@ -151,6 +158,12 @@ def evaluate(
 
         day_preds: list[float] = []
         day_targets: list[float] = []
+        day_update_stats: dict[str, int] = {
+            "considered": 0,
+            "none": 0,
+            "head": 0,
+            "whole": 0,
+        }
 
         for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
             image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
@@ -169,6 +182,30 @@ def evaluate(
                 mean_raw = output[0] if isinstance(output, tuple) else output
             mean = torch.clamp(mean_raw, min=0.0)
 
+            pred_np = mean.detach().cpu().numpy().flatten()
+            target_np = target.detach().cpu().numpy().flatten()
+
+            day_preds.extend(pred_np)
+            day_targets.extend(target_np)
+            all_predictions.extend(pred_np)
+            all_targets.extend(target_np)
+
+            pred_row_idx = len(predictions_data)
+            predictions_data.append(
+                {
+                    "timestamp": image_name if isinstance(image_name, str) else None,
+                    "day": day_key,
+                    "prediction": pred_np[0] if len(pred_np) == 1 else pred_np,
+                    "target": target_np[0] if len(target_np) == 1 else target_np,
+                    "error": float(pred_np[0] - target_np[0]),
+                    "absolute_error": float(abs(pred_np[0] - target_np[0])),
+                    "update_considered": False,
+                    "adapted": False,
+                    "adaptation_scope": "not_available",
+                    "delayed_abs_error": np.nan,
+                }
+            )
+
             # --- Enqueue (store raw prediction for delayed error computation) ---
             causal_queue.append(
                 {
@@ -176,6 +213,7 @@ def evaluate(
                     "history": irradiance_history,
                     "gt": target_irradiance.unsqueeze(0),
                     "raw_pred": float(mean_raw.detach().cpu().view(-1)[0].item()),
+                    "pred_row_idx": pred_row_idx,
                 }
             )
 
@@ -183,13 +221,19 @@ def evaluate(
             if len(causal_queue) > horizon_steps:
                 oldest = causal_queue.popleft()
                 update_stats["considered"] += 1
+                day_update_stats["considered"] += 1
 
                 delayed_gt = float(oldest["gt"].view(-1)[0].item())
                 delayed_abs_error = abs(float(oldest["raw_pred"]) - delayed_gt)
                 scope = _algorithm1_scope(delayed_abs_error, paper_t1, paper_t2)
+                oldest_row = predictions_data[oldest["pred_row_idx"]]
+                oldest_row["update_considered"] = True
+                oldest_row["delayed_abs_error"] = delayed_abs_error
 
                 if scope == "none":
                     update_stats["none"] += 1
+                    day_update_stats["none"] += 1
+                    oldest_row["adaptation_scope"] = "none"
                 else:
                     _ogd_step(
                         model=model,
@@ -203,34 +247,29 @@ def evaluate(
                     )
                     if scope == "head_only":
                         update_stats["head"] += 1
+                        day_update_stats["head"] += 1
+                        oldest_row["adapted"] = True
+                        oldest_row["adaptation_scope"] = "head"
                     else:
                         update_stats["whole"] += 1
-
-            pred_np = mean.detach().cpu().numpy().flatten()
-            target_np = target.detach().cpu().numpy().flatten()
-
-            day_preds.extend(pred_np)
-            day_targets.extend(target_np)
-            all_predictions.extend(pred_np)
-            all_targets.extend(target_np)
-
-            predictions_data.append(
-                {
-                    "timestamp": image_name if isinstance(image_name, str) else None,
-                    "day": day_key,
-                    "prediction": pred_np[0] if len(pred_np) == 1 else pred_np,
-                    "target": target_np[0] if len(target_np) == 1 else target_np,
-                    "error": float(pred_np[0] - target_np[0]),
-                    "absolute_error": float(abs(pred_np[0] - target_np[0])),
-                }
-            )
+                        day_update_stats["whole"] += 1
+                        oldest_row["adapted"] = True
+                        oldest_row["adaptation_scope"] = "whole"
 
         if day_preds:
             day_metrics = compute_metrics(np.array(day_preds), np.array(day_targets))
             per_day_metrics[day_key] = day_metrics
+            per_day_adaptation[day_key] = day_update_stats
             print(
                 f"{day_key:<6} {day_metrics['mae']:<10.4f} {day_metrics['rmse']:<10.4f} "
                 f"{day_metrics['wape']:<10.2f}% {day_metrics['smape']:<10.2f}% {day_metrics['count']:<16}",
+                flush=True,
+            )
+            print(
+                f"       adapt: considered={day_update_stats['considered']} "
+                f"none={day_update_stats['none']} "
+                f"head={day_update_stats['head']} "
+                f"whole={day_update_stats['whole']}",
                 flush=True,
             )
 
@@ -247,7 +286,7 @@ def evaluate(
         flush=True,
     )
 
-    return overall_metrics, per_day_metrics, predictions_data
+    return overall_metrics, per_day_metrics, predictions_data, per_day_adaptation, update_stats
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +472,7 @@ def main(
     # Run evaluation
     # ------------------------------------------------------------------
     print("Running paper Algorithm 1 lagged OGD evaluation...\n")
-    overall_metrics, per_day_metrics, predictions_data = evaluate(
+    overall_metrics, per_day_metrics, predictions_data, per_day_adaptation, update_stats = evaluate(
         model=model,
         optimizer=optimizer,
         loss_fn=loss_fn,
@@ -463,7 +502,19 @@ def main(
             f"ogd_beta2={ogd_beta2}",
             f"ogd_weight_decay={ogd_weight_decay}",
             f"ogd_loss={ogd_loss}",
+            "Adaptation summary:",
+            f"considered={update_stats['considered']}",
+            f"none={update_stats['none']}",
+            f"head={update_stats['head']}",
+            f"whole={update_stats['whole']}",
+            "Per-day adaptation:",
         ]
+        for day_key in sorted(per_day_adaptation.keys()):
+            day_stats = per_day_adaptation[day_key]
+            extra.append(
+                f"{day_key}: considered={day_stats['considered']} none={day_stats['none']} "
+                f"head={day_stats['head']} whole={day_stats['whole']}"
+            )
         save_metrics_report(
             tag=method_tag,
             dataset_name=dataset_name,
