@@ -93,11 +93,21 @@ class ShermanMorrisonHeadUpdater:
         forgetting_factor: float = 1.0,
         full_head_regularization_mult: float = 100.0,
         error_clip: float = 0.2,
+        max_last_layer_update_norm: float = 0.01,
+        max_first_layer_update_norm: float = 0.002,
+        anchor_decay_last: float = 1e-4,
+        anchor_decay_first: float = 5e-4,
         device: str = "cuda",
     ) -> None:
         self.lam = forgetting_factor
         self.device = device
         self.error_clip = float(error_clip)
+        self.max_last_layer_update_norm = float(max_last_layer_update_norm)
+        self.max_first_layer_update_norm = float(max_first_layer_update_norm)
+        self.anchor_decay_last = float(anchor_decay_last)
+        self.anchor_decay_first = float(anchor_decay_first)
+        self._lambda_init = float(lambda_init)
+        self._full_head_regularization_mult = float(full_head_regularization_mult)
 
         head = model.network_head
         self._last_linear: nn.Linear = head[2]
@@ -114,6 +124,12 @@ class ShermanMorrisonHeadUpdater:
 
         self._P2 = torch.eye(aug_d2, dtype=torch.float32, device=device) / lambda_init
         self._P1 = torch.eye(aug_d1, dtype=torch.float32, device=device) / (lambda_init * full_head_regularization_mult)
+
+        # Anchor tensors (checkpoint state) used for mild anti-drift pullback.
+        self._last_weight_anchor = self._last_linear.weight.detach().clone()
+        self._last_bias_anchor = self._last_linear.bias.detach().clone() if self._use_bias_last else None
+        self._first_weight_anchor = self._first_linear.weight.detach().clone()
+        self._first_bias_anchor = self._first_linear.bias.detach().clone() if self._use_bias_first else None
 
     # ------------------------------------------------------------------
 
@@ -134,6 +150,21 @@ class ShermanMorrisonHeadUpdater:
         p_new = (1.0 / self.lam) * (p - torch.outer(p_phi, p_phi) / denom)
         k = p_phi / denom
         return p_new, k
+
+    def _clip_delta(self, delta: torch.Tensor, max_norm: float) -> torch.Tensor:
+        """Clip update tensor by global L2 norm."""
+        norm = float(torch.linalg.norm(delta).item())
+        if norm <= max_norm or norm < 1e-12:
+            return delta
+        return delta * (max_norm / norm)
+
+    @torch.no_grad()
+    def reset_covariance(self) -> None:
+        """Reset only RLS covariance state, keeping adapted weights."""
+        self._P2 = torch.eye(self._P2.shape[0], dtype=self._P2.dtype, device=self._P2.device) / self._lambda_init
+        self._P1 = torch.eye(self._P1.shape[0], dtype=self._P1.dtype, device=self._P1.device) / (
+            self._lambda_init * self._full_head_regularization_mult
+        )
 
     # ------------------------------------------------------------------
 
@@ -188,10 +219,26 @@ class ShermanMorrisonHeadUpdater:
         w2_pre = self._last_linear.weight.detach().clone().to(self.device)
 
         if self._use_bias_last:
-            self._last_linear.weight.add_((k2[:-1] * error).unsqueeze(0).to(self._last_linear.weight.device))
-            self._last_linear.bias.add_((k2[-1] * error).to(self._last_linear.bias.device))
+            delta_w2 = (k2[:-1] * error).unsqueeze(0)
+            delta_w2 = self._clip_delta(delta_w2, self.max_last_layer_update_norm)
+            self._last_linear.weight.add_(delta_w2.to(self._last_linear.weight.device))
+
+            delta_b2 = (k2[-1] * error).view(1)
+            delta_b2 = self._clip_delta(delta_b2, self.max_last_layer_update_norm)
+            self._last_linear.bias.add_(delta_b2[0].to(self._last_linear.bias.device))
         else:
-            self._last_linear.weight.add_((k2 * error).unsqueeze(0).to(self._last_linear.weight.device))
+            delta_w2 = (k2 * error).unsqueeze(0)
+            delta_w2 = self._clip_delta(delta_w2, self.max_last_layer_update_norm)
+            self._last_linear.weight.add_(delta_w2.to(self._last_linear.weight.device))
+
+        # Mild pullback towards checkpoint head to prevent cumulative drift.
+        self._last_linear.weight.mul_(1.0 - self.anchor_decay_last).add_(
+            self.anchor_decay_last * self._last_weight_anchor.to(self._last_linear.weight.device)
+        )
+        if self._use_bias_last and self._last_bias_anchor is not None:
+            self._last_linear.bias.mul_(1.0 - self.anchor_decay_last).add_(
+                self.anchor_decay_last * self._last_bias_anchor.to(self._last_linear.bias.device)
+            )
 
         if scope == "last_layer":
             return
@@ -209,10 +256,24 @@ class ShermanMorrisonHeadUpdater:
 
         if self._use_bias_first:
             delta_w1 = torch.outer(credit, k1[:-1])  # [256, fusion_dim]
+            delta_w1 = self._clip_delta(delta_w1, self.max_first_layer_update_norm)
             self._first_linear.weight.add_(delta_w1.to(self._first_linear.weight.device))
-            self._first_linear.bias.add_((credit * k1[-1]).to(self._first_linear.bias.device))
+
+            delta_b1 = credit * k1[-1]
+            delta_b1 = self._clip_delta(delta_b1, self.max_first_layer_update_norm)
+            self._first_linear.bias.add_(delta_b1.to(self._first_linear.bias.device))
         else:
-            self._first_linear.weight.add_(torch.outer(credit, k1).to(self._first_linear.weight.device))
+            delta_w1 = torch.outer(credit, k1)
+            delta_w1 = self._clip_delta(delta_w1, self.max_first_layer_update_norm)
+            self._first_linear.weight.add_(delta_w1.to(self._first_linear.weight.device))
+
+        self._first_linear.weight.mul_(1.0 - self.anchor_decay_first).add_(
+            self.anchor_decay_first * self._first_weight_anchor.to(self._first_linear.weight.device)
+        )
+        if self._use_bias_first and self._first_bias_anchor is not None:
+            self._first_linear.bias.mul_(1.0 - self.anchor_decay_first).add_(
+                self.anchor_decay_first * self._first_bias_anchor.to(self._first_linear.bias.device)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +285,7 @@ def evaluate(
     model: Forecaster,
     updater: ShermanMorrisonHeadUpdater,
     update_scope: Literal["last_layer", "full_head"],
+    reset_covariance_per_day: bool,
     dataset: Any,
     day_index_map: dict[str, list[int]],
     days_to_eval: list[str],
@@ -358,6 +420,8 @@ def evaluate(
 
         # Prevent overnight ground-truth leakage across day boundaries.
         causal_queue.clear()
+        if reset_covariance_per_day:
+            updater.reset_covariance()
 
     overall_metrics = compute_metrics(np.array(all_predictions), np.array(all_targets))
     print(
@@ -432,6 +496,40 @@ def evaluate(
     help="Absolute clip applied to per-sample error before SM-RLS update.",
 )
 @click.option(
+    "--max-last-layer-update-norm",
+    type=click.FloatRange(min=1e-8),
+    default=0.01,
+    show_default=True,
+    help="L2 norm cap for one-step output-layer parameter update.",
+)
+@click.option(
+    "--max-first-layer-update-norm",
+    type=click.FloatRange(min=1e-8),
+    default=0.002,
+    show_default=True,
+    help="L2 norm cap for one-step hidden-layer parameter update.",
+)
+@click.option(
+    "--anchor-decay-last",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=1e-4,
+    show_default=True,
+    help="Per-step pullback strength of output layer toward checkpoint weights.",
+)
+@click.option(
+    "--anchor-decay-first",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=5e-4,
+    show_default=True,
+    help="Per-step pullback strength of hidden layer toward checkpoint weights.",
+)
+@click.option(
+    "--reset-covariance-per-day/--no-reset-covariance-per-day",
+    default=True,
+    show_default=True,
+    help="Reset RLS covariance matrices at day boundaries while keeping adapted weights.",
+)
+@click.option(
     "--num-days",
     type=int,
     default=-1,
@@ -467,6 +565,11 @@ def main(
     forgetting_factor: float,
     full_head_regularization_mult: float,
     error_clip: float,
+    max_last_layer_update_norm: float,
+    max_first_layer_update_norm: float,
+    anchor_decay_last: float,
+    anchor_decay_first: float,
+    reset_covariance_per_day: bool,
     num_days: int,
     start_day: str,
     device: str,
@@ -501,6 +604,10 @@ def main(
         forgetting_factor=forgetting_factor,
         full_head_regularization_mult=full_head_regularization_mult,
         error_clip=error_clip,
+        max_last_layer_update_norm=max_last_layer_update_norm,
+        max_first_layer_update_norm=max_first_layer_update_norm,
+        anchor_decay_last=anchor_decay_last,
+        anchor_decay_first=anchor_decay_first,
         device=device,
     )
 
@@ -509,6 +616,11 @@ def main(
         f"  lambda_init={lambda_init}  forgetting={forgetting_factor}"
         f"  full_head_reg_mult={full_head_regularization_mult}"
         f"  error_clip={error_clip}"
+        f"  max_last_delta={max_last_layer_update_norm}"
+        f"  max_first_delta={max_first_layer_update_norm}"
+        f"  anchor_last={anchor_decay_last}"
+        f"  anchor_first={anchor_decay_first}"
+        f"  reset_cov_per_day={reset_covariance_per_day}"
         f"  horizon_steps={horizon_steps}"
     )
 
@@ -541,6 +653,7 @@ def main(
         model=model,
         updater=updater,
         update_scope=update_scope,  # type: ignore[arg-type]
+        reset_covariance_per_day=reset_covariance_per_day,
         dataset=test_dataset,
         day_index_map=day_index_map,
         days_to_eval=days_to_eval,
@@ -563,6 +676,11 @@ def main(
             f"forgetting_factor={forgetting_factor}",
             f"full_head_regularization_mult={full_head_regularization_mult}",
             f"error_clip={error_clip}",
+            f"max_last_layer_update_norm={max_last_layer_update_norm}",
+            f"max_first_layer_update_norm={max_first_layer_update_norm}",
+            f"anchor_decay_last={anchor_decay_last}",
+            f"anchor_decay_first={anchor_decay_first}",
+            f"reset_covariance_per_day={reset_covariance_per_day}",
             "Adaptation summary:",
             f"considered={update_stats['considered']}",
             f"updated={update_stats['updated']}",
