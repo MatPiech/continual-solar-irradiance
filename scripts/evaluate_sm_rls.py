@@ -31,6 +31,7 @@ import click
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from cirr.datamodules.loading import load_dataset
@@ -90,10 +91,13 @@ class ShermanMorrisonHeadUpdater:
         model: Forecaster,
         lambda_init: float = 1.0,
         forgetting_factor: float = 1.0,
+        full_head_regularization_mult: float = 100.0,
+        error_clip: float = 0.2,
         device: str = "cuda",
     ) -> None:
         self.lam = forgetting_factor
         self.device = device
+        self.error_clip = float(error_clip)
 
         head = model.network_head
         self._last_linear: nn.Linear = head[2]
@@ -109,7 +113,7 @@ class ShermanMorrisonHeadUpdater:
         aug_d1 = d1 + int(self._use_bias_first)
 
         self._P2 = torch.eye(aug_d2, dtype=torch.float32, device=device) / lambda_init
-        self._P1 = torch.eye(aug_d1, dtype=torch.float32, device=device) / lambda_init
+        self._P1 = torch.eye(aug_d1, dtype=torch.float32, device=device) / (lambda_init * full_head_regularization_mult)
 
     # ------------------------------------------------------------------
 
@@ -121,6 +125,10 @@ class ShermanMorrisonHeadUpdater:
         ``P_new = (1/λ) * (P - P φ φᵀ P / (λ + φᵀ P φ))``
         ``k = P φ / (λ + φᵀ P φ)``
         """
+        # Normalize feature vector to avoid gain spikes on large activations.
+        phi_norm = float(torch.linalg.norm(phi).item())
+        phi = phi / max(phi_norm, 1e-6)
+
         p_phi = p @ phi  # [d]
         denom = self.lam + float((phi @ p_phi).item())
         p_new = (1.0 / self.lam) * (p - torch.outer(p_phi, p_phi) / denom)
@@ -150,22 +158,34 @@ class ShermanMorrisonHeadUpdater:
         target = gt.to(device).float()
 
         # ---- Forward pass: collect activations ----
-        img_feat = model.image_encoder(imgs)  # [1, num_features]
+        # Use the same encoder path as model.forward to stay consistent.
+        img_feat = model._encode_image_features(imgs, hist)  # [1, num_features]
         x_fusion = torch.cat([img_feat, hist], dim=-1)  # [1, fusion_dim]
 
         head = model.network_head
         h1 = head[0](x_fusion)  # [1, 256] pre-ReLU
         relu_mask = (h1 > 0).squeeze(0)  # [256] bool mask
         a1 = head[1](h1)  # [1, 256] post-ReLU
-        y_hat = head[2](a1)  # [1, out_dim]
+        z = head[2](a1)  # [1, out_dim] pre-softplus
+        y_hat = F.softplus(z)  # [1, out_dim] matches model.forward regression output
 
         error = float((target - y_hat).view(-1)[0].item())
+        # Limit one-step correction magnitude to keep online adaptation stable.
+        error = float(np.clip(error, -self.error_clip, self.error_clip))
+
+        # Local Jacobian dy/dz for softplus; used for linearized RLS update.
+        gain = float(torch.sigmoid(z).view(-1)[0].item())
+        gain = max(gain, 1e-4)
 
         # ---- Update output layer (W2, b2) ----
         a1_flat = a1.squeeze(0).to(self.device)
         phi2 = torch.cat([a1_flat, a1_flat.new_ones(1)]) if self._use_bias_last else a1_flat
+        phi2_eff = gain * phi2
 
-        self._P2, k2 = self._sm_update(self._P2, phi2, error)
+        self._P2, k2 = self._sm_update(self._P2, phi2_eff, error)
+
+        # Keep a pre-update snapshot for hidden-layer credit propagation.
+        w2_pre = self._last_linear.weight.detach().clone().to(self.device)
 
         if self._use_bias_last:
             self._last_linear.weight.add_((k2[:-1] * error).unsqueeze(0).to(self._last_linear.weight.device))
@@ -182,9 +202,10 @@ class ShermanMorrisonHeadUpdater:
 
         self._P1, k1 = self._sm_update(self._P1, phi1, error)
 
-        # credit[i] = (Σ_j W2[j,i]) * error * relu_mask[i]
-        w2 = self._last_linear.weight.detach().to(self.device)  # [out_dim, 256]
-        credit = w2.sum(dim=0) * error * relu_mask.float().to(self.device)  # [256]
+        # Hidden credit uses local linearization through softplus and ReLU.
+        # For scalar output: credit_i ≈ w2_i * (error * gain) * relu_mask_i.
+        # Use W2 before its own update for a cleaner local linearization.
+        credit = w2_pre[0] * (error * gain) * relu_mask.float().to(self.device)  # [256]
 
         if self._use_bias_first:
             delta_w1 = torch.outer(credit, k1[:-1])  # [256, fusion_dim]
@@ -397,6 +418,20 @@ def evaluate(
     help="Exponential forgetting factor λ ∈ (0, 1]. 1.0 = no forgetting (standard RLS).",
 )
 @click.option(
+    "--full-head-regularization-mult",
+    type=click.FloatRange(min=1.0),
+    default=100.0,
+    show_default=True,
+    help="Extra regularization factor for full-head hidden-layer RLS (larger = more conservative).",
+)
+@click.option(
+    "--error-clip",
+    type=click.FloatRange(min=1e-6),
+    default=0.2,
+    show_default=True,
+    help="Absolute clip applied to per-sample error before SM-RLS update.",
+)
+@click.option(
     "--num-days",
     type=int,
     default=-1,
@@ -430,6 +465,8 @@ def main(
     update_scope: str,
     lambda_init: float,
     forgetting_factor: float,
+    full_head_regularization_mult: float,
+    error_clip: float,
     num_days: int,
     start_day: str,
     device: str,
@@ -462,12 +499,16 @@ def main(
         model=model,
         lambda_init=lambda_init,
         forgetting_factor=forgetting_factor,
+        full_head_regularization_mult=full_head_regularization_mult,
+        error_clip=error_clip,
         device=device,
     )
 
     print(
         f"SM-RLS:  update_scope={update_scope}"
         f"  lambda_init={lambda_init}  forgetting={forgetting_factor}"
+        f"  full_head_reg_mult={full_head_regularization_mult}"
+        f"  error_clip={error_clip}"
         f"  horizon_steps={horizon_steps}"
     )
 
@@ -520,6 +561,8 @@ def main(
             f"update_scope={update_scope}",
             f"lambda_init={lambda_init}",
             f"forgetting_factor={forgetting_factor}",
+            f"full_head_regularization_mult={full_head_regularization_mult}",
+            f"error_clip={error_clip}",
             "Adaptation summary:",
             f"considered={update_stats['considered']}",
             f"updated={update_stats['updated']}",
