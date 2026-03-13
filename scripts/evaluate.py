@@ -33,12 +33,14 @@ python scripts/evaluate.py \\
 """
 
 from pathlib import Path
+import random
 import sys
 from typing import Any
 
 import click
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from cirr.datamodules.loading import load_dataset
@@ -46,6 +48,7 @@ from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.training.replay import build_folsom_replay_buffer
 from cirr.tta import MEMOReg, NOTEReg
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
@@ -160,6 +163,288 @@ def evaluate(
     return overall_metrics, per_day_metrics, predictions_data
 
 
+def _predict_single(model: Forecaster, images: torch.Tensor, history: torch.Tensor) -> torch.Tensor:
+    """Return model mean prediction for a batch."""
+    output = model(images, history)
+    return output[0] if isinstance(output, tuple) else output
+
+
+def _fewshot_compute_loss(model: Forecaster, pred_mean: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute supervised adaptation loss for few-shot fitting."""
+    if hasattr(model, "loss_fn"):
+        try:
+            return model.loss_fn(pred_mean, target)
+        except TypeError:
+            pass
+    return F.mse_loss(pred_mean, target)
+
+
+@torch.enable_grad()
+def _fewshot_fit(
+    model: Forecaster,
+    dataset: Any,
+    adaptation_indices: list[int],
+    replay_samples: list[tuple[Any, int]],
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    weight_decay: float,
+    patience: int,
+    min_delta: float,
+    val_ratio: float,
+    seed: int,
+    device: str,
+) -> dict[str, float]:
+    """Fit model once on adaptation data with early stopping."""
+    pooled_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in adaptation_indices] + replay_samples
+    if not pooled_samples:
+        return {
+            "epochs_trained": 0.0,
+            "best_monitor": np.nan,
+            "train_samples": 0.0,
+            "val_samples": 0.0,
+            "replay_samples": float(len(replay_samples)),
+        }
+
+    rng = random.Random(seed)
+    rng.shuffle(pooled_samples)
+
+    n_total = len(pooled_samples)
+    if n_total < 2:
+        val_size = 0
+    else:
+        val_size = int(round(n_total * val_ratio))
+        val_size = max(1, min(val_size, n_total - 1))
+
+    val_samples = pooled_samples[:val_size]
+    train_samples = pooled_samples[val_size:]
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    best_monitor = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
+    epochs_trained = 0
+
+    print(
+        f"Few-shot training: train_samples={len(train_samples)} val_samples={len(val_samples)} "
+        f"replay_samples={len(replay_samples)} lr={lr} wd={weight_decay} "
+        f"max_epochs={epochs} patience={patience} min_delta={min_delta}",
+        flush=True,
+    )
+
+    for epoch_idx in range(epochs):
+        model.train()
+        rng.shuffle(train_samples)
+        train_losses: list[float] = []
+
+        train_starts = list(range(0, len(train_samples), batch_size))
+        with tqdm(
+            train_starts,
+            desc=f"Few-shot epoch {epoch_idx + 1}/{epochs}",
+            unit="batch",
+            leave=False,
+            file=sys.stderr,
+        ) as batch_bar:
+            for start in batch_bar:
+                batch = train_samples[start : start + batch_size]
+                images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
+                histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
+                targets = torch.stack([sample_ds[sample_idx][2] for sample_ds, sample_idx in batch]).to(device)
+
+                optimizer.zero_grad()
+                pred_mean = _predict_single(model, images, histories)
+                loss = _fewshot_compute_loss(model, pred_mean, targets)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                train_losses.append(float(loss.item()))
+
+                running_train = float(np.mean(train_losses)) if train_losses else float("nan")
+                batch_bar.set_postfix(train=f"{running_train:.4f}")
+
+        model.eval()
+        if val_samples:
+            with torch.no_grad():
+                val_losses: list[float] = []
+                for start in range(0, len(val_samples), batch_size):
+                    batch = val_samples[start : start + batch_size]
+                    images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
+                    histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
+                    targets = torch.stack([sample_ds[sample_idx][2] for sample_ds, sample_idx in batch]).to(device)
+                    pred_mean = _predict_single(model, images, histories)
+                    val_loss = _fewshot_compute_loss(model, pred_mean, targets)
+                    val_losses.append(float(val_loss.item()))
+                monitor = float(np.mean(val_losses)) if val_losses else float("inf")
+        else:
+            monitor = float(np.mean(train_losses)) if train_losses else float("inf")
+        train_mean = float(np.mean(train_losses)) if train_losses else float("nan")
+        val_mean = monitor if val_samples else float("nan")
+
+        epochs_trained += 1
+        if monitor + min_delta < best_monitor:
+            best_monitor = monitor
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch_idx + 1
+            stale_epochs = 0
+            improved = "yes"
+        else:
+            stale_epochs += 1
+            improved = "no"
+
+        monitor_name = "val" if val_samples else "train"
+        print(
+            f"Few-shot epoch {epoch_idx + 1:>3}/{epochs}: "
+            f"train_loss={train_mean:.6f} "
+            f"val_loss={val_mean:.6f} "
+            f"monitor({monitor_name})={monitor:.6f} "
+            f"best={best_monitor:.6f}@{best_epoch} "
+            f"improved={improved} stale={stale_epochs}/{patience}",
+            flush=True,
+        )
+
+        if stale_epochs >= patience:
+            print(
+                f"Few-shot early stopping at epoch {epoch_idx + 1} "
+                f"(best_epoch={best_epoch}, best_monitor={best_monitor:.6f})",
+                flush=True,
+            )
+            break
+
+    model.load_state_dict(best_state)
+    model.eval()
+
+    return {
+        "epochs_trained": float(epochs_trained),
+        "best_monitor": best_monitor,
+        "best_epoch": float(best_epoch),
+        "train_samples": float(len(train_samples)),
+        "val_samples": float(len(val_samples)),
+        "replay_samples": float(len(replay_samples)),
+    }
+
+
+def evaluate_fewshot(
+    model: Forecaster,
+    dataset: Any,
+    day_index_map: dict[str, list[int]],
+    days_to_eval: list[str],
+    fewshot_days: int,
+    fewshot_epochs: int,
+    fewshot_batch_size: int,
+    fewshot_lr: float,
+    fewshot_weight_decay: float,
+    fewshot_patience: int,
+    fewshot_min_delta: float,
+    fewshot_val_ratio: float,
+    fewshot_seed: int,
+    fewshot_replay_ratio: float,
+    fewshot_replay_buffer_size: int,
+    folsom_path: Path,
+    device: str,
+) -> tuple[dict[str, float], dict[str, dict[str, float]], list[dict[str, Any]], dict[str, float]]:
+    """Evaluate with a single few-shot adaptation after the first N days."""
+    if fewshot_days <= 0:
+        raise ValueError("--fewshot-days must be >= 1 for method='fewshot'.")
+
+    fit_days = days_to_eval[:fewshot_days]
+    predict_days = days_to_eval[fewshot_days:]
+    fit_indices = [idx for day in fit_days for idx in day_index_map.get(day, [])]
+
+    replay_samples: list[tuple[Any, int]] = []
+    desired_replay_count = int(round(len(fit_indices) * fewshot_replay_ratio))
+    if desired_replay_count > 0 and fewshot_replay_buffer_size > 0:
+        effective_replay_count = min(desired_replay_count, fewshot_replay_buffer_size)
+        if effective_replay_count < desired_replay_count:
+            print(
+                f"Few-shot replay capped by buffer size: requested={desired_replay_count} "
+                f"cap={fewshot_replay_buffer_size}",
+                flush=True,
+            )
+        try:
+            # Replay is used once in few-shot adaptation, so we directly build
+            # the final replay set with Folsom-distribution-aware stratified sampling.
+            replay_samples, _ = build_folsom_replay_buffer(folsom_path, effective_replay_count)
+        except FileNotFoundError:
+            print(
+                f"Few-shot replay skipped: could not load Folsom training split from {folsom_path}",
+                flush=True,
+            )
+
+    print(
+        f"Few-shot setup: fit_days={len(fit_days)} predict_days={len(predict_days)} "
+        f"fit_samples={len(fit_indices)} replay_samples={len(replay_samples)} "
+        f"epochs={fewshot_epochs} batch_size={fewshot_batch_size}",
+        flush=True,
+    )
+
+    print("Few-shot phase 1: baseline inference on adaptation days.\n", flush=True)
+    base_overall, base_per_day, base_predictions = evaluate(
+        tta_model=None,
+        base_model=model,
+        dataset=dataset,
+        day_index_map=day_index_map,
+        days_to_eval=fit_days,
+        device=device,
+        reset_per_day=False,
+    )
+
+    adaptation_stats = _fewshot_fit(
+        model=model,
+        dataset=dataset,
+        adaptation_indices=fit_indices,
+        replay_samples=replay_samples,
+        epochs=fewshot_epochs,
+        batch_size=fewshot_batch_size,
+        lr=fewshot_lr,
+        weight_decay=fewshot_weight_decay,
+        patience=fewshot_patience,
+        min_delta=fewshot_min_delta,
+        val_ratio=fewshot_val_ratio,
+        seed=fewshot_seed,
+        device=device,
+    )
+
+    print(
+        f"Few-shot training finished: epochs_trained={int(adaptation_stats['epochs_trained'])} "
+        f"best_epoch={int(adaptation_stats['best_epoch'])} "
+        f"best_monitor={adaptation_stats['best_monitor']:.6f}",
+        flush=True,
+    )
+
+    print("\nFew-shot phase 2: adapted inference on remaining days.\n", flush=True)
+    adapted_overall, adapted_per_day, adapted_predictions = evaluate(
+        tta_model=None,
+        base_model=model,
+        dataset=dataset,
+        day_index_map=day_index_map,
+        days_to_eval=predict_days,
+        device=device,
+        reset_per_day=False,
+    )
+    _ = base_overall
+    _ = adapted_overall
+
+    predictions_data = base_predictions + adapted_predictions
+    per_day_metrics = {**base_per_day, **adapted_per_day}
+
+    if predictions_data:
+        all_predictions = np.array([row["prediction"] for row in predictions_data], dtype=float)
+        all_targets = np.array([row["target"] for row in predictions_data], dtype=float)
+        overall_metrics = compute_metrics(all_predictions, all_targets)
+    else:
+        overall_metrics = {
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "wape": float("nan"),
+            "smape": float("nan"),
+            "count": 0,
+        }
+
+    return overall_metrics, per_day_metrics, predictions_data, adaptation_stats
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -180,10 +465,10 @@ def evaluate(
 )
 @click.option(
     "--method",
-    type=click.Choice(["none", "memo", "note"], case_sensitive=False),
+    type=click.Choice(["none", "memo", "note", "fewshot"], case_sensitive=False),
     default="none",
     show_default=True,
-    help="TTA method: 'none'=baseline, 'memo'=MEMO-Reg, 'note'=NOTE-Reg. For dual-phase use evaluate_dual_phase.py.",
+    help="Evaluation method: 'none'=baseline, 'memo'=MEMO-Reg, 'note'=NOTE-Reg, 'fewshot'=offline N-day adaptation.",
 )
 @click.option(
     "--adapt-mode",
@@ -241,6 +526,76 @@ def evaluate(
     help="Optimizer weight decay.",
 )
 @click.option(
+    "--fewshot-days",
+    type=click.IntRange(min=1),
+    default=7,
+    show_default=True,
+    help="(Fewshot) Number of initial days used for one-time adaptation.",
+)
+@click.option(
+    "--fewshot-epochs",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="(Fewshot) Maximum adaptation epochs.",
+)
+@click.option(
+    "--fewshot-batch-size",
+    type=click.IntRange(min=1),
+    default=64,
+    show_default=True,
+    help="(Fewshot) Mini-batch size for adaptation.",
+)
+@click.option(
+    "--fewshot-lr",
+    type=float,
+    default=1e-5,
+    show_default=True,
+    help="(Fewshot) Learning rate for offline adaptation.",
+)
+@click.option(
+    "--fewshot-weight-decay",
+    type=float,
+    default=1e-4,
+    show_default=True,
+    help="(Fewshot) Weight decay for offline adaptation optimizer.",
+)
+@click.option(
+    "--fewshot-patience",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="(Fewshot) Early-stopping patience in epochs.",
+)
+@click.option(
+    "--fewshot-min-delta",
+    type=float,
+    default=1e-5,
+    show_default=True,
+    help="(Fewshot) Minimum monitor improvement to reset patience.",
+)
+@click.option(
+    "--fewshot-val-ratio",
+    type=click.FloatRange(min=0.0, max=0.8),
+    default=0.1,
+    show_default=True,
+    help="(Fewshot) Validation split ratio used for early stopping.",
+)
+@click.option(
+    "--fewshot-seed",
+    type=int,
+    default=42,
+    show_default=True,
+    help="(Fewshot) Random seed for sample split and replay sampling.",
+)
+@click.option(
+    "--fewshot-replay-ratio",
+    type=click.FloatRange(min=0.0),
+    default=0.0,
+    show_default=True,
+    help="(Fewshot) Ratio of replay samples relative to target adaptation samples.",
+)
+@click.option(
     "--num-days",
     type=int,
     default=-1,
@@ -286,6 +641,16 @@ def main(
     niter: int,
     lr: float,
     weight_decay: float,
+    fewshot_days: int,
+    fewshot_epochs: int,
+    fewshot_batch_size: int,
+    fewshot_lr: float,
+    fewshot_weight_decay: float,
+    fewshot_patience: int,
+    fewshot_min_delta: float,
+    fewshot_val_ratio: float,
+    fewshot_seed: int,
+    fewshot_replay_ratio: float,
     num_days: int,
     start_day: str,
     device: str,
@@ -299,7 +664,12 @@ def main(
         device = "cpu"
 
     dataset_name = dataset_path.name.split("_")[0]
-    method_tag = "baseline" if method == "none" else f"{method}_reg_{adapt_mode}"
+    if method == "none":
+        method_tag = "baseline"
+    elif method == "fewshot":
+        method_tag = f"fewshot_d{fewshot_days}"
+    else:
+        method_tag = f"{method}_reg_{adapt_mode}"
 
     # ------------------------------------------------------------------
     # Load model
@@ -344,6 +714,11 @@ def main(
             use_learned_stats=use_learned_stats,
             bn_momentum=bn_momentum,
         ).to(device)
+    elif method == "fewshot":
+        print(
+            f"Few-shot mode (fit_days={fewshot_days}, epochs={fewshot_epochs}, "
+            f"patience={fewshot_patience}, replay_ratio={fewshot_replay_ratio})..."
+        )
     else:
         print("No TTA — running baseline inference.")
 
@@ -371,18 +746,52 @@ def main(
     # ------------------------------------------------------------------
     # Run evaluation
     # ------------------------------------------------------------------
-    method_labels = {"none": "baseline", "memo": "MEMO-Reg TTA", "note": "NOTE-Reg TTA"}
+    method_labels = {
+        "none": "baseline",
+        "memo": "MEMO-Reg TTA",
+        "note": "NOTE-Reg TTA",
+        "fewshot": "few-shot offline adaptation",
+    }
     print(f"Running {method_labels[method]} evaluation...\n")
 
-    overall_metrics, per_day_metrics, predictions_data = evaluate(
-        tta_model=tta_model,
-        base_model=model,
-        dataset=test_dataset,
-        day_index_map=day_index_map,
-        days_to_eval=days_to_eval,
-        device=device,
-        reset_per_day=reset_per_day,
-    )
+    adaptation_stats: dict[str, float] | None = None
+    if method == "fewshot":
+        folsom_path = dataset_path.parent / "folsom_prepared"
+        computed_replay_buffer_size = max(0, int(round(fewshot_days * fewshot_replay_ratio * 1000)))
+        print(
+            f"Few-shot replay buffer size computed as {computed_replay_buffer_size} "
+            f"(fewshot_days * fewshot_replay_ratio * 1000)",
+            flush=True,
+        )
+        overall_metrics, per_day_metrics, predictions_data, adaptation_stats = evaluate_fewshot(
+            model=model,
+            dataset=test_dataset,
+            day_index_map=day_index_map,
+            days_to_eval=days_to_eval,
+            fewshot_days=fewshot_days,
+            fewshot_epochs=fewshot_epochs,
+            fewshot_batch_size=fewshot_batch_size,
+            fewshot_lr=fewshot_lr,
+            fewshot_weight_decay=fewshot_weight_decay,
+            fewshot_patience=fewshot_patience,
+            fewshot_min_delta=fewshot_min_delta,
+            fewshot_val_ratio=fewshot_val_ratio,
+            fewshot_seed=fewshot_seed,
+            fewshot_replay_ratio=fewshot_replay_ratio,
+            fewshot_replay_buffer_size=computed_replay_buffer_size,
+            folsom_path=folsom_path,
+            device=device,
+        )
+    else:
+        overall_metrics, per_day_metrics, predictions_data = evaluate(
+            tta_model=tta_model,
+            base_model=model,
+            dataset=test_dataset,
+            day_index_map=day_index_map,
+            days_to_eval=days_to_eval,
+            device=device,
+            reset_per_day=reset_per_day,
+        )
 
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
 
@@ -402,6 +811,23 @@ def main(
                 f"TTA: NOTEReg  adapt_mode={adapt_mode}  update_every_x={update_every_x}"
                 f"  niter={niter}  lr={lr}  use_learned_stats={use_learned_stats}"
                 f"  bn_momentum={bn_momentum}  reset_per_day={reset_per_day}"
+            )
+        elif method == "fewshot" and adaptation_stats is not None:
+            extra.append(
+                f"Fewshot: fit_days={fewshot_days}  epochs={fewshot_epochs} "
+                f"batch_size={fewshot_batch_size}  lr={fewshot_lr}  wd={fewshot_weight_decay}"
+            )
+            extra.append(
+                f"EarlyStopping: patience={fewshot_patience}  min_delta={fewshot_min_delta} " f"val_ratio={fewshot_val_ratio}"
+            )
+            extra.append(
+                f"Replay: ratio={fewshot_replay_ratio} "
+                f"buffer_size={max(0, int(round(fewshot_days * fewshot_replay_ratio * 1000)))} "
+                f"samples={int(adaptation_stats['replay_samples'])}"
+            )
+            extra.append(
+                f"Fewshot result: epochs_trained={int(adaptation_stats['epochs_trained'])} "
+                f"best_monitor={adaptation_stats['best_monitor']:.6f}"
             )
         save_metrics_report(
             tag=method_tag,
