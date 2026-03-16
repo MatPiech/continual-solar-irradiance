@@ -467,9 +467,7 @@ class DualPhaseAdapter(nn.Module):
         """Configure gradient flow on base_model for Phase 1 OGD.
 
         Freezes all parameters, then selectively unfreezes the regression head
-        and (if ``ogd_scope='head_and_encoder'``) the deepest child of
-        ``image_encoder``.  Puts ``base_model`` into train mode so BN layers
-        update their running statistics during the supervised forward pass.
+        and, for ``ogd_scope='head_and_encoder'``, the full ``image_encoder``.
         """
         # Freeze all parameters to establish a clean baseline.
         for param in self.base_model.parameters():
@@ -479,11 +477,8 @@ class DualPhaseAdapter(nn.Module):
             param.requires_grad_(True)
 
         if self.ogd_scope == "head_and_encoder":
-            encoder_children = list(self.base_model.image_encoder.children())
-            if encoder_children:
-                for i in range(-2, 0):
-                    for param in encoder_children[i].parameters():
-                        param.requires_grad_(True)
+            for param in self.base_model.image_encoder.parameters():
+                param.requires_grad_(True)
 
         self.base_model.eval()
 
@@ -529,10 +524,7 @@ class DualPhaseAdapter(nn.Module):
         """
         params = list(self.base_model.network_head.parameters())
         if self.ogd_scope == "head_and_encoder":
-            encoder_children = list(self.base_model.image_encoder.children())
-            if encoder_children:
-                for i in range(-2, 0):
-                    params.extend(encoder_children[i].parameters())
+            params.extend(self.base_model.image_encoder.parameters())
         return torch.optim.SGD(
             params,
             lr=self.lr_ogd,
