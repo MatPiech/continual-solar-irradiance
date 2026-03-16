@@ -219,7 +219,6 @@ def evaluate(
     days_to_eval: list[str],
     device: str,
     horizon_steps: int,
-    forecasting_horizon: int,
     ogd_gating: Literal["none", "raw", "csi"],
     ogd_gating_low: float,
     ogd_gating_high: float,
@@ -375,7 +374,7 @@ def evaluate(
             if use_dynamic_ensemble:
                 current_irr_val = irr_history[0, -1].item()
 
-                target_dt = current_dt + pd.Timedelta(minutes=forecasting_horizon)
+                target_dt = current_dt + pd.Timedelta(minutes=horizon_steps)
 
                 target_cs = _resolve_clear_sky_value(clear_sky_lookup, target_dt.strftime("%Y%m%d_%H%M%S"))
 
@@ -564,14 +563,7 @@ def evaluate(
     type=int,
     default=15,
     show_default=True,
-    help="Causal queue depth: time steps between prediction and label arrival.",
-)
-@click.option(
-    "--forecasting-horizon",
-    type=int,
-    default=15,
-    show_default=True,
-    help="Forecasting horizon in minutes, used by the clear-sky persistence ensemble.",
+    help="Shared horizon in minutes for both delayed-label queue depth and forecasting offset.",
 )
 @click.option(
     "--ogd-lr",
@@ -803,7 +795,6 @@ def main(
     start_day: str,
     tta_method: str,
     horizon_steps: int,
-    forecasting_horizon: int,
     ogd_lr: float,
     ogd_scope: str,
     ogd_loss: str,
@@ -941,7 +932,6 @@ def main(
         days_to_eval=days_to_eval,
         device=device,
         horizon_steps=horizon_steps,
-        forecasting_horizon=forecasting_horizon,
         ogd_gating=effective_ogd_gating,
         ogd_gating_low=ogd_gating_low,
         ogd_gating_high=ogd_gating_high,
