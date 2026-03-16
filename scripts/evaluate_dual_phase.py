@@ -93,6 +93,37 @@ class OnlineARErrorFilter:
         """Return a copy of current AR coefficients."""
         return self._coeffs.copy()
 
+    def _fit_ar_coeffs(self) -> np.ndarray | None:
+        errors = np.asarray(self._errors, dtype=np.float64)
+        n = len(errors)
+        rows = n - self.order
+        if rows <= 0:
+            return None
+
+        y = errors[self.order :]
+        x_cols = [errors[self.order - lag - 1 : n - lag - 1] for lag in range(self.order)]
+        x = np.stack(x_cols, axis=1)
+
+        xtx = x.T @ x
+        if self.ridge > 0:
+            xtx = xtx + self.ridge * np.eye(self.order, dtype=np.float64)
+        xty = x.T @ y
+
+        try:
+            coeffs = np.linalg.solve(xtx, xty)
+        except np.linalg.LinAlgError:
+            return None
+        return coeffs
+
+    def _forecast_residual_now(self) -> float:
+        # State = [e_{t-1}, e_{t-2}, ..., e_{t-p}]
+        state = [float(self._errors[-lag - 1]) for lag in range(self.order)]
+        forecast = 0.0
+        for _ in range(self.horizon_steps):
+            forecast = float(np.dot(self._coeffs, np.asarray(state, dtype=np.float64)))
+            state = [forecast, *state[:-1]]
+        return forecast
+
 
 class ResidualKNNMemory:
     """Rolling feature-space memory for retrieval-augmented residual correction."""
@@ -129,37 +160,6 @@ class ResidualKNNMemory:
         top_idx = np.argpartition(sims, -k_eff)[-k_eff:]
         top_errors = np.asarray(list(self._errors), dtype=np.float64)[top_idx]
         return float(np.mean(top_errors))
-
-    def _fit_ar_coeffs(self) -> np.ndarray | None:
-        errors = np.asarray(self._errors, dtype=np.float64)
-        n = len(errors)
-        rows = n - self.order
-        if rows <= 0:
-            return None
-
-        y = errors[self.order :]
-        x_cols = [errors[self.order - lag - 1 : n - lag - 1] for lag in range(self.order)]
-        x = np.stack(x_cols, axis=1)
-
-        xtx = x.T @ x
-        if self.ridge > 0:
-            xtx = xtx + self.ridge * np.eye(self.order, dtype=np.float64)
-        xty = x.T @ y
-
-        try:
-            coeffs = np.linalg.solve(xtx, xty)
-        except np.linalg.LinAlgError:
-            return None
-        return coeffs
-
-    def _forecast_residual_now(self) -> float:
-        # State = [e_{t-1}, e_{t-2}, ..., e_{t-p}]
-        state = [float(self._errors[-lag - 1]) for lag in range(self.order)]
-        forecast = 0.0
-        for _ in range(self.horizon_steps):
-            forecast = float(np.dot(self._coeffs, np.asarray(state, dtype=np.float64)))
-            state = [forecast, *state[:-1]]
-        return forecast
 
 
 def _load_clear_sky_lookup(dataset_path: Path) -> dict[str, float]:
@@ -539,6 +539,20 @@ def evaluate(
     help="Path to prepared dataset directory (e.g. data/alpnach_prepared).",
 )
 @click.option(
+    "--num-days",
+    type=int,
+    default=-1,
+    show_default=True,
+    help="Number of days to evaluate. -1 means all available days.",
+)
+@click.option(
+    "--start-day",
+    type=str,
+    default="0101",
+    show_default=True,
+    help="Starting day in MMDD format (e.g. 0101).",
+)
+@click.option(
     "--tta-method",
     type=click.Choice(["memo", "note", "aug_ensemble", "none"], case_sensitive=False),
     default="none",
@@ -616,35 +630,9 @@ def evaluate(
     help="(NOTE) Maximum number of recent samples retained in the persistent buffer.",
 )
 @click.option(
-    "--num-days",
-    type=int,
-    default=-1,
-    show_default=True,
-    help="Number of days to evaluate. -1 means all available days.",
-)
-@click.option(
-    "--start-day",
-    type=str,
-    default="0101",
-    show_default=True,
-    help="Starting day in MMDD format (e.g. 0101).",
-)
-@click.option(
-    "--device",
-    type=str,
-    default="cuda",
-    show_default=True,
-    help="Device to run on ('cuda' or 'cpu').",
-)
-@click.option(
-    "--save-results",
+    "--use-ar-error-filter",
     is_flag=True,
     default=False,
-    help="Save per-day metrics report and predictions CSV to disk.",
-)
-@click.option(
-    "--use-ar-error-filter/--no-ar-error-filter",
-    default=True,
     show_default=True,
     help="Apply delayed-label AR residual filtering on neural predictions.",
 )
@@ -688,7 +676,7 @@ def evaluate(
     type=click.Choice(["none", "raw", "csi"], case_sensitive=False),
     default="none",
     show_default=True,
-    help="Selective OGD updates by delayed error thresholds.",
+    help="Selective OGD updates by delayed error thresholds; 'none' disables gating.",
 )
 @click.option(
     "--ogd-gating-low",
@@ -716,14 +704,14 @@ def evaluate(
     type=int,
     default=0,
     show_default=True,
-    help="Number of initial samples to skip OGD updates (warm-up period).",
+    help="Number of initial delayed samples to skip OGD updates (0 disables warm-up).",
 )
 @click.option(
     "--lr-decay-rate",
     type=float,
     default=0.0,
     show_default=True,
-    help="Learning rate decay rate per decay-steps (0.0 = no decay).",
+    help="Learning rate decay rate per decay-steps (0.0 disables decay).",
 )
 @click.option(
     "--lr-decay-steps",
@@ -733,19 +721,22 @@ def evaluate(
     help="Number of OGD updates between learning rate decay applications.",
 )
 @click.option(
-    "--use-dynamic-ensemble/--no-dynamic-ensemble",
-    default=True,
+    "--use-dynamic-ensemble",
+    is_flag=True,
+    default=False,
     show_default=True,
     help="Use CSI-based variance to dynamically switch between Smart Persistence and Model.",
 )
 @click.option(
-    "--use-adain-feature-norm/--no-adain-feature-norm",
+    "--use-adain-feature-norm",
+    is_flag=True,
     default=False,
     show_default=True,
     help="Enable gradient-free AdaIN feature normalization with clear-sky EMA stats.",
 )
 @click.option(
-    "--use-knn-residual/--no-knn-residual",
+    "--use-knn-residual",
+    is_flag=True,
     default=False,
     show_default=True,
     help="Enable retrieval-augmented residual correction using feature-space k-NN.",
@@ -792,9 +783,24 @@ def evaluate(
     show_default=True,
     help="Upper CSI bound for clear-sky AdaIN stats updates.",
 )
+@click.option(
+    "--device",
+    type=str,
+    default="cuda",
+    show_default=True,
+    help="Device to run on ('cuda' or 'cpu').",
+)
+@click.option(
+    "--save-results",
+    is_flag=True,
+    default=False,
+    help="Save per-day metrics report and predictions CSV to disk.",
+)
 def main(
     checkpoint: Path,
     dataset_path: Path,
+    num_days: int,
+    start_day: str,
     tta_method: str,
     horizon_steps: int,
     forecasting_horizon: int,
@@ -806,10 +812,6 @@ def main(
     n_augmentations: int,
     niter: int,
     note_buffer_size: int,
-    num_days: int,
-    start_day: str,
-    device: str,
-    save_results: bool,
     use_ar_error_filter: bool,
     ar_order: int,
     ar_min_history: int,
@@ -832,6 +834,8 @@ def main(
     adain_ema_decay: float,
     adain_csi_low: float,
     adain_csi_high: float,
+    device: str,
+    save_results: bool,
 ) -> None:
     """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation."""
 
@@ -839,12 +843,14 @@ def main(
         print("CUDA not available, falling back to CPU.")
         device = "cpu"
 
+    effective_ogd_gating = ogd_gating.lower()
+
     dataset_name = dataset_path.name.split("_")[0]
     cal_tag = "arcal" if use_ar_error_filter else "noarcal"
-    gating_tag = f"gate_{ogd_gating}"
+    gating_tag = f"gate_{effective_ogd_gating}"
     method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}_{gating_tag}"
 
-    if ogd_gating_low > ogd_gating_high:
+    if effective_ogd_gating != "none" and ogd_gating_low > ogd_gating_high:
         raise ValueError(f"Invalid OGD gating range: low={ogd_gating_low} > high={ogd_gating_high}.")
 
     # Always load clear sky data (required by the CSI dynamic router)
@@ -912,9 +918,9 @@ def main(
     total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
     print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
     print(f"Total samples: {total_samples}\n")
-    if ogd_gating == "none":
+    if effective_ogd_gating == "none":
         print("OGD gating: disabled (all delayed samples update base model).\n")
-    elif ogd_gating == "raw":
+    elif effective_ogd_gating == "raw":
         print(f"OGD gating: raw absolute error band [{ogd_gating_low}, {ogd_gating_high}] (inclusive).\n")
     else:
         print(
@@ -936,7 +942,7 @@ def main(
         device=device,
         horizon_steps=horizon_steps,
         forecasting_horizon=forecasting_horizon,
-        ogd_gating=ogd_gating,
+        ogd_gating=effective_ogd_gating,
         ogd_gating_low=ogd_gating_low,
         ogd_gating_high=ogd_gating_high,
         clear_sky_lookup=clear_sky_lookup,
@@ -975,7 +981,7 @@ def main(
             f"  ar_order={ar_order}  ar_min_history={ar_min_history}"
             f"  ar_ridge={ar_ridge}  ar_max_abs_correction={ar_max_abs_correction}"
             f"  ar_debug_every={ar_debug_every}"
-            f"  ogd_gating={ogd_gating}"
+            f"  ogd_gating={effective_ogd_gating}"
             f"  ogd_gating_low={ogd_gating_low}  ogd_gating_high={ogd_gating_high}"
             f"  csi_min_clear_sky={csi_min_clear_sky}"
             f"  warmup_samples={warmup_samples}"
