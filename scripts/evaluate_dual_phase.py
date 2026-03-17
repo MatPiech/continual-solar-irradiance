@@ -310,6 +310,8 @@ def evaluate(
         "count": 0,
         "temporal_sum": 0.0,
         "spatial_sum": 0.0,
+        "temporal_norm_sum": 0.0,
+        "spatial_norm_sum": 0.0,
         "combined_sum": 0.0,
         "persistence_dominant": 0,
         "model_dominant": 0,
@@ -450,10 +452,14 @@ def evaluate(
                             cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
 
                         cs_history_tensor = torch.tensor(cs_history_vals, dtype=target.dtype, device=device)
+                        cs_history_tensor = torch.clamp(cs_history_tensor, min=csi_min_clear_sky)
                         recent_csi = irr_history[0, -4:] / cs_history_tensor
+                        # Keep CSI in a physically meaningful range to avoid denominator blow-ups.
+                        recent_csi = torch.clamp(recent_csi, min=0.0, max=2.0)
                         csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
                     else:
-                        csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
+                        # If clear-sky context is not usable, do not mix raw-irradiance variance scale.
+                        csi_var = 0.0
 
                 # 3. Spatial Volatility from all-sky image texture (if selected)
                 if use_spatial_indicator:
@@ -497,6 +503,8 @@ def evaluate(
                 volatility_stats["count"] += 1
                 volatility_stats["temporal_sum"] += float(csi_var)
                 volatility_stats["spatial_sum"] += float(spatial_var)
+                volatility_stats["temporal_norm_sum"] += float(csi_norm)
+                volatility_stats["spatial_norm_sum"] += float(spatial_norm)
                 volatility_stats["combined_sum"] += float(combined_vol)
             else:
                 # Dynamic routing is disabled, so all predictions come from the model path.
@@ -606,11 +614,15 @@ def evaluate(
         n = volatility_stats["count"]
         temporal_avg = volatility_stats["temporal_sum"] / n
         spatial_avg = volatility_stats["spatial_sum"] / n
+        temporal_norm_avg = volatility_stats["temporal_norm_sum"] / n
+        spatial_norm_avg = volatility_stats["spatial_norm_sum"] / n
         combined_avg = volatility_stats["combined_sum"] / n
         print(
             "Fused volatility summary: "
-            f"avg_temporal={temporal_avg:.5f}  "
+            f"avg_temporal_raw={temporal_avg:.5f}  "
             f"avg_spatial_rbr={spatial_avg:.5f}  "
+            f"avg_temporal_norm={temporal_norm_avg:.5f}  "
+            f"avg_spatial_norm={spatial_norm_avg:.5f}  "
             f"avg_combined={combined_avg:.5f}  "
             f"persistence_dominant={volatility_stats['persistence_dominant']}  "
             f"model_dominant={volatility_stats['model_dominant']}",
