@@ -1,8 +1,9 @@
 """Evaluate solar irradiance forecasting with Dual-Phase Online Adaptation.
 
 Runs :class:`~cirr.tta.DualPhaseAdapter` in an online day-by-day loop over a
-prepared dataset. Includes Dynamic Regime-Aware Ensembling using the
-Clear Sky Index (CSI).
+prepared dataset. Includes Dynamic Regime-Aware Ensembling using temporal
+Clear Sky Index (CSI) volatility fused with spatial Red-Blue Ratio (RBR)
+texture volatility.
 """
 
 from collections import deque
@@ -207,6 +208,41 @@ def _is_in_learning_zone(error_value: float, low: float, high: float) -> bool:
     return low <= error_value <= high
 
 
+def _compute_rbr_spatial_variance(
+    image_chw: torch.Tensor,
+    rb_eps: float = 1e-4,
+    min_valid_pixels: int = 64,
+) -> float:
+    """Estimate instantaneous spatial volatility using RBR texture variance.
+
+    Input is a normalized CHW image tensor (ImageNet mean/std) with masked
+    regions set to zeros. The function denormalizes red/blue channels and
+    computes variance of the red/blue ratio over valid sky pixels.
+    """
+    if image_chw.ndim != 3 or image_chw.shape[0] < 3:
+        return 0.0
+
+    # Dataset masking writes exact zeros outside the circular sky region.
+    valid_mask = image_chw.abs().sum(dim=0) > 1e-8
+    if int(valid_mask.sum().item()) < min_valid_pixels:
+        return 0.0
+
+    red = image_chw[0]
+    blue = image_chw[2]
+
+    red_denorm = red * 0.229 + 0.485
+    blue_denorm = blue * 0.225 + 0.406
+
+    red_denorm = torch.clamp(red_denorm, min=0.0)
+    blue_denorm = torch.clamp(blue_denorm, min=0.0)
+
+    rbr = red_denorm / (blue_denorm + rb_eps)
+    rbr_valid = rbr[valid_mask]
+    if rbr_valid.numel() < min_valid_pixels:
+        return 0.0
+    return float(torch.var(rbr_valid, unbiased=False).item())
+
+
 # ---------------------------------------------------------------------------
 # Evaluation loop
 # ---------------------------------------------------------------------------
@@ -234,6 +270,7 @@ def evaluate(
     lr_decay_rate: float,
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
+    dynamic_ensemble_indicator: Literal["temporal", "spatial", "both"],
     use_adain_feature_norm: bool,
     use_knn_residual: bool,
     knn_bank_size: int,
@@ -269,6 +306,14 @@ def evaluate(
     total_samples_processed = 0
     total_predictions_made = 0
     ogd_lr_current = adapter.lr_ogd
+    volatility_stats = {
+        "count": 0,
+        "temporal_sum": 0.0,
+        "spatial_sum": 0.0,
+        "combined_sum": 0.0,
+        "persistence_dominant": 0,
+        "model_dominant": 0,
+    }
 
     print_metrics_header()
 
@@ -367,11 +412,16 @@ def evaluate(
             # Decide routing first so we can skip expensive TTA in Regime 1.
             dyn_weight = 0.0
             smart_persistence_pred = None
+            spatial_var = 0.0
+            csi_var = 0.0
 
             # -----------------------------------------------------------------
-            # DYNAMIC REGIME-AWARE ENSEMBLE (CSI-BASED)
+            # DYNAMIC REGIME-AWARE ENSEMBLE (TEMPORAL + SPATIAL VOLATILITY)
             # -----------------------------------------------------------------
             if use_dynamic_ensemble:
+                use_temporal_indicator = dynamic_ensemble_indicator in ("temporal", "both")
+                use_spatial_indicator = dynamic_ensemble_indicator in ("spatial", "both")
+
                 current_irr_val = irr_history[0, -1].item()
 
                 target_dt = current_dt + pd.Timedelta(minutes=horizon_steps)
@@ -388,43 +438,74 @@ def evaluate(
 
                 smart_persistence_pred = torch.tensor([[smart_persistence_val]], dtype=target.dtype, device=device)
 
-                # 2. Calculate CSI Variance to determine the Weather Regime
-                if current_cs is not None and current_cs > 0:
-                    cs_history_vals = []
-                    # Assuming 4 history steps are [t-15, t-10, t-5, t]
-                    for offset in [15, 10, 5, 0]:
-                        hist_dt = current_dt - pd.Timedelta(minutes=offset)
-                        hist_cs = _resolve_clear_sky_value(clear_sky_lookup, hist_dt.strftime("%Y%m%d_%H%M%S"))
-                        # Fallback to current_cs if a history clear sky value is missing
-                        cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
+                # 2. Temporal Volatility from CSI variance (if selected)
+                if use_temporal_indicator:
+                    if current_cs is not None and current_cs > 0:
+                        cs_history_vals = []
+                        # Assuming 4 history steps are [t-15, t-10, t-5, t]
+                        for offset in [15, 10, 5, 0]:
+                            hist_dt = current_dt - pd.Timedelta(minutes=offset)
+                            hist_cs = _resolve_clear_sky_value(clear_sky_lookup, hist_dt.strftime("%Y%m%d_%H%M%S"))
+                            # Fallback to current_cs if a history clear sky value is missing
+                            cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
 
-                    cs_history_tensor = torch.tensor(cs_history_vals, dtype=target.dtype, device=device)
-                    recent_csi = irr_history[0, -4:] / cs_history_tensor
-                    csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
-                else:
-                    csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
+                        cs_history_tensor = torch.tensor(cs_history_vals, dtype=target.dtype, device=device)
+                        recent_csi = irr_history[0, -4:] / cs_history_tensor
+                        csi_var = torch.var(recent_csi).item() if recent_csi.numel() > 1 else 0.0
+                    else:
+                        csi_var = torch.var(irr_history[0, -4:]).item() if irr_history[0, -4:].numel() > 1 else 0.0
 
-                # 3. Dynamic Router (Blend)
+                # 3. Spatial Volatility from all-sky image texture (if selected)
+                if use_spatial_indicator:
+                    spatial_var = _compute_rbr_spatial_variance(image_input)
+
+                # 4. Dynamic Router (smooth blend via fused max-volatility)
                 csi_flat_threshold = 0.0158
-                # max_csi_var = 0.0876
+                max_csi_var = 0.0876
+                rbr_flat_threshold = 0.0100
+                max_rbr_var = 0.2500
 
-                if csi_var < csi_flat_threshold or target_cs is None or target_cs < csi_min_clear_sky:
-                    # REGIME 1: Stable Weather. Anchor heavily to Smart Persistence.
-                    dyn_weight = 1.0
-                    day_regime1_count += 1
+                csi_denom = max(max_csi_var - csi_flat_threshold, 1e-8)
+                rbr_denom = max(max_rbr_var - rbr_flat_threshold, 1e-8)
+                csi_norm = np.clip((csi_var - csi_flat_threshold) / csi_denom, 0.0, 1.0) if use_temporal_indicator else 0.0
+                spatial_norm = (
+                    np.clip((spatial_var - rbr_flat_threshold) / rbr_denom, 0.0, 1.0) if use_spatial_indicator else 0.0
+                )
+
+                if dynamic_ensemble_indicator == "temporal":
+                    combined_vol = float(csi_norm)
+                elif dynamic_ensemble_indicator == "spatial":
+                    combined_vol = float(spatial_norm)
                 else:
-                    # REGIME 2: Chaotic Weather / Broken Clouds. Trust the Vision Network.
-                    dyn_weight = 0.25
-                    # volatility_factor = max(0.0, min((csi_var - csi_flat_threshold) / (max_csi_var - csi_flat_threshold), 1.0))
-                    # dyn_weight = volatility_factor * 1.0
+                    combined_vol = max(float(csi_norm), float(spatial_norm))
+
+                # Keep existing clear-sky safeguards for routing.
+                if target_cs is None or target_cs < csi_min_clear_sky:
+                    dyn_weight = 1.0
+                else:
+                    # Weight = confidence in persistence path (1.0 -> persistence only).
+                    dyn_weight = 1.0 - (0.75 * combined_vol)
+                    dyn_weight = float(np.clip(dyn_weight, 0.25, 1.0))
+
+                if dyn_weight >= 0.5:
+                    day_regime1_count += 1
+                    volatility_stats["persistence_dominant"] += 1
+                else:
                     day_regime2_count += 1
+                    volatility_stats["model_dominant"] += 1
+
+                volatility_stats["count"] += 1
+                volatility_stats["temporal_sum"] += float(csi_var)
+                volatility_stats["spatial_sum"] += float(spatial_var)
+                volatility_stats["combined_sum"] += float(combined_vol)
             else:
                 # Dynamic routing is disabled, so all predictions come from the model path.
                 day_regime2_count += 1
+                volatility_stats["model_dominant"] += 1
             # -----------------------------------------------------------------
 
-            if use_dynamic_ensemble and dyn_weight == 1.0 and smart_persistence_pred is not None:
-                # Regime 1: serve Smart Persistence directly and avoid TTA compute.
+            if use_dynamic_ensemble and dyn_weight >= 0.999 and smart_persistence_pred is not None:
+                # Persistence-dominant fast path: avoid full TTA compute.
                 mean_raw, _, feature_vec = adapter.predict_base_with_features(
                     images,
                     irr_history,
@@ -433,19 +514,24 @@ def evaluate(
                 )
                 mean = smart_persistence_pred
             else:
-                # Regime 2 (or dynamic routing disabled): run full Dual-Phase prediction.
+                # Full Dual-Phase prediction (or blended output when dynamic routing is on).
                 mean_raw, _, feature_vec = adapter.predict_with_features(
                     images,
                     irr_history,
                     clear_sky_current=current_cs,
                     update_clear_sky_stats=use_adain_feature_norm,
                 )
-                mean = error_filter.apply(mean_raw) if error_filter is not None else mean_raw
+                model_mean = error_filter.apply(mean_raw) if error_filter is not None else mean_raw
 
                 if knn_memory is not None and feature_vec is not None:
                     feat_np = feature_vec.detach().cpu().view(-1).numpy()
                     knn_correction = knn_memory.predict_correction(feat_np)
-                    mean = torch.clamp(mean + knn_correction, min=0.0)
+                    model_mean = torch.clamp(model_mean + knn_correction, min=0.0)
+
+                if use_dynamic_ensemble and smart_persistence_pred is not None:
+                    mean = torch.clamp(dyn_weight * smart_persistence_pred + (1.0 - dyn_weight) * model_mean, min=0.0)
+                else:
+                    mean = model_mean
 
             # Store raw prediction for delayed-label calibrator updates.
             causal_queue[-1]["raw_pred"] = float(mean_raw.detach().cpu().view(-1)[0].item())
@@ -516,6 +602,20 @@ def evaluate(
         )
     if lr_decay_rate > 0:
         print(f"Final OGD learning rate: {ogd_lr_current:.2e}", flush=True)
+    if use_dynamic_ensemble and volatility_stats["count"] > 0:
+        n = volatility_stats["count"]
+        temporal_avg = volatility_stats["temporal_sum"] / n
+        spatial_avg = volatility_stats["spatial_sum"] / n
+        combined_avg = volatility_stats["combined_sum"] / n
+        print(
+            "Fused volatility summary: "
+            f"avg_temporal={temporal_avg:.5f}  "
+            f"avg_spatial_rbr={spatial_avg:.5f}  "
+            f"avg_combined={combined_avg:.5f}  "
+            f"persistence_dominant={volatility_stats['persistence_dominant']}  "
+            f"model_dominant={volatility_stats['model_dominant']}",
+            flush=True,
+        )
     return overall_metrics, per_day_metrics, predictions_data
 
 
@@ -717,7 +817,14 @@ def evaluate(
     is_flag=True,
     default=False,
     show_default=True,
-    help="Use CSI-based variance to dynamically switch between Smart Persistence and Model.",
+    help="Use fused temporal CSI and spatial RBR volatility to blend Smart Persistence and Model.",
+)
+@click.option(
+    "--dynamic-ensemble-indicator",
+    type=click.Choice(["temporal", "spatial", "both"], case_sensitive=False),
+    default="both",
+    show_default=True,
+    help="Indicator used for dynamic ensemble routing: temporal CSI, spatial RBR, or both (max fusion).",
 )
 @click.option(
     "--use-adain-feature-norm",
@@ -725,6 +832,27 @@ def evaluate(
     default=False,
     show_default=True,
     help="Enable gradient-free AdaIN feature normalization with clear-sky EMA stats.",
+)
+@click.option(
+    "--adain-ema-decay",
+    type=click.FloatRange(min=0.0, max=0.9999),
+    default=0.98,
+    show_default=True,
+    help="EMA decay for clear-sky feature statistics.",
+)
+@click.option(
+    "--adain-csi-low",
+    type=float,
+    default=0.85,
+    show_default=True,
+    help="Lower CSI bound for clear-sky AdaIN stats updates.",
+)
+@click.option(
+    "--adain-csi-high",
+    type=float,
+    default=1.15,
+    show_default=True,
+    help="Upper CSI bound for clear-sky AdaIN stats updates.",
 )
 @click.option(
     "--use-knn-residual",
@@ -753,27 +881,6 @@ def evaluate(
     default=300,
     show_default=True,
     help="Minimum memory-bank size before k-NN corrections are applied.",
-)
-@click.option(
-    "--adain-ema-decay",
-    type=click.FloatRange(min=0.0, max=0.9999),
-    default=0.98,
-    show_default=True,
-    help="EMA decay for clear-sky feature statistics.",
-)
-@click.option(
-    "--adain-csi-low",
-    type=float,
-    default=0.85,
-    show_default=True,
-    help="Lower CSI bound for clear-sky AdaIN stats updates.",
-)
-@click.option(
-    "--adain-csi-high",
-    type=float,
-    default=1.15,
-    show_default=True,
-    help="Upper CSI bound for clear-sky AdaIN stats updates.",
 )
 @click.option(
     "--device",
@@ -817,14 +924,15 @@ def main(
     lr_decay_rate: float,
     lr_decay_steps: int,
     use_dynamic_ensemble: bool,
+    dynamic_ensemble_indicator: str,
     use_adain_feature_norm: bool,
+    adain_ema_decay: float,
+    adain_csi_low: float,
+    adain_csi_high: float,
     use_knn_residual: bool,
     knn_bank_size: int,
     knn_k: int,
     knn_min_samples: int,
-    adain_ema_decay: float,
-    adain_csi_low: float,
-    adain_csi_high: float,
     device: str,
     save_results: bool,
 ) -> None:
@@ -835,11 +943,13 @@ def main(
         device = "cpu"
 
     effective_ogd_gating = ogd_gating.lower()
+    effective_dynamic_indicator = dynamic_ensemble_indicator.lower()
 
     dataset_name = dataset_path.name.split("_")[0]
     cal_tag = "arcal" if use_ar_error_filter else "noarcal"
     gating_tag = f"gate_{effective_ogd_gating}"
-    method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}_{gating_tag}"
+    indicator_tag = f"dynind_{effective_dynamic_indicator}"
+    method_tag = f"dual_{tta_method}_{ogd_scope}_{cal_tag}_{gating_tag}_{indicator_tag}"
 
     if effective_ogd_gating != "none" and ogd_gating_low > ogd_gating_high:
         raise ValueError(f"Invalid OGD gating range: low={ogd_gating_low} > high={ogd_gating_high}.")
@@ -919,6 +1029,8 @@ def main(
             f"[{ogd_gating_low}, {ogd_gating_high}] (inclusive), "
             f"min clear sky={csi_min_clear_sky} kW/m^2.\n"
         )
+    if use_dynamic_ensemble:
+        print(f"Dynamic ensemble indicator: {effective_dynamic_indicator}.\n")
 
     # ------------------------------------------------------------------
     # Run evaluation
@@ -947,6 +1059,7 @@ def main(
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,
         use_dynamic_ensemble=use_dynamic_ensemble,
+        dynamic_ensemble_indicator=effective_dynamic_indicator,
         use_adain_feature_norm=use_adain_feature_norm,
         use_knn_residual=use_knn_residual,
         knn_bank_size=knn_bank_size,
@@ -977,6 +1090,7 @@ def main(
             f"  warmup_samples={warmup_samples}"
             f"  lr_decay_rate={lr_decay_rate}  lr_decay_steps={lr_decay_steps}"
             f"  use_dynamic_ensemble={use_dynamic_ensemble}"
+            f"  dynamic_ensemble_indicator={effective_dynamic_indicator}"
             f"  use_adain_feature_norm={use_adain_feature_norm}"
             f"  use_knn_residual={use_knn_residual}"
             f"  knn_bank_size={knn_bank_size}  knn_k={knn_k}  knn_min_samples={knn_min_samples}"
