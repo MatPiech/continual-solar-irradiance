@@ -25,6 +25,7 @@ compounds into catastrophic forgetting.
 
 Algorithms
 ----------
+    static    Inference only — no training, no aggregation.
   isolated  No federation — lower bound, proves source degrades and targets lag.
   fedavg    Standard FedAvg: average all weights every sync interval.
   fedbn     Aggregate all layers *except* BatchNorm statistics, preserving
@@ -47,10 +48,10 @@ Usage
       --source-dataset data/folsom_prepared \\
       --target-dataset data/karpicko_prepared \\
       --target-dataset data/poznan_prepared \\
-      --algorithm fedbn \\
+      --algorithm static \
       --sync-interval 7 \\
       --num-days 90 \\
-      --save-results results/fedbn_7day
+    --save-results results/static_7day
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -645,6 +646,7 @@ def _process_client_day(
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
     extract_prototypes: bool = False,
+    train: bool = True,
 ) -> dict[str, Any]:
     """Process prediction + training for one client on one day.
 
@@ -667,46 +669,48 @@ def _process_client_day(
         )
         metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
 
-        # Step 2: Prepare replay samples
-        _reservoir_entries: list[tuple[Any, int]] = []
-        if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
-            _n = max(0, int(round(len(day_indices) * replay_ratio)))
-            _reservoir_entries = sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
-        _recent_entries: list[tuple[Any, int]] = []
-        if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
-            _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
-            _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
-        _replay = (_reservoir_entries + _recent_entries) or None
+        loss = 0.0
+        if train:
+            # Step 2: Prepare replay samples
+            _reservoir_entries: list[tuple[Any, int]] = []
+            if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
+                _n = max(0, int(round(len(day_indices) * replay_ratio)))
+                _reservoir_entries = sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
+            _recent_entries: list[tuple[Any, int]] = []
+            if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+                _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
+                _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
+            _replay = (_reservoir_entries + _recent_entries) or None
 
-        # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
-        loss = _train_day(
-            model,
-            dataset,
-            day_indices,
-            lr=adapt_lr,
-            weight_decay=adapt_weight_decay,
-            max_grad_norm=adapt_max_grad_norm,
-            batch_size=adapt_batch_size,
-            epochs=adapt_epochs,
-            device=device,
-            replay_entries=_replay,
-            global_state_dict=global_state_dict,
-            mu=prox_mu,
-            rng_seed=rng_seed,
-            day_samples=day_samples,
-            client_name=name,
-            global_prototypes=global_prototypes,
-            proto_lambda=proto_lambda,
-        )
+            # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
+            loss = _train_day(
+                model,
+                dataset,
+                day_indices,
+                lr=adapt_lr,
+                weight_decay=adapt_weight_decay,
+                max_grad_norm=adapt_max_grad_norm,
+                batch_size=adapt_batch_size,
+                epochs=adapt_epochs,
+                device=device,
+                replay_entries=_replay,
+                global_state_dict=global_state_dict,
+                mu=prox_mu,
+                rng_seed=rng_seed,
+                day_samples=day_samples,
+                client_name=name,
+                global_prototypes=global_prototypes,
+                proto_lambda=proto_lambda,
+            )
 
         # Step 4: Extract per-class prototypes (FedProto — after training
         # so features reflect the updated model)
         day_protos: dict[int, tuple[torch.Tensor, int]] = {}
-        if extract_prototypes and day_samples:
+        if train and extract_prototypes and day_samples:
             day_protos = _extract_day_prototypes(model, day_samples, device, adapt_batch_size)
 
         # Step 5: Update recent FIFO buffer
-        if recent_buffer_size > 0:
+        if train and recent_buffer_size > 0:
             recent_buffer.add_day(dataset, day_indices)
 
     if stream is not None:
@@ -880,8 +884,10 @@ def run_fl_benchmark(
         raise ValueError("At least two clients are required.")
 
     algorithm = algorithm.lower()
-    if algorithm not in ("isolated", *AGGREGATION_FNS.keys()):
-        raise ValueError(f"Unknown algorithm '{algorithm}'. Choose from: isolated, {', '.join(AGGREGATION_FNS)}")
+    if algorithm not in ("static", "isolated", *AGGREGATION_FNS.keys()):
+        raise ValueError(f"Unknown algorithm '{algorithm}'. Choose from: static, isolated, {', '.join(AGGREGATION_FNS)}")
+
+    is_static = algorithm == "static"
 
     client_names = [name for name, _ in clients]
 
@@ -1093,6 +1099,7 @@ def run_fl_benchmark(
                 else None,
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
                 "extract_prototypes": _is_fedproto and not in_warmup,
+                "train": not is_static,
             }
             for i in range(len(clients))
         ]
@@ -1178,7 +1185,7 @@ def run_fl_benchmark(
         #   - forced round immediately after warmup ends
         #   - periodic round every sync_interval days (post-warmup)
         # ---------------------------------------------------------------
-        _do_aggregate = algorithm != "isolated" and (warmup_ended_today or days_since_sync >= sync_interval)
+        _do_aggregate = not is_static and algorithm != "isolated" and (warmup_ended_today or days_since_sync >= sync_interval)
         if warmup_ended_today and not in_warmup:
             # Reset counter so the next periodic sync starts fresh
             days_since_sync = 0
@@ -1413,12 +1420,13 @@ def run_fl_benchmark(
 @click.option(
     "--algorithm",
     type=click.Choice(
-        ["isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto"], case_sensitive=False
+        ["static", "isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto"], case_sensitive=False
     ),
     default="fedbn",
     show_default=True,
     help=(
         "FL aggregation algorithm.\n"
+        "  static   — inference only (no training, no aggregation).\n"
         "  isolated — no federation (lower bound).\n"
         "  fedavg   — standard weight averaging.\n"
         "  fedbn    — FedAvg excluding BatchNorm layers.\n"
