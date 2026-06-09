@@ -1,5 +1,5 @@
 #!/bin/bash
-# FL Benchmark — run all five algorithms across a configurable list of datasets.
+# FL Benchmark — run selected algorithms across a configurable list of datasets.
 #
 # Usage:
 #   bash scripts/bash_scripts/run_fl_benchmark.sh [SYNC_INTERVAL] [NUM_DAYS] [DATASET ...]
@@ -35,6 +35,7 @@ fi
 
 # FL algorithms to run for every dataset pair (comment out any you want to skip).
 ALGORITHMS=(
+    # static    # inference-only baseline — no training, no aggregation
     # isolated   # lower bound — no federation
     # fedavg     # standard weight averaging
     # fedbn      # FedAvg, BatchNorm layers kept local
