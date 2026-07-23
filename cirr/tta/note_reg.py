@@ -47,28 +47,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-# ---------------------------------------------------------------------------
-# Variance-minimisation loss  (shared objective with MEMO-Reg)
-# ---------------------------------------------------------------------------
-
-
-def prediction_variance_loss(predictions: torch.Tensor) -> torch.Tensor:
-    """Mean prediction variance across a batch.
-
-    Parameters
-    ----------
-    predictions : torch.Tensor
-        Shape ``[N, 1]`` or ``[N]``.
-
-    Returns
-    -------
-    torch.Tensor
-        Scalar variance loss.
-    """
-    preds = predictions.squeeze(-1)  # [N]
-    mean_pred = preds.mean()
-    return ((preds - mean_pred) ** 2).mean()
-
+from cirr.tta.common import prediction_variance_loss, select_adapt_params
 
 # ---------------------------------------------------------------------------
 # NOTE-Reg
@@ -150,7 +129,7 @@ class NOTEReg(nn.Module):
         self.configure_model()
 
         # Optimizer (created after configure_model sets requires_grad)
-        self.optimizer = torch.optim.Adam(_get_params(model, adapt_mode), lr=lr, weight_decay=weight_decay)
+        self.optimizer = torch.optim.Adam(select_adapt_params(model, adapt_mode), lr=lr, weight_decay=weight_decay)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -213,7 +192,7 @@ class NOTEReg(nn.Module):
         self._buffer_images.clear()
         self._buffer_histories.clear()
         self._sample_count = 0
-        params = _get_params(self.model, self.adapt_mode)
+        params = select_adapt_params(self.model, self.adapt_mode)
         self.optimizer = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
         self.configure_model()
 
@@ -305,20 +284,3 @@ class NOTEReg(nn.Module):
             f"bn_momentum={self.bn_momentum}, "
             f"buffer_size={len(self._buffer_images)}/{self.update_every_x})"
         )
-
-
-# ---------------------------------------------------------------------------
-# Helper: select parameters for the optimizer
-# ---------------------------------------------------------------------------
-
-
-def _get_params(model: nn.Module, adapt_mode: str) -> list[nn.Parameter]:
-    """Return the list of parameters to optimise."""
-    if adapt_mode == "bn_only":
-        params: list[nn.Parameter] = []
-        for m in model.modules():
-            if isinstance(m, nn.BatchNorm2d | nn.BatchNorm1d) and m.affine:
-                params.extend([m.weight, m.bias])
-        return params
-    else:
-        return list(model.parameters())

@@ -50,7 +50,7 @@ CHECKPOINT="checkpoints/epoch_024.ckpt"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
 # minimal so that FL aggregation does the heavy lifting).
-WARMUP_DAYS=30
+WARMUP_DAYS=0
 WARMUP_CACHE_DIR="warmup_cache"
 ADAPT_LR=1e-5
 ADAPT_WEIGHT_DECAY=1e-4

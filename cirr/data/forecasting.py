@@ -6,7 +6,8 @@ from lightning import LightningDataModule
 import numpy as np
 import torch.utils.data
 
-from cirr.datamodules.datasets import SkyImageDataset
+from cirr.data.datasets import SkyImageDataset
+from cirr.physics.clear_sky import load_clear_sky_lookup
 
 
 class ForecastingDataModule(LightningDataModule):
@@ -21,6 +22,7 @@ class ForecastingDataModule(LightningDataModule):
         batch_size: int,
         workers: int,
         seed: int,
+        optical_flow: str = "none",
     ):
         super().__init__()
 
@@ -34,6 +36,8 @@ class ForecastingDataModule(LightningDataModule):
         self._batch_size = batch_size
         self._workers = workers
         self._seed = seed
+        self._optical_flow = optical_flow
+        self._clear_sky_lookup = load_clear_sky_lookup(self._data_root)
 
         dataset_name_lower = self._dataset_name.lower()
         if any(name in dataset_name_lower for name in ("folsom", "modena", "poznan", "karpicko")):
@@ -96,30 +100,38 @@ class ForecastingDataModule(LightningDataModule):
             val_periods = []
             train_periods = []
 
+        ds_kwargs = {
+            "data_root": self._data_root,
+            "image_size": self._image_size,
+            "image_mean": self._image_mean,
+            "image_std": self._image_std,
+            "clear_sky_lookup": self._clear_sky_lookup,
+            "optical_flow": self._optical_flow,
+        }
+
         self._train_dataset = SkyImageDataset(
-            data_root=self._data_root,
             periods=train_periods,
             transforms=self._augmentations if self._augment else self._transforms,
-            image_size=self._image_size,
-            image_mean=self._image_mean,
-            image_std=self._image_std,
+            **ds_kwargs,
         )
         self._val_dataset = SkyImageDataset(
-            data_root=self._data_root,
             periods=val_periods,
             transforms=self._transforms,
-            image_size=self._image_size,
-            image_mean=self._image_mean,
-            image_std=self._image_std,
+            **ds_kwargs,
         )
         self._test_dataset = SkyImageDataset(
-            data_root=self._data_root,
             periods=test_periods,
             transforms=self._transforms,
-            image_size=self._image_size,
-            image_mean=self._image_mean,
-            image_std=self._image_std,
+            **ds_kwargs,
         )
+
+    @property
+    def train_dataset(self) -> SkyImageDataset:
+        return self._train_dataset
+
+    @property
+    def test_dataset(self) -> SkyImageDataset:
+        return self._test_dataset
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(

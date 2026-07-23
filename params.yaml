@@ -34,7 +34,6 @@ train_forecaster:
   #### MODEL ####
   model:
     model_name: timm-resnet50
-    channels: 3
     pretrained: True
     compile: False
     loss_function: Berhu
@@ -60,6 +59,7 @@ train_forecaster:
 
   #### DATA ####
   datamodule:
+    optical_flow: none  # none | farneback
     augment: True
     image_size: [ 128, 128 ]
     image_mean: [ 0.485, 0.456, 0.406 ]

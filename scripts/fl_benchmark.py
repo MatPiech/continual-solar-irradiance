@@ -61,20 +61,26 @@ import hashlib
 import json
 from pathlib import Path
 import random
-import sys
 from typing import Any
 
 import click
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from tqdm import tqdm
 
-from cirr.datamodules.loading import load_dataset
-from cirr.fl.server import AGGREGATION_FNS, _is_bn_key, _is_head_key
+from cirr.continual import build_gated_thresholds, train_gated_day
+from cirr.data.loading import load_dataset
+from cirr.fl.kc_prototypes import (
+    PROTO_CLASS_NAMES,
+    aggregate_global_prototypes,
+    extract_day_prototypes,
+)
+from cirr.fl.prototypes import accumulate_prototypes, aggregate_prototypes, extract_prototypes
+from cirr.fl.server import AGGREGATION_FNS, is_bn_key, is_head_key
+from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.training.day_loop import predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
@@ -83,212 +89,6 @@ from cirr.utils.metrics import compute_metrics
 # Data helpers
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# FedProto: kc-stratified prototype classes
-# ---------------------------------------------------------------------------
-# Weather conditions are classified from normalised target irradiance
-# (target_irradiance / 1000).  These thresholds approximate the clearness
-# index (kc) bins commonly used in solar forecasting literature.
-PROTO_OVERCAST = 0  # heavy cloud cover
-PROTO_TRANSIENT = 1  # variable / partly cloudy
-PROTO_CLEAR = 2  # clear or mostly clear sky
-PROTO_CLASS_NAMES = {PROTO_OVERCAST: "overcast", PROTO_TRANSIENT: "transient", PROTO_CLEAR: "clear"}
-
-_KC_OVERCAST_THRESHOLD = 0.15  # norm irradiance < 150 W/m²
-_KC_CLEAR_THRESHOLD = 0.50  # norm irradiance >= 500 W/m²
-
-
-def _classify_irradiance(norm_irradiance: float) -> int:
-    """Classify a normalised irradiance value into a prototype weather class.
-
-    Parameters
-    ----------
-    norm_irradiance : float
-        Target irradiance normalised to [0, 1] (i.e. target / 1000 W/m²).
-
-    Returns
-    -------
-    class_idx : int
-        One of ``PROTO_OVERCAST``, ``PROTO_TRANSIENT``, ``PROTO_CLEAR``.
-    """
-    if norm_irradiance < _KC_OVERCAST_THRESHOLD:
-        return PROTO_OVERCAST
-    elif norm_irradiance < _KC_CLEAR_THRESHOLD:
-        return PROTO_TRANSIENT
-    else:
-        return PROTO_CLEAR
-
-
-def _extract_day_prototypes(
-    model: Forecaster,
-    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    device: str,
-    batch_size: int,
-) -> dict[int, tuple[torch.Tensor, int]]:
-    """Extract per-class prototype feature vectors from a day's samples.
-
-    Passes samples through the image encoder and accumulates feature sums
-    per weather class (Clear, Overcast, Transient).
-
-    Parameters
-    ----------
-    model : Forecaster
-        Model whose ``image_encoder`` produces the feature vectors.
-    day_samples : list
-        Pre-loaded ``(image, irr_hist, target)`` tensor tuples.
-    device : str
-        Compute device.
-    batch_size : int
-        Batch size for feature extraction.
-
-    Returns
-    -------
-    prototypes : dict[int, tuple[Tensor, int]]
-        Mapping from class index to ``(sum_of_features, sample_count)``.
-        Feature sums are on CPU.
-    """
-    if not day_samples:
-        return {}
-
-    model.eval()
-    proto_sums: dict[int, torch.Tensor] = {}
-    proto_counts: dict[int, int] = {}
-
-    with torch.no_grad():
-        for start in range(0, len(day_samples), batch_size):
-            batch = day_samples[start : start + batch_size]
-            imgs = torch.stack([s[0] for s in batch]).to(device)
-            tgts = [s[2] for s in batch]
-
-            # Use extract_proto_features so EfficientViT prototypes come from
-            # stages[3] (deep attention) rather than the full encoder head.
-            # For ResNet this falls back to the full image_encoder output.
-            features = model.extract_proto_features(imgs)  # [B, proto_dim]
-
-            for b in range(len(batch)):
-                tgt_val = tgts[b].item() if isinstance(tgts[b], torch.Tensor) else float(tgts[b])
-                cls = _classify_irradiance(tgt_val)
-                feat = features[b].cpu()
-
-                if cls not in proto_sums:
-                    proto_sums[cls] = torch.zeros_like(feat)
-                    proto_counts[cls] = 0
-                proto_sums[cls] += feat
-                proto_counts[cls] += 1
-
-    return {cls: (proto_sums[cls], proto_counts[cls]) for cls in proto_sums}
-
-
-def _accumulate_prototypes(
-    accum: dict[int, tuple[torch.Tensor, int]],
-    day_protos: dict[int, tuple[torch.Tensor, int]],
-) -> dict[int, tuple[torch.Tensor, int]]:
-    """Merge *day_protos* into running accumulator *accum* (in-place).
-
-    Returns the modified *accum* for convenience.
-    """
-    for cls, (feat_sum, count) in day_protos.items():
-        if cls in accum:
-            old_sum, old_count = accum[cls]
-            accum[cls] = (old_sum + feat_sum, old_count + count)
-        else:
-            accum[cls] = (feat_sum.clone(), count)
-    return accum
-
-
-def _aggregate_global_prototypes(
-    client_protos: list[dict[int, tuple[torch.Tensor, int]]],
-) -> tuple[list[dict[int, torch.Tensor]], dict[int, list[list[float]]]]:
-    """Attention-weighted prototype aggregation (per-client personalised).
-
-    Instead of a single count-weighted average, each client receives a
-    *personalised* global prototype for every weather class.  The
-    personalisation is driven by **cosine similarity** between the
-    client's own mean prototype and every other client's mean prototype
-    for the same class.
-
-    For a given class *c* and target client *i*:
-
-    .. math::
-
-       w_{ij}^{(c)} = \frac{\\exp(\text{sim}(p_i^c, p_j^c) / \tau)}
-                           {\\sum_k \\exp(\text{sim}(p_i^c, p_k^c) / \tau)}
-
-       \\hat{p}_i^c = \\sum_j w_{ij}^{(c)} \\, p_j^c
-
-    where *τ = 0.5* is a temperature parameter that sharpens the
-    attention distribution (lower → more peaked toward similar clients).
-
-    This creates implicit topological clusters: Alpine sites like Alpnach
-    and Bern2 attend strongly to each other while down-weighting flat-
-    terrain sites like Karpicko, and vice versa.
-
-    Parameters
-    ----------
-    client_protos : list[dict[int, tuple[Tensor, int]]]
-        Per-client accumulated prototypes: class → ``(sum_features, count)``.
-
-    Returns
-    -------
-    per_client_protos : list[dict[int, Tensor]]
-        Personalised global prototypes for each client.
-    attention_weights : dict[int, list[list[float]]]
-        Per-class attention matrix (N_clients x N_clients) for logging.
-        ``attention_weights[cls][i][j]`` is the weight client *i* assigns
-        to client *j* for class *cls*.
-    """
-    n_clients = len(client_protos)
-    tau = 0.5  # temperature — lower = sharper attention
-
-    # Step 1: compute per-client mean prototypes for each class
-    client_means: list[dict[int, torch.Tensor]] = []
-    for cp in client_protos:
-        means: dict[int, torch.Tensor] = {}
-        for cls, (feat_sum, count) in cp.items():
-            if count > 0:
-                means[cls] = feat_sum / count
-        client_means.append(means)
-
-    per_client_protos: list[dict[int, torch.Tensor]] = [{} for _ in range(n_clients)]
-    attention_weights: dict[int, list[list[float]]] = {}
-
-    for cls in (PROTO_OVERCAST, PROTO_TRANSIENT, PROTO_CLEAR):
-        # Gather which clients have this class
-        present = [i for i in range(n_clients) if cls in client_means[i]]
-        if not present:
-            continue
-
-        if len(present) == 1:
-            # Only one client has this class — no cross-client attention
-            i = present[0]
-            per_client_protos[i][cls] = client_means[i][cls]
-            attention_weights[cls] = [[0.0] * n_clients for _ in range(n_clients)]
-            attention_weights[cls][i][i] = 1.0
-            continue
-
-        # Stack mean prototypes: (K, D) where K = len(present)
-        proto_stack = torch.stack([client_means[i][cls] for i in present])  # (K, D)
-        # Cosine similarity matrix: (K, K)
-        norms = proto_stack.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        normed = proto_stack / norms
-        sim_matrix = normed @ normed.T  # (K, K)
-
-        # Softmax attention with temperature
-        attn = torch.softmax(sim_matrix / tau, dim=1)  # (K, K)
-
-        # Weighted prototypes: each present client gets a personalised average
-        weighted = attn @ proto_stack  # (K, D)
-
-        # Build full N_clients x N_clients attention matrix for logging
-        cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]
-        for ki, i in enumerate(present):
-            per_client_protos[i][cls] = weighted[ki]
-            for kj, j in enumerate(present):
-                cls_attn[i][j] = attn[ki, kj].item()
-        attention_weights[cls] = cls_attn
-
-    return per_client_protos, attention_weights
-
 
 def _load_checkpoint(checkpoint_path: Path, device: str, freeze_early_backbone: bool = False) -> Forecaster:
     """Instantiate a Forecaster and load weights from *checkpoint_path*."""
@@ -296,284 +96,6 @@ def _load_checkpoint(checkpoint_path: Path, device: str, freeze_early_backbone: 
     if freeze_early_backbone:
         model.freeze_early_backbone()
     return model
-
-
-# ---------------------------------------------------------------------------
-# Per-day inference / training
-# ---------------------------------------------------------------------------
-
-
-def _predict_day(
-    model: Forecaster,
-    dataset: Any,
-    day_indices: list[int],
-    device: str,
-    batch_size: int,
-    client_name: str = "",
-) -> tuple[np.ndarray, np.ndarray, list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-    """Run batched inference for every sample in *day_indices*.
-
-    Returns
-    -------
-    predictions  : np.ndarray, shape (N,)
-    targets      : np.ndarray, shape (N,)
-    day_samples  : list of (image, irr_hist, target) tensor tuples on CPU,
-                   one per sample — reusable by ``_train_day`` to avoid
-                   redundant dataset loads.
-    """
-    if not day_indices:
-        return np.array([]), np.array([]), []
-
-    model.eval()
-    preds, tgts = [], []
-    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    with torch.no_grad():
-        _pbar = tqdm(
-            total=len(day_indices),
-            desc=f"  [{client_name}] load+infer",
-            leave=False,
-            unit="smp",
-            file=sys.stdout,
-            dynamic_ncols=True,
-        )
-        for start in range(0, len(day_indices), batch_size):
-            batch_idx = day_indices[start : start + batch_size]
-            imgs, hists, targets = [], [], []
-            for idx in batch_idx:
-                images, irr_hist, target, _ = dataset[idx]
-                imgs.append(images)
-                hists.append(irr_hist)
-                if not isinstance(target, torch.Tensor):
-                    target = torch.tensor(target)
-                targets.append(target)
-                # Cache each sample as-is (already on CPU)
-                day_samples.append((images, irr_hist, target))
-                _pbar.update(1)
-            imgs_t = torch.stack(imgs).to(device)
-            hists_t = torch.stack(hists).to(device)
-            mean, _ = model(imgs_t, hists_t)
-            preds.append(mean.cpu().numpy().ravel())
-            tgts.extend(t.item() for t in targets)
-        _pbar.close()
-    return (
-        np.concatenate(preds) if preds else np.array([]),
-        np.array(tgts),
-        day_samples,
-    )
-
-
-def _train_day(
-    model: Forecaster,
-    dataset: Any,
-    day_indices: list[int],
-    lr: float,
-    weight_decay: float,
-    max_grad_norm: float,
-    batch_size: int,
-    epochs: int,
-    device: str,
-    replay_entries: list[tuple[Any, int]] | None = None,
-    global_state_dict: dict[str, Any] | None = None,
-    mu: float = 0.0,
-    rng_seed: int | None = None,
-    day_samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
-    client_name: str = "",
-    global_prototypes: dict[int, torch.Tensor] | None = None,
-    proto_lambda: float = 0.0,
-) -> float:
-    """Train *model* for *epochs* epochs on *day_indices*.
-
-    *replay_entries* is a pre-sampled list of ``(dataset, index)`` pairs
-    (assembled by the caller via ``sample_replay_for_day()``) that is
-    concatenated with the current-day samples before batching — matching
-    the design of ``train_on_day`` in ``local_training.py``.
-    The pool is reshuffled at the start of every epoch.
-
-    Parameters
-    ----------
-    global_state_dict : dict, optional
-        Reference weights for the proximal term (FedProx / Ditto).  When
-        provided together with ``mu > 0``, the loss is augmented with
-        ``(μ/2) ‖w - w_global‖²``.
-    mu : float
-        Proximal regularisation strength.  0 disables the proximal term.
-    day_samples : list, optional
-        Pre-loaded (image, irr_hist, target) tensor tuples from
-        ``_predict_day()``.  Avoids redundant dataset reads.
-    global_prototypes : dict, optional
-        FedProto global prototypes: mapping from weather class index
-        (``PROTO_OVERCAST``, ``PROTO_TRANSIENT``, ``PROTO_CLEAR``) to a
-        mean feature-vector tensor.  When provided together with
-        ``proto_lambda > 0``, the loss is augmented with a prototype
-        regularisation term that pulls local feature representations
-        toward the global consensus.
-    proto_lambda : float
-        Prototype regularisation strength for FedProto (relative weight).
-        The prototype MSE term is adaptively scaled to match the task-loss
-        magnitude, so ``proto_lambda`` acts as a *relative* contribution:
-        0.1 means the prototype term contributes ~10 % of the task loss.
-        0 disables the prototype term.
-
-    Returns
-    -------
-    avg_loss : float
-    """
-    if not day_indices:
-        return 0.0
-
-    # Build the training pool.  When day_samples is available we already have
-    # the tensors; replay entries are also materialised to the same format
-    # so the entire pool is homogeneous (img, hist, tgt) tensor tuples.
-    if day_samples is not None:
-        preloaded_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = list(day_samples)
-        if replay_entries:
-            for ds, idx in tqdm(
-                replay_entries,
-                desc=f"  [{client_name}] load replay",
-                leave=False,
-                unit="smp",
-                file=sys.stdout,
-                dynamic_ncols=True,
-            ):
-                img, hist, tgt, _ = ds[idx]
-                if not isinstance(tgt, torch.Tensor):
-                    tgt = torch.tensor(tgt)
-                preloaded_pool.append((img, hist, tgt))
-        pool_base: list = preloaded_pool
-        _preloaded = True
-    else:
-        current_ds: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
-        pool_base = current_ds + (replay_entries or [])
-        _preloaded = False
-
-    model.train()
-
-    # Pre-compute detached reference tensors for proximal regularisation
-    # (FedProx: μ/2 · ‖w - w_global‖²,  Ditto: λ/2 · ‖v - w_global‖²)
-    _prox_ref: dict[str, torch.Tensor] | None = None
-    if mu > 0.0 and global_state_dict is not None:
-        _prox_ref = {k: v.detach().to(device) for k, v in global_state_dict.items() if v.is_floating_point()}
-
-    # Pre-move global prototypes to device for FedProto regularisation
-    _use_proto = global_prototypes is not None and proto_lambda > 0.0
-    _proto_on_device: dict[int, torch.Tensor] = {}
-    if _use_proto:
-        _proto_on_device = {cls: proto.detach().to(device) for cls, proto in global_prototypes.items()}
-
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
-
-    total_loss = 0.0
-    count = 0
-    _rng = random.Random(rng_seed)
-
-    for ep in range(epochs):
-        # Reshuffle the fixed pool each epoch (replay+current already sized by caller)
-        pool = list(pool_base)
-        _rng.shuffle(pool)
-        batches = [pool[i : i + batch_size] for i in range(0, len(pool), batch_size)]
-
-        _pbar = tqdm(
-            batches,
-            desc=f"  [{client_name}] train e{ep+1}/{epochs}",
-            leave=False,
-            unit="batch",
-            file=sys.stdout,
-            dynamic_ncols=True,
-        )
-        for batch in _pbar:
-            if _preloaded:
-                # Pool entries are (img, hist, target) tensor tuples
-                imgs = torch.stack([item[0] for item in batch]).to(device)
-                hist = torch.stack([item[1] for item in batch]).to(device)
-                tgts = torch.stack([item[2] for item in batch]).to(device)
-            else:
-                # Pool entries are (dataset, idx) tuples; load from dataset
-                imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)  # type: ignore
-                hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)  # type: ignore
-                tgts = torch.stack([ds[idx][2] for ds, idx in batch]).to(device)  # type: ignore
-
-            optimizer.zero_grad()
-
-            # Forward pass — use forward_with_features when prototype
-            # regularisation is active to get intermediate encoder features
-            # in a single pass (no redundant encoder computation).
-            if _use_proto:
-                mean, var, img_feats = model.forward_with_features(imgs, hist)
-            else:
-                mean, var = model(imgs, hist)
-
-            if var is not None:
-                loss = model.loss_fn(mean, tgts, var)
-            elif model.loss_name == "Berhu":
-                loss = model.loss_fn(mean * 1000, tgts * 1000)
-            else:
-                loss = model.loss_fn(mean, tgts)
-
-            # Proximal term: (μ/2) · ‖w - w_global‖²  (FedProx / Ditto)
-            if _prox_ref is not None:
-                prox = sum(
-                    ((p - _prox_ref[n]) ** 2).sum() for n, p in model.named_parameters() if p.requires_grad and n in _prox_ref
-                )
-                loss = loss + (mu / 2.0) * prox
-
-            # Prototype regularisation (adaptively scaled):
-            #   loss += λ_rel · |L_task| · mean(‖f(x) - proto[class(x)]‖²) / (mean(‖…‖²) + ε)
-            # The BerHu task loss can range from single digits to millions
-            # (because it operates on ×1000 W/m² predictions), while prototype
-            # MSE on 2048-dim feature vectors is typically single digits.
-            # A fixed λ cannot balance both scales, so we adaptively scale
-            # the prototype term relative to the task loss magnitude.  This
-            # makes proto_lambda a *relative* weight: 0.1 ≈ proto contributes
-            # 10 % of the task-loss magnitude to the total gradient.
-            if _use_proto:
-                proto_loss = torch.tensor(0.0, device=device)
-                n_proto = 0
-                for b in range(imgs.size(0)):
-                    tgt_val = tgts[b].item()
-                    cls = _classify_irradiance(tgt_val)
-                    if cls in _proto_on_device:
-                        proto_loss = proto_loss + F.mse_loss(img_feats[b], _proto_on_device[cls])
-                        n_proto += 1
-                if n_proto > 0:
-                    avg_proto = proto_loss / n_proto
-                    # Adaptive scale: ratio of task-loss to proto-loss (both
-                    # detached so the scaling factor is treated as a constant
-                    # and gradients flow only through avg_proto).
-                    _task_loss_val = loss.detach()
-                    scale = _task_loss_val / (avg_proto.detach() + 1e-8)
-                    _proto_contrib = proto_lambda * scale * avg_proto
-                    loss = loss + _proto_contrib
-
-                    # Log loss components once per epoch (first batch only)
-                    # if count % len(batches) == 0:
-                    #     print(
-                    #         f"  {'':6}      [proto] {client_name} e{ep+1}  "
-                    #         f"task={_task_loss_val.item():.5f}  "
-                    #         f"proto_raw={avg_proto.item():.5f}  "
-                    #         f"scale={scale.item():.2f}  "
-                    #         f"proto_scaled={_proto_contrib.item():.5f}  "
-                    #         f"total={loss.item():.5f}  "
-                    #         f"λ={proto_lambda}  n={n_proto}/{imgs.size(0)}",
-                    #     )
-
-            loss.backward()
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-
-            total_loss += loss.item()
-            count += 1
-
-    return total_loss / count if count > 0 else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Folsom replay buffer — static buffer sampled from Folsom training distribution
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +169,11 @@ def _process_client_day(
     proto_lambda: float = 0.0,
     extract_prototypes: bool = False,
     train: bool = True,
+    gated: bool = False,
+    gate_prototypes: dict[int, torch.Tensor] | None = None,
+    gate_thresholds: dict[int, dict[str, float]] | None = None,
+    gate_optimizer: torch.optim.Optimizer | None = None,
+    gate_loss_fn: torch.nn.Module | None = None,
 ) -> dict[str, Any]:
     """Process prediction + training for one client on one day.
 
@@ -664,50 +191,64 @@ def _process_client_day(
 
     with ctx:
         # Step 1: Predict (also caches per-sample tensors for training)
-        preds, tgts, day_samples = _predict_day(
+        preds, tgts, day_samples = predict_day(
             infer_model, dataset, day_indices, device, batch_size=adapt_batch_size, client_name=name
         )
         metrics = compute_metrics(preds, tgts) if len(preds) > 0 else {}
 
         loss = 0.0
+        gate_stats: dict[str, int | float] = {}
         if train:
-            # Step 2: Prepare replay samples
-            _reservoir_entries: list[tuple[Any, int]] = []
-            if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
-                _n = max(0, int(round(len(day_indices) * replay_ratio)))
-                _reservoir_entries = sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
-            _recent_entries: list[tuple[Any, int]] = []
-            if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
-                _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
-                _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
-            _replay = (_reservoir_entries + _recent_entries) or None
+            if gated and gate_optimizer is not None and gate_prototypes is not None:
+                gate_stats = train_gated_day(
+                    model,
+                    dataset,
+                    day_indices,
+                    device,
+                    gate_optimizer,
+                    gate_loss_fn or BerHuLoss(threshold=30, scale=1000),
+                    gate_prototypes,
+                    gate_thresholds or {},
+                )
+                loss = float(gate_stats.get("backprop", 0))
+            else:
+                # Step 2: Prepare replay samples
+                _reservoir_entries: list[tuple[Any, int]] = []
+                if replay_buffer_size > 0 and replay_ratio > 0.0 and folsom_replay_buffer:
+                    _n = max(0, int(round(len(day_indices) * replay_ratio)))
+                    _reservoir_entries = sample_replay_for_day(folsom_replay_buffer, _n, seed=rng_seed)
+                _recent_entries: list[tuple[Any, int]] = []
+                if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+                    _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
+                    _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
+                _replay = (_reservoir_entries + _recent_entries) or None
 
-            # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
-            loss = _train_day(
-                model,
-                dataset,
-                day_indices,
-                lr=adapt_lr,
-                weight_decay=adapt_weight_decay,
-                max_grad_norm=adapt_max_grad_norm,
-                batch_size=adapt_batch_size,
-                epochs=adapt_epochs,
-                device=device,
-                replay_entries=_replay,
-                global_state_dict=global_state_dict,
-                mu=prox_mu,
-                rng_seed=rng_seed,
-                day_samples=day_samples,
-                client_name=name,
-                global_prototypes=global_prototypes,
-                proto_lambda=proto_lambda,
-            )
+                # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
+                loss = train_day(
+                    model,
+                    dataset,
+                    day_indices,
+                    lr=adapt_lr,
+                    weight_decay=adapt_weight_decay,
+                    max_grad_norm=adapt_max_grad_norm,
+                    batch_size=adapt_batch_size,
+                    epochs=adapt_epochs,
+                    device=device,
+                    replay_entries=_replay,
+                    global_state_dict=global_state_dict,
+                    mu=prox_mu,
+                    rng_seed=rng_seed,
+                    day_samples=day_samples,
+                    client_name=name,
+                    global_prototypes=global_prototypes,
+                    proto_lambda=proto_lambda,
+                )
 
         # Step 4: Extract per-class prototypes (FedProto — after training
         # so features reflect the updated model)
         day_protos: dict[int, tuple[torch.Tensor, int]] = {}
         if train and extract_prototypes and day_samples:
-            day_protos = _extract_day_prototypes(model, day_samples, device, adapt_batch_size)
+            day_protos = extract_day_prototypes(model, day_samples, device, adapt_batch_size)
 
         # Step 5: Update recent FIFO buffer
         if train and recent_buffer_size > 0:
@@ -726,6 +267,8 @@ def _process_client_day(
         "rmse": metrics.get("rmse", float("nan")),
         "loss": loss,
         "day_prototypes": day_protos,
+        "gate_stats": gate_stats,
+        "gate_opened": bool(gate_stats.get("backprop", 0)),
     }
 
 
@@ -805,6 +348,7 @@ def run_fl_benchmark(
     fedproto_lambda: float = 0.1,
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
+    loso_holdout: str | None = None,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
 
@@ -904,10 +448,10 @@ def run_fl_benchmark(
     day_maps = []
     for name, path in clients:
         ds = load_dataset(path, split="test")
-        dm = group_indices_by_day(ds._periods)
+        dm = group_indices_by_day(ds.periods)
         datasets.append(ds)
         day_maps.append(dm)
-        print(f"  {name}: {len(ds._periods)} periods")
+        print(f"  {name}: {len(ds.periods)} periods")
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -974,7 +518,22 @@ def run_fl_benchmark(
     # After the first FedProto sync this becomes a list of dicts, one per client.
     _per_client_global_protos: list[dict[int, torch.Tensor]] | None = None
 
-    # -----------------------------------------------------------------------
+    # --- Gated FL state ---
+    _is_gated = algorithm == "gated"
+    _gated_prototypes: list[dict[int, torch.Tensor]] = []
+    _gated_thresholds: list[dict[int, dict[str, float]]] = []
+    _gated_optimizers: list[torch.optim.Optimizer] = []
+    _gated_loss_fn = BerHuLoss(threshold=30, scale=1000)
+    _gated_proto_accum: list[dict[int, tuple[torch.Tensor, int]]] = [{} for _ in clients]
+    if _is_gated:
+        print("Initialising gated prototypes and thresholds per client...")
+        for i in range(len(clients)):
+            protos, thresholds = build_gated_thresholds(models[i], datasets[i], device)
+            _gated_prototypes.append(protos)
+            _gated_thresholds.append(thresholds)
+            _gated_optimizers.append(torch.optim.AdamW(models[i].network_head.parameters(), lr=adapt_lr))
+        if loso_holdout:
+            print(f"  LOSO holdout site (excluded from federation): {loso_holdout}")
     # Warmup cache — load if available, skipping the warmup simulation
     # -----------------------------------------------------------------------
     _warmup_cache_loaded = False
@@ -1071,6 +630,7 @@ def run_fl_benchmark(
         _global_sd = last_global_state_dict if algorithm == "fedprox" else None
         _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
         _is_fedproto = algorithm == "fedproto"
+        _is_gated = algorithm == "gated"
         client_kwargs = [
             {
                 "client_idx": i,
@@ -1100,6 +660,11 @@ def run_fl_benchmark(
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
                 "extract_prototypes": _is_fedproto and not in_warmup,
                 "train": not is_static,
+                "gated": _is_gated,
+                "gate_prototypes": _gated_prototypes[i] if _is_gated else None,
+                "gate_thresholds": _gated_thresholds[i] if _is_gated else None,
+                "gate_optimizer": _gated_optimizers[i] if _is_gated else None,
+                "gate_loss_fn": _gated_loss_fn if _is_gated else None,
             }
             for i in range(len(clients))
         ]
@@ -1123,7 +688,13 @@ def run_fl_benchmark(
 
             # FedProto: accumulate per-class prototypes for this client
             if _is_fedproto and result.get("day_prototypes"):
-                _accumulate_prototypes(_proto_accum[i], result["day_prototypes"])
+                accumulate_prototypes(_proto_accum[i], result["day_prototypes"])
+
+            if _is_gated and result.get("gate_opened"):
+                day_gate_samples = [datasets[i][idx] for idx in day_maps[i].get(_day_key, [])[:64]]
+                if day_gate_samples:
+                    day_gate_protos = extract_prototypes(models[i], day_gate_samples, device, adapt_batch_size)
+                    accumulate_prototypes(_gated_proto_accum[i], day_gate_protos)
 
         per_day.append(day_record)
         # Only count toward sync_interval once warmup is over
@@ -1196,7 +767,7 @@ def run_fl_benchmark(
                 # FedProto: aggregate prototypes, NOT model weights.
                 # Each client keeps its own model entirely local.
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                _per_client_global_protos, _attn_weights = _aggregate_global_prototypes(_proto_accum)
+                _per_client_global_protos, _attn_weights = aggregate_global_prototypes(_proto_accum)
                 wc = 0.0  # no weight-level change
 
                 # Log per-client prototype norms and attention weights
@@ -1232,6 +803,38 @@ def run_fl_benchmark(
                 # Reset accumulators for next sync interval
                 _proto_accum = [{} for _ in clients]
 
+            elif algorithm == "gated":
+                gated_indices = [
+                    i
+                    for i, result in enumerate(client_results)
+                    if result.get("gate_opened") and (loso_holdout is None or client_names[i] != loso_holdout)
+                ]
+                if gated_indices:
+                    gated_states = [models[i].state_dict() for i in gated_indices]
+                    new_global, wc = AGGREGATION_FNS["gated"](
+                        last_global_state_dict or models[0].state_dict(),
+                        gated_states,
+                    )
+                    last_global_state_dict = copy.deepcopy(new_global)
+                    for i, model in enumerate(models):
+                        if loso_holdout and client_names[i] == loso_holdout:
+                            continue
+                        merged = copy.deepcopy(model.state_dict())
+                        for key in merged:
+                            if is_head_key(key):
+                                merged[key] = new_global[key]
+                        model.load_state_dict(merged)
+
+                    gated_proto_accum = [_gated_proto_accum[i] for i in gated_indices if _gated_proto_accum[i]]
+                    if gated_proto_accum:
+                        global_csi_protos = aggregate_prototypes(gated_proto_accum)
+                        for i in range(len(clients)):
+                            _gated_prototypes[i] = global_csi_protos
+                    print(f"  {'':6}      [gated] Aggregated adapters from {len(gated_indices)} gated client(s)")
+                else:
+                    wc = 0.0
+                _gated_proto_accum = [{} for _ in clients]
+
             else:
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                 # Weight-based FL algorithms
@@ -1241,9 +844,9 @@ def run_fl_benchmark(
 
                 # Capture local-only layers before aggregation
                 if algorithm == "fedbn":
-                    local_bn = [_extract_local_keys(sd, _is_bn_key) for sd in state_dicts]
+                    local_bn = [_extract_local_keys(sd, is_bn_key) for sd in state_dicts]
                 if algorithm == "fedper":
-                    local_head = [_extract_local_keys(sd, _is_head_key) for sd in state_dicts]
+                    local_head = [_extract_local_keys(sd, is_head_key) for sd in state_dicts]
 
                 new_global, wc = agg_fn(state_dicts[0], state_dicts)
                 last_global_state_dict = copy.deepcopy(new_global)
@@ -1291,7 +894,7 @@ def run_fl_benchmark(
                             seed=_d_seed + 1,
                         )
                     _d_replay = (_d_reservoir + _d_recent) or None
-                    _train_day(
+                    train_day(
                         ditto_models[i],
                         datasets[i],
                         _d_indices,
@@ -1420,7 +1023,8 @@ def run_fl_benchmark(
 @click.option(
     "--algorithm",
     type=click.Choice(
-        ["static", "isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto"], case_sensitive=False
+        ["static", "isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto", "gated"],
+        case_sensitive=False,
     ),
     default="fedbn",
     show_default=True,
@@ -1434,8 +1038,15 @@ def run_fl_benchmark(
         "  fedprox  — FedAvg + proximal term in local training.\n"
         "  ditto    — dual-model with personalised proximal anchor.\n"
         "  fedema   — FedAvg + EMA interpolation at distribution.\n"
-        "  fedproto — share per-class feature prototypes, not weights."
+        "  fedproto — share per-class feature prototypes, not weights.\n"
+        "  gated — CSI-binned prototypes + adapter aggregation from gated clients."
     ),
+)
+@click.option(
+    "--loso-holdout",
+    type=str,
+    default=None,
+    help="Site name to hold out for LOSO (excluded from federation aggregation).",
 )
 @click.option(
     "--sync-interval",
@@ -1658,6 +1269,7 @@ def main(
     save_results: Path | None,
     parallel_clients: int,
     freeze_early_backbone: bool,
+    loso_holdout: str | None,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
     # Build ordered client list from all --dataset flags
@@ -1694,6 +1306,7 @@ def main(
         fedproto_lambda=fedproto_lambda,
         parallel_clients=parallel_clients,
         freeze_early_backbone=freeze_early_backbone,
+        loso_holdout=loso_holdout,
     )
 
     if save_results is not None:

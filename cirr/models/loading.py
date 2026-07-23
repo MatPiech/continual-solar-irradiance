@@ -54,7 +54,7 @@ def load_forecaster_from_checkpoint(
 
     model = Forecaster(
         model_name=hp.get("model_name", "timm-resnet50"),
-        pretrained=hp.get("pretrained", False),
+        pretrained=False,  # weights loaded from checkpoint; avoid HF download
         input_channels=hp.get("input_channels", 3),
         loss_function=hp.get("loss_function", "MSE"),
         lr=hp.get("lr", 3e-4),
@@ -63,3 +63,19 @@ def load_forecaster_from_checkpoint(
 
     model.load_state_dict(data["state_dict"], strict=False)
     return model
+
+
+def prepare_forecaster_for_eval(model: Forecaster) -> Forecaster:
+    if hasattr(model.image_encoder, "fc") and not isinstance(model.image_encoder.fc, torch.nn.Identity):
+        model.image_encoder.fc = torch.nn.Identity()
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    return model
+
+
+def load_forecaster_for_eval(
+    checkpoint_path: Path,
+    device: str = "cpu",
+) -> Forecaster:
+    return prepare_forecaster_for_eval(load_forecaster_from_checkpoint(checkpoint_path, device=device, use_hparams=True))

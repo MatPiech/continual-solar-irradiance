@@ -26,8 +26,9 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from cirr.losses import BerHuLoss
-from cirr.tta.memo_reg import _random_augment, prediction_variance_loss
+from cirr.training.ogd import make_regression_loss, ogd_step
+from cirr.tta.common import prediction_variance_loss
+from cirr.tta.memo_reg import _random_augment
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -77,16 +78,10 @@ class DualPhaseAdapter(nn.Module):
         self.note_buffer_size = note_buffer_size
 
         # ── Supervised OGD loss ──────────────────────────────────────────────
-        if ogd_loss == "berhu":
-            self._ogd_loss_fn: nn.Module = BerHuLoss(threshold=30, scale=1000)
-        elif ogd_loss == "huber":
-            self._ogd_loss_fn = nn.HuberLoss()
-        elif ogd_loss == "mse":
-            self._ogd_loss_fn = nn.MSELoss()
-        elif ogd_loss == "mae":
-            self._ogd_loss_fn = nn.L1Loss()
+        if ogd_loss == "mae":
+            self._ogd_loss_fn: nn.Module = nn.L1Loss()
         else:
-            raise ValueError(f"Unsupported ogd_loss: {ogd_loss!r}")
+            self._ogd_loss_fn = make_regression_loss(ogd_loss)
 
         # ── NOTE persistent sample buffer ───────────────────────────────────
         self._note_buffer: deque[tuple[torch.Tensor, torch.Tensor]] = deque(maxlen=note_buffer_size)
@@ -129,6 +124,27 @@ class DualPhaseAdapter(nn.Module):
             Ground-truth label that is now causally observable.
         """
         self._ogd_step(image=image, history=history, gt=gt)
+
+    def _ogd_step(
+        self,
+        image: torch.Tensor,
+        history: torch.Tensor,
+        gt: torch.Tensor,
+    ) -> None:
+        device = str(next(self.base_model.parameters()).device)
+        ogd_step(
+            self.base_model,
+            self._ogd_optimizer,
+            self.ogd_scope,
+            self._ogd_loss_fn,
+            image,
+            history,
+            gt,
+            device,
+            slope_penalty=True,
+            max_grad_norm=10.0,
+            encoder_unfreeze="full",
+        )
 
     def predict(
         self,
@@ -342,56 +358,6 @@ class DualPhaseAdapter(nn.Module):
     # =========================================================================
 
     @torch.enable_grad()
-    def _ogd_step(
-        self,
-        image: torch.Tensor,  # [C, H, W]
-        history: torch.Tensor,  # [hist_len]
-        gt: torch.Tensor,  # [1, 1]
-    ) -> None:
-        """Phase 1 — OGD with Physical BerHu and Volatility-Weighted Slope Penalty."""
-        self._set_ogd_mode()
-
-        imgs_batch = image.unsqueeze(0)
-        hist_batch = history.unsqueeze(0)
-
-        self._ogd_optimizer.zero_grad()
-        output = self.base_model(imgs_batch, hist_batch)
-        pred = output[0] if isinstance(output, tuple) else output
-
-        # 1. Base Absolute Loss
-        base_loss = self._ogd_loss_fn(pred, gt.view_as(pred))
-
-        # 2. Volatility-Weighted Slope Penalty
-        current_irr = history[-1]
-        scale_factor = 1000.0
-
-        true_delta = (gt.view(-1)[0] - current_irr) * scale_factor
-        pred_delta = (pred.view(-1)[0] - current_irr) * scale_factor
-
-        slope_error = torch.abs(pred_delta - true_delta)
-
-        # Variance of physical history
-        history_phys = history * scale_factor
-        hist_var = torch.var(history_phys, unbiased=False)
-
-        voltality_multiplier = 0.01
-        dynamic_slope_weight = 1.0 + (hist_var.detach() * voltality_multiplier)
-
-        slope_loss = (slope_error * dynamic_slope_weight) / scale_factor
-
-        # 3. Combine and apply
-        total_loss = base_loss + slope_loss
-        total_loss.backward()
-
-        # Lift the gradient clipping to 10.0 to prevent neutralizing the physical thresholds
-        torch.nn.utils.clip_grad_norm_(self.base_model.parameters(), max_norm=10.0)
-
-        self._ogd_optimizer.step()
-
-        for param in self.base_model.parameters():
-            param.requires_grad_(False)
-
-    @torch.enable_grad()
     def _memo_tta_step(
         self,
         tta_model: nn.Module,
@@ -462,25 +428,6 @@ class DualPhaseAdapter(nn.Module):
     # =========================================================================
     # Mode helpers
     # =========================================================================
-
-    def _set_ogd_mode(self) -> None:
-        """Configure gradient flow on base_model for Phase 1 OGD.
-
-        Freezes all parameters, then selectively unfreezes the regression head
-        and, for ``ogd_scope='head_and_encoder'``, the full ``image_encoder``.
-        """
-        # Freeze all parameters to establish a clean baseline.
-        for param in self.base_model.parameters():
-            param.requires_grad_(False)
-
-        for param in self.base_model.network_head.parameters():
-            param.requires_grad_(True)
-
-        if self.ogd_scope == "head_and_encoder":
-            for param in self.base_model.image_encoder.parameters():
-                param.requires_grad_(True)
-
-        self.base_model.eval()
 
     @staticmethod
     def _set_tta_mode(model: nn.Module) -> None:
