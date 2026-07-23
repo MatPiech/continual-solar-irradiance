@@ -172,6 +172,7 @@ checkpoints/
 
 # Data folders
 data/
+!cirr/data/
 notebooks/data/
 
 # Results folders
