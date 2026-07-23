@@ -5,8 +5,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
 
+from cirr.data.transforms import FLOW_CHANNELS, RGB_CHANNELS
 from cirr.losses import MeanAdaptiveBerHuLoss
 from cirr.models.lora import LoRAConv2d, LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
+
+
+def _inflate_conv1_weights(weight: torch.Tensor, extra_channels: int = 2) -> torch.Tensor:
+    if weight.ndim != 4:
+        raise ValueError(f"Expected conv weight [out, in, kH, kW], got shape {tuple(weight.shape)}")
+    in_ch = weight.shape[1]
+    if in_ch == 3 + extra_channels:
+        return weight
+    if in_ch != 3:
+        raise ValueError(f"Expected 3 input channels, got {in_ch}")
+    avg = weight.mean(dim=1, keepdim=True)
+    return torch.cat([weight, avg.repeat(1, extra_channels, 1, 1)], dim=1)
+
+
+def _apply_conv1_inflation(state_dict: dict[str, torch.Tensor], extra_channels: int = 2) -> dict[str, torch.Tensor]:
+    out = dict(state_dict)
+    for key, tensor in list(out.items()):
+        if "conv1.weight" in key and tensor.ndim == 4 and tensor.shape[1] == 3:
+            out[key] = _inflate_conv1_weights(tensor, extra_channels=extra_channels)
+    return out
 
 
 class Forecaster(pl.LightningModule):
@@ -28,15 +49,37 @@ class Forecaster(pl.LightningModule):
         # 1. Flag to check if we are doing Uncertainty Quantification
         self.is_probabilistic = loss_function == "GNLL"
 
+        backbone_name = model_name.replace("timm-", "")
+
         # 2. Image Encoder — num_classes=0 returns the pooled feature vector
-        # without any classification head, making num_features reliable across
-        # timm versions and model families (ResNet, EfficientViT, …).
-        self.image_encoder = timm.create_model(
-            model_name.replace("timm-", ""),
-            pretrained=pretrained,
-            num_classes=0,
-            in_chans=input_channels,
-        )
+        if input_channels > RGB_CHANNELS and pretrained:
+            # Load 3-ch pretrained weights, inflate conv1 for flow channels.
+            pretrained_encoder = timm.create_model(
+                backbone_name,
+                pretrained=True,
+                num_classes=0,
+                in_chans=RGB_CHANNELS,
+            )
+            state = _apply_conv1_inflation(pretrained_encoder.state_dict(), extra_channels=FLOW_CHANNELS)
+            self.image_encoder = timm.create_model(
+                backbone_name,
+                pretrained=False,
+                num_classes=0,
+                in_chans=input_channels,
+            )
+            missing, unexpected = self.image_encoder.load_state_dict(state, strict=False)
+            if unexpected:
+                raise RuntimeError(f"Unexpected keys loading inflated encoder: {unexpected}")
+            # timm may rename stem conv differently across families
+            if missing and not all("conv1" in k or "stem" in k for k in missing):
+                pass  # non-conv1 missing keys are ok for partial families
+        else:
+            self.image_encoder = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                num_classes=0,
+                in_chans=input_channels,
+            )
 
         # num_features from timm is not always reliable (e.g. EfficientViT in some
         # versions reports the internal embedding dim rather than the actual pooled
@@ -115,14 +158,14 @@ class Forecaster(pl.LightningModule):
         self.adain_csi_high = float(csi_high)
         self.adain_eps = float(eps)
 
-    def _encode_image_features(
+    def encode_fusion_features(
         self,
         x: torch.Tensor,
         irradiance_history: torch.Tensor,
         clear_sky_current: float | None = None,
         update_clear_sky_stats: bool = False,
     ) -> torch.Tensor:
-        """Encode image and optionally apply AdaIN using clear-sky EMA stats."""
+        """Encode image-side features used before fusion with irradiance history."""
         if (
             not self.use_adain_feature_norm
             or not hasattr(self.image_encoder, "forward_features")
@@ -424,7 +467,7 @@ class Forecaster(pl.LightningModule):
         Note: 'variance' will be None if using MSE/MAE.
         """
         # 1. Encode Image
-        img_feats = self._encode_image_features(
+        img_feats = self.encode_fusion_features(
             x,
             irradiance_history,
             clear_sky_current=clear_sky_current,
@@ -468,7 +511,7 @@ class Forecaster(pl.LightningModule):
         encoder_features : Tensor
             1D feature vector from ``image_encoder`` used as MLP head input.
         """
-        img_feats = self._encode_image_features(
+        img_feats = self.encode_fusion_features(
             x,
             irradiance_history,
             clear_sky_current=clear_sky_current,
@@ -542,8 +585,7 @@ class Forecaster(pl.LightningModule):
         * **Private head** — ``network_head`` adapts to the local pyranometer
           calibration offset without any federated penalty.
 
-        For ResNet checkpoints the full encoder output is returned unchanged
-        (backward-compatible fallback).
+        For ResNet checkpoints the full encoder output is returned unchanged.
 
         Returns
         -------
@@ -560,7 +602,7 @@ class Forecaster(pl.LightningModule):
             _handle = self.image_encoder.stages[3].register_forward_hook(lambda _m, _i, o: _proto_holder.update({"feat": o}))
 
         try:
-            img_feats = self._encode_image_features(
+            img_feats = self.encode_fusion_features(
                 x,
                 irradiance_history,
                 clear_sky_current=clear_sky_current,
@@ -587,7 +629,7 @@ class Forecaster(pl.LightningModule):
         """
         Handles the logic for Train, Val, and Test to avoid code duplication.
         """
-        source_images, source_irradiances, target_irradiances, _ = batch
+        source_images, source_irradiances, _ghi_clear, target_irradiances, _ = batch
 
         # Forward pass
         pred_mean, pred_var = self(source_images, source_irradiances)

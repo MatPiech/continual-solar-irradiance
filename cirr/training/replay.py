@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 
-from cirr.datamodules.loading import load_dataset
+from cirr.data.loading import load_dataset
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,7 +26,7 @@ def period_target_value(period: dict[str, Any]) -> float:
     Parameters
     ----------
     period : dict
-        A period dictionary from a ``SkyImageDataset._periods`` list.
+        A period dictionary from a ``SkyImageDataset.periods`` list.
 
     Returns
     -------
@@ -71,7 +71,7 @@ def build_folsom_replay_buffer(
 
     irradiance_values: list[float] = []
     eligible_samples: list[tuple[Any, int]] = []
-    for idx, period in enumerate(folsom_dataset._periods):
+    for idx, period in enumerate(folsom_dataset.periods):
         val = period_target_value(period)
         if val < nonzero_threshold:
             continue

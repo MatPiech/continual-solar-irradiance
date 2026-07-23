@@ -35,6 +35,8 @@ import torch
 import torch.nn as nn
 import torchvision.transforms.functional as TF
 
+from cirr.tta.common import prediction_variance_loss, select_adapt_params
+
 # ---------------------------------------------------------------------------
 # Tensor-space augmentations (operate on normalised float tensors [c, h, w])
 # ---------------------------------------------------------------------------
@@ -102,29 +104,6 @@ def _random_augment(
     )
 
     return img
-
-
-# ---------------------------------------------------------------------------
-# Variance-minimisation loss
-# ---------------------------------------------------------------------------
-
-
-def prediction_variance_loss(predictions: torch.Tensor) -> torch.Tensor:
-    """Compute the mean prediction variance across a batch of augmented views.
-
-    Parameters
-    ----------
-    predictions : torch.Tensor
-        Predictions tensor of shape ``[N, 1]`` or ``[N]``.
-
-    Returns
-    -------
-    torch.Tensor
-        Scalar variance loss.
-    """
-    preds = predictions.squeeze(-1)  # [N]
-    mean_pred = preds.mean()
-    return ((preds - mean_pred) ** 2).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +187,7 @@ class MEMOReg(nn.Module):
         self.configure_model()
 
         # Optimizer (created after configure_model sets requires_grad)
-        self.optimizer = torch.optim.Adam(_get_params(model, adapt_mode), lr=lr, weight_decay=weight_decay)
+        self.optimizer = torch.optim.Adam(select_adapt_params(model, adapt_mode), lr=lr, weight_decay=weight_decay)
 
     # ------------------------------------------------------------------
     # Public interface override: regression takes a 2-tuple
@@ -298,7 +277,7 @@ class MEMOReg(nn.Module):
         """Reset model and optimizer to initial state."""
         self.model.load_state_dict(self._initial_model_state, strict=True)
         # Re-register params after weight reset so optimizer sees fresh tensors
-        params = _get_params(self.model, self.adapt_mode)
+        params = select_adapt_params(self.model, self.adapt_mode)
         self.optimizer = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
         self.configure_model()
 
@@ -401,20 +380,3 @@ class MEMOReg(nn.Module):
             f"max_rotation={self.max_rotation}, translate_percent={self.translate_percent}, "
             f"scale=[{self.scale_min},{self.scale_max}], episodic={self.episodic})"
         )
-
-
-# ---------------------------------------------------------------------------
-# Helper: select parameters for the optimizer
-# ---------------------------------------------------------------------------
-
-
-def _get_params(model: nn.Module, adapt_mode: str) -> list[nn.Parameter]:
-    """Return the list of parameters to be optimised."""
-    if adapt_mode == "bn_only":
-        params = []
-        for m in model.modules():
-            if isinstance(m, nn.BatchNorm2d | nn.BatchNorm1d) and m.affine:
-                params.extend([m.weight, m.bias])
-        return params
-    else:
-        return list(model.parameters())

@@ -12,7 +12,8 @@ from omegaconf import OmegaConf
 import torch
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 
-from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.data.forecasting import ForecastingDataModule
+from cirr.data.transforms import input_channels, normalize_optical_flow
 from cirr.models.forecaster import Forecaster
 from cirr.utils import utils
 
@@ -28,6 +29,8 @@ def train_forecaster(data_root: Path):
 
     pl.seed_everything(seed=cfg.seed)
 
+    optical_flow = normalize_optical_flow(cfg.datamodule.optical_flow)
+
     datamodule = ForecastingDataModule(
         root_data_path=data_root,
         periods_path=data_root / "train_periods.pickle",
@@ -38,12 +41,13 @@ def train_forecaster(data_root: Path):
         batch_size=cfg.datamodule.batch_size,
         workers=cfg.datamodule.workers,
         seed=cfg.seed,
+        optical_flow=optical_flow,
     )
 
     model = Forecaster(
         model_name=cfg.model.model_name,
         pretrained=cfg.model.pretrained,
-        input_channels=cfg.model.channels,
+        input_channels=input_channels(optical_flow=optical_flow),
         loss_function=cfg.model.loss_function,
         lr=cfg.model.lr,
         lr_patience=cfg.model.lr_patience,

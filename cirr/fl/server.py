@@ -56,12 +56,12 @@ def federated_averaging(global_weights, client_updates):
     return new_weights, weight_change_mb
 
 
-def _is_bn_key(key: str) -> bool:
+def is_bn_key(key: str) -> bool:
     """Return True if *key* belongs to a BatchNorm layer (FedBN exclusion list)."""
     return any(pattern in key for pattern in _BN_KEY_PATTERNS)
 
 
-def _is_head_key(key: str) -> bool:
+def is_head_key(key: str) -> bool:
     """Return True if *key* belongs to the network head (FedPer exclusion list)."""
     return key.startswith(_HEAD_PREFIX)
 
@@ -107,7 +107,7 @@ def fedbn_aggregate(
 
     new_weights = copy.deepcopy(global_weights)
     for key in new_weights:
-        if _is_bn_key(key):
+        if is_bn_key(key):
             # Keep global (= previous round) BN statistics — each client
             # restores its own local BN stats before fine-tuning.
             continue
@@ -151,8 +151,33 @@ def fedper_aggregate(
 
     new_weights = copy.deepcopy(global_weights)
     for key in new_weights:
-        if _is_head_key(key):
+        if is_head_key(key):
             # This client's head is personal — do not overwrite.
+            continue
+        tensors = [update[key] for update in client_updates]
+        if tensors[0].is_floating_point():
+            new_weights[key] = torch.stack(tensors).mean(dim=0)
+        else:
+            new_weights[key] = tensors[0]
+
+    return new_weights, _compute_weight_change(global_weights, new_weights)
+
+
+def gated_aggregate(
+    global_weights: dict[str, Any],
+    client_updates: list[dict[str, Any]],
+) -> tuple[dict[str, Any], float]:
+    """Gated FL: aggregate adapter (network_head) weights only.
+
+    Backbone stays frozen/global; only clients that opened their gates should
+    be included in *client_updates* by the benchmark runner.
+    """
+    if not client_updates:
+        return global_weights, 0.0
+
+    new_weights = copy.deepcopy(global_weights)
+    for key in new_weights:
+        if not is_head_key(key):
             continue
         tensors = [update[key] for update in client_updates]
         if tensors[0].is_floating_point():
@@ -309,4 +334,5 @@ AGGREGATION_FNS: dict[str, Any] = {
     "ditto": ditto_aggregate,
     "fedema": fedema_aggregate,
     "fedproto": fedproto_aggregate,
+    "gated": gated_aggregate,
 }

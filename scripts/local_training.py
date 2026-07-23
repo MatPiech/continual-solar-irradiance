@@ -18,11 +18,12 @@ import click
 import numpy as np
 import torch
 
-from cirr.datamodules.loading import load_dataset
+from cirr.data.loading import load_dataset
 from cirr.evaluation.printing import print_overall_metrics
 from cirr.evaluation.results import format_percentage_metric, save_metrics_report, save_predictions_csv
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.training.day_loop import predict_day, train_day
 from cirr.training.replay import build_folsom_replay_buffer, period_target_value, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
@@ -44,7 +45,7 @@ def _compute_sample_distribution(samples: list[tuple[Any, int]]) -> dict[str, fl
     if len(samples) == 0:
         return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
-    irradiances = [period_target_value(dataset._periods[idx]) for dataset, idx in samples]
+    irradiances = [period_target_value(dataset.periods[idx]) for dataset, idx in samples]
     irr_array = np.array(irradiances)
 
     return {
@@ -125,7 +126,7 @@ def load_model_and_data(
 
     # Load dataset
     test_dataset = load_dataset(dataset_path, split="test")
-    day_index_map = group_indices_by_day(test_dataset._periods)
+    day_index_map = group_indices_by_day(test_dataset.periods)
 
     return model, day_index_map, test_dataset
 
@@ -135,44 +136,17 @@ def predict_on_day(
     dataset: Any,
     day_indices: list[int],
     device: str,
+    batch_size: int = 32,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Generate predictions for all samples on a given day.
-
-    Parameters
-    ----------
-    model : Forecaster
-        Model to use for predictions.
-    dataset : SkyImageDataset
-        Dataset containing the periods.
-    day_indices : list[int]
-        Indices of samples to predict on.
-    device : str
-        Device to use for inference.
-
-    Returns
-    -------
-    predictions : np.ndarray
-        Model predictions, shape (n_samples,).
-    targets : np.ndarray
-        Ground truth values, shape (n_samples,).
-    """
-    model.eval()
-    predictions = []
-    targets = []
-
-    with torch.no_grad():
-        for idx in day_indices:
-            images, irradiance_history, target, _ = dataset[idx]
-            images = images.unsqueeze(0).to(device)
-            irradiance_history = irradiance_history.unsqueeze(0).to(device)
-            target = target.to(device)
-
-            # Forward pass
-            pred_mean, _ = model(images, irradiance_history)
-            predictions.append(pred_mean.cpu().item())
-            targets.append(target.cpu().item())
-
-    return np.array(predictions), np.array(targets)
+    """Generate predictions for all samples on a given day."""
+    predictions, targets, _ = predict_day(
+        model,
+        dataset,
+        day_indices,
+        device,
+        batch_size=batch_size,
+    )
+    return predictions, targets
 
 
 def train_on_day(
@@ -243,94 +217,55 @@ def train_on_day(
     if len(day_indices) == 0:
         return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
 
-    # Collect current day samples
-    current_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in day_indices]
-
-    # Combine current day samples with pre-sampled replay samples
-    pooled_samples = current_samples + replay_samples
-
-    if len(pooled_samples) == 0:
-        return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
-
-    random.shuffle(pooled_samples)
-    mini_batches = [pooled_samples[idx : idx + batch_size] for idx in range(0, len(pooled_samples), batch_size)]
-
-    if len(mini_batches) == 0:
-        return 0.0, {"count": 0, "mean_irradiance": 0.0, "std_irradiance": 0.0}
-
     model.train()
 
-    # Apply freezing strategy based on use_lora/use_dual_lora
     if use_dual_lora or use_lora:
-        # LoRA: entire network is frozen except LoRA parameters
-        # This is already done in load_model_and_data via freeze_all_except_lora()
         pass
     elif freeze_image_encoder:
-        # Legacy mode: freeze only the image encoder
         model.freeze_image_encoder()
 
-    # Create optimizer with asymmetric learning rates for dual-LoRA
     if use_dual_lora and encoder_lr is not None and head_lr is not None:
-        # Dual-LoRA: use separate learning rates for encoder and head
         param_groups = model.get_lora_param_groups(encoder_lr=encoder_lr, head_lr=head_lr, weight_decay=weight_decay)
         optimizer = torch.optim.AdamW(param_groups)
     else:
-        # Single learning rate for all trainable parameters
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay
         )
 
-    # Snapshot trainable parameters for L2-SP anti-drift regularization
     reference_parameters = {
         name: parameter.detach().clone() for name, parameter in model.named_parameters() if parameter.requires_grad
     }
 
-    total_loss = 0.0
-    batch_count = 0
+    def extra_loss_fn(_base_loss: torch.Tensor, model: Forecaster) -> torch.Tensor:
+        l2sp_terms = []
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            reference_parameter = reference_parameters[name]
+            l2sp_terms.append(torch.mean((parameter - reference_parameter) ** 2))
+        if not l2sp_terms:
+            return torch.tensor(0.0, device=device)
+        return l2sp_lambda * torch.stack(l2sp_terms).mean()
 
-    # Training loop over epochs
-    for __ in range(epochs):
-        # One pass over stratified mini-batches per epoch
-        for batch_indices in mini_batches:
-            samples = [sample_dataset[sample_idx] for sample_dataset, sample_idx in batch_indices]
-            images = torch.stack([sample[0] for sample in samples]).to(device)
-            irradiance_history = torch.stack([sample[1] for sample in samples]).to(device)
-            target = torch.stack([sample[2] for sample in samples]).to(device)
+    avg_loss = train_day(
+        model,
+        dataset,
+        day_indices,
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        batch_size=batch_size,
+        epochs=epochs,
+        device=device,
+        replay_entries=replay_samples or None,
+        optimizer=optimizer,
+        extra_loss_fn=extra_loss_fn,
+        shuffle_each_epoch=False,
+    )
 
-            optimizer.zero_grad()
-
-            # Forward pass
-            pred_mean, pred_var = model(images, irradiance_history)
-
-            # Compute base loss
-            base_loss = (
-                model.loss_fn(pred_mean, target, pred_var) if pred_var is not None else model.loss_fn(pred_mean, target)
-            )
-
-            # L2-SP anti-drift penalty (distance to pre-adaptation weights)
-            l2sp_terms = []
-            for name, parameter in model.named_parameters():
-                if not parameter.requires_grad:
-                    continue
-                reference_parameter = reference_parameters[name]
-                l2sp_terms.append(torch.mean((parameter - reference_parameter) ** 2))
-
-            l2sp_penalty = torch.stack(l2sp_terms).mean() if l2sp_terms else torch.tensor(0.0, device=device)
-            loss = base_loss + l2sp_lambda * l2sp_penalty
-
-            # Backward pass with gradient clipping
-            loss.backward()
-            if max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-            optimizer.step()
-
-            total_loss += loss.item()
-            batch_count += 1
-
-    # Compute replay sample distribution statistics
     replay_stats: dict[str, Any] = {"count": len(replay_samples)}
     if len(replay_samples) > 0:
-        replay_irradiances = [period_target_value(rb_dataset._periods[rb_idx]) for rb_dataset, rb_idx in replay_samples]
+        replay_irradiances = [period_target_value(rb_dataset.periods[rb_idx]) for rb_dataset, rb_idx in replay_samples]
         replay_irr_array = np.array(replay_irradiances)
         replay_stats["mean_irradiance"] = float(np.mean(replay_irr_array))
         replay_stats["std_irradiance"] = float(np.std(replay_irr_array))
@@ -342,7 +277,7 @@ def train_on_day(
         replay_stats["min_irradiance"] = 0.0
         replay_stats["max_irradiance"] = 0.0
 
-    return total_loss / batch_count if batch_count > 0 else 0.0, replay_stats
+    return avg_loss, replay_stats
 
 
 def run_local_training(
@@ -463,7 +398,7 @@ def run_local_training(
         head_alpha=head_alpha,
     )
 
-    print(f"Dataset size: {len(dataset._periods)} samples")
+    print(f"Dataset size: {len(dataset.periods)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
 
     # Generate training days
@@ -515,7 +450,7 @@ def run_local_training(
         # Collect predictions data
         for idx, (pred, target) in enumerate(zip(predictions, targets, strict=False)):
             sample_idx = day_indices[idx]
-            image_name = dataset._periods[sample_idx]["history"][-1]["image_name"]
+            image_name = dataset.periods[sample_idx]["history"][-1]["image_name"]
             all_predictions_data.append(
                 {
                     "timestamp": image_name,

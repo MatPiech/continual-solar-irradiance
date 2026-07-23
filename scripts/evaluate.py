@@ -43,14 +43,13 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from cirr.datamodules.loading import load_dataset
 from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
+from cirr.evaluation.runner import load_eval_days
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.training.replay import build_folsom_replay_buffer
 from cirr.tta import MEMOReg, NOTEReg
-from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
 # ---------------------------------------------------------------------------
@@ -111,7 +110,7 @@ def evaluate(
         day_targets: list[float] = []
 
         for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
-            image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
+            image_input, irradiance_history, ghi_clear, target_irradiance, image_name = dataset[idx]
 
             images = image_input.unsqueeze(0).to(device)
             irr_history = irradiance_history.unsqueeze(0).to(device)
@@ -251,7 +250,7 @@ def _fewshot_fit(
                 batch = train_samples[start : start + batch_size]
                 images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
                 histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                targets = torch.stack([sample_ds[sample_idx][2] for sample_ds, sample_idx in batch]).to(device)
+                targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
 
                 optimizer.zero_grad()
                 pred_mean = _predict_single(model, images, histories)
@@ -272,7 +271,7 @@ def _fewshot_fit(
                     batch = val_samples[start : start + batch_size]
                     images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
                     histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                    targets = torch.stack([sample_ds[sample_idx][2] for sample_ds, sample_idx in batch]).to(device)
+                    targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
                     pred_mean = _predict_single(model, images, histories)
                     val_loss = _fewshot_compute_loss(model, pred_mean, targets)
                     val_losses.append(float(val_loss.item()))
@@ -726,18 +725,9 @@ def main(
     # Load dataset and determine days to evaluate
     # ------------------------------------------------------------------
     print(f"Loading dataset from {dataset_path}...")
-    test_dataset = load_dataset(dataset_path, split="test")
-    day_index_map = group_indices_by_day(test_dataset._periods)
+    test_dataset, day_index_map, days_to_eval, _dataset_name = load_eval_days(dataset_path, start_day, num_days)
     print(f"Test set size: {len(test_dataset)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
-
-    all_days = generate_year_days()
-    if start_day not in all_days:
-        raise ValueError(f"Invalid start_day: {start_day!r}")
-    start_idx = all_days.index(start_day)
-
-    days_to_eval = all_days[start_idx : start_idx + num_days] if num_days > 0 else all_days[start_idx:]
-    days_to_eval = [d for d in days_to_eval if d in day_index_map]
 
     total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
     print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")

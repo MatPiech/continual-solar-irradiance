@@ -17,12 +17,12 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from cirr.datamodules.loading import load_dataset
 from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.evaluation.results import save_metrics_report, save_predictions_csv
+from cirr.evaluation.runner import load_eval_days
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.physics.clear_sky import load_clear_sky_lookup, resolve_clear_sky_value
 from cirr.tta import DualPhaseAdapter
-from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
 
@@ -163,46 +163,6 @@ class ResidualKNNMemory:
         return float(np.mean(top_errors))
 
 
-def _load_clear_sky_lookup(dataset_path: Path) -> dict[str, float]:
-    """Load clear-sky irradiance indexed by ``YYYYMMDD_HHMMSS`` timestamp.
-
-    Returns values scaled to ``kW/m^2`` to match dataset target scaling.
-    """
-    clear_sky_files = sorted(dataset_path.glob("*clear_sky.csv"))
-    if not clear_sky_files:
-        return {}
-
-    clear_sky_path = clear_sky_files[0]
-    frame = pd.read_csv(clear_sky_path)
-    if "datetime" not in frame.columns or "ghi_clear" not in frame.columns:
-        raise ValueError(f"Invalid clear-sky file format: {clear_sky_path}")
-
-    dt = pd.to_datetime(frame["datetime"], errors="coerce")
-    ghi_kw = frame["ghi_clear"].astype(float) / 1000.0
-    valid = ~dt.isna() & ghi_kw.notna()
-
-    keys = dt.loc[valid].dt.strftime("%Y%m%d_%H%M%S")
-    values = ghi_kw.loc[valid].astype(float)
-    return dict(zip(keys.tolist(), values.tolist(), strict=False))
-
-
-def _resolve_clear_sky_value(clear_sky_lookup: dict[str, float], timestamp: str) -> float | None:
-    """Resolve clear-sky value for a sample timestamp.
-
-    Image timestamps are second-level; clear-sky tables are often 1-minute.
-    Tries exact key first, then falls back to ``...SS=00`` for the same minute.
-    """
-    value = clear_sky_lookup.get(timestamp)
-    if value is not None:
-        return value
-
-    if len(timestamp) >= 15:
-        minute_key = f"{timestamp[:-2]}00"
-        return clear_sky_lookup.get(minute_key)
-
-    return None
-
-
 def _is_in_learning_zone(error_value: float, low: float, high: float) -> bool:
     """Return ``True`` when error lies inside the configured update band."""
     return low <= error_value <= high
@@ -330,7 +290,7 @@ def evaluate(
         day_regime2_count = 0
 
         for idx in tqdm(day_indices, desc=f"Day {day_key}", unit="sample", leave=False, file=sys.stderr):
-            image_input, irradiance_history, target_irradiance, image_name = dataset[idx]
+            image_input, irradiance_history, ghi_clear, target_irradiance, image_name = dataset[idx]
 
             images = image_input.unsqueeze(0).to(device)  # [1, C, H, W]
             irr_history = irradiance_history.unsqueeze(0).to(device)  # [1, hist]
@@ -341,7 +301,7 @@ def evaluate(
 
             timestamp_str = Path(str(image_name)).stem
             current_dt = pd.to_datetime(timestamp_str, format="%Y%m%d_%H%M%S", errors="coerce")
-            current_cs = _resolve_clear_sky_value(clear_sky_lookup, current_dt.strftime("%Y%m%d_%H%M%S"))
+            current_cs = resolve_clear_sky_value(clear_sky_lookup, current_dt.strftime("%Y%m%d_%H%M%S"))
 
             causal_queue.append(
                 {
@@ -370,7 +330,7 @@ def evaluate(
                     if ogd_gating == "raw":
                         error_value = raw_error
                     else:
-                        clear_sky = _resolve_clear_sky_value(clear_sky_lookup, str(oldest["timestamp"]))
+                        clear_sky = resolve_clear_sky_value(clear_sky_lookup, str(oldest["timestamp"]))
                         if clear_sky is None:
                             should_update = False
                             update_stats["skipped_no_clear_sky"] += 1
@@ -428,7 +388,7 @@ def evaluate(
 
                 target_dt = current_dt + pd.Timedelta(minutes=horizon_steps)
 
-                target_cs = _resolve_clear_sky_value(clear_sky_lookup, target_dt.strftime("%Y%m%d_%H%M%S"))
+                target_cs = resolve_clear_sky_value(clear_sky_lookup, target_dt.strftime("%Y%m%d_%H%M%S"))
 
                 # 1. Calculate Smart Persistence Prediction
                 if current_cs is not None and target_cs is not None and current_cs > 0:
@@ -447,7 +407,7 @@ def evaluate(
                         # Assuming 4 history steps are [t-15, t-10, t-5, t]
                         for offset in [15, 10, 5, 0]:
                             hist_dt = current_dt - pd.Timedelta(minutes=offset)
-                            hist_cs = _resolve_clear_sky_value(clear_sky_lookup, hist_dt.strftime("%Y%m%d_%H%M%S"))
+                            hist_cs = resolve_clear_sky_value(clear_sky_lookup, hist_dt.strftime("%Y%m%d_%H%M%S"))
                             # Fallback to current_cs if a history clear sky value is missing
                             cs_history_vals.append(hist_cs if hist_cs and hist_cs > 0 else current_cs)
 
@@ -967,7 +927,7 @@ def main(
         raise ValueError(f"Invalid OGD gating range: low={ogd_gating_low} > high={ogd_gating_high}.")
 
     # Always load clear sky data (required by the CSI dynamic router)
-    clear_sky_lookup = _load_clear_sky_lookup(dataset_path)
+    clear_sky_lookup = load_clear_sky_lookup(dataset_path)
     if not clear_sky_lookup:
         print("Warning: No '*clear_sky.csv' file was found. The CSI Router and Gating might fail.")
 
@@ -1015,18 +975,9 @@ def main(
     # Load dataset and determine days to evaluate
     # ------------------------------------------------------------------
     print(f"Loading dataset from {dataset_path}...")
-    test_dataset = load_dataset(dataset_path, split="test")
-    day_index_map = group_indices_by_day(test_dataset._periods)
+    test_dataset, day_index_map, days_to_eval, _dataset_name = load_eval_days(dataset_path, start_day, num_days)
     print(f"Test set size: {len(test_dataset)} samples")
     print(f"Number of unique days: {len(day_index_map)}\n")
-
-    all_days = generate_year_days()
-    if start_day not in all_days:
-        raise ValueError(f"Invalid start_day: {start_day!r}")
-    start_idx = all_days.index(start_day)
-
-    days_to_eval = all_days[start_idx : start_idx + num_days] if num_days > 0 else all_days[start_idx:]
-    days_to_eval = [d for d in days_to_eval if d in day_index_map]
 
     total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
     print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
