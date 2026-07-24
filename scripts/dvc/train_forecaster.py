@@ -1,12 +1,10 @@
-import os
 from pathlib import Path
 
 import click
-from dotenv import find_dotenv, load_dotenv
 import dvc.api
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, ModelSummary
-from lightning.pytorch.loggers import NeptuneLogger
+from lightning.pytorch.loggers import MLFlowLogger
 from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import OmegaConf
 import torch
@@ -23,8 +21,6 @@ log = utils.get_logger(__name__)
 @click.command()
 @click.option("--data-root", type=click.Path(exists=True, path_type=Path), required=True)
 def train_forecaster(data_root: Path):
-    load_dotenv(find_dotenv(".env"))
-
     cfg = OmegaConf.create(dvc.api.params_show()["train_forecaster"])
 
     pl.seed_everything(seed=cfg.seed)
@@ -64,15 +60,15 @@ def train_forecaster(data_root: Path):
         early_stopping_callback,
     ]
 
-    if not cfg.debug:
-        logger = NeptuneLogger(
-            api_key=os.environ["NEPTUNE_API_TOKEN"],
-            project=os.environ["NEPTUNE_PROJECT"],
-            log_model_checkpoints=False,
+    mlflow_cfg = cfg.get("mlflow", {})
+    if mlflow_cfg.get("enabled", False):
+        logger = MLFlowLogger(
+            experiment_name=mlflow_cfg.get("experiment_name", "forecaster"),
+            tracking_uri=mlflow_cfg.get("tracking_uri", "mlruns"),
+            run_name=mlflow_cfg.get("run_name") or None,
         )
         callbacks.append(lr_monitor)
-
-        logger.log_hyperparams(cfg.datamodule)
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     else:
         logger = None
 

@@ -161,14 +161,17 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Pre-commit cache
+.pre-commit-cache/
+
 # Lightning logs folder
 lightning_logs/
 
 # Model checkpoints
 checkpoints/
 
-# Neptune logger folder
-.neptune/
+# MLflow local tracking
+mlruns/
 
 # Data folders
 data/
