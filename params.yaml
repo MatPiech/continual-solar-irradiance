@@ -19,10 +19,16 @@ train_forecaster:
   seed: 42
 
   #### MODE ####
-  debug: True
   test_only: False
 
   restore_from_ckpt:
+
+  #### MLflow ####
+  mlflow:
+    enabled: false
+    tracking_uri: mlruns
+    experiment_name: solar-irradiance-forecasting
+    run_name:
 
   #### TRAINER ####
   trainer:

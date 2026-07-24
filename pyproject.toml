@@ -45,7 +45,7 @@ dev = [
     "timm",
     "transformers",
     # --------- loggers --------- #
-    # "neptune",
+    "mlflow",
     # --------- dvc --------- #
     "dvc[s3]",
     # --------- misc --------- #
