@@ -232,7 +232,16 @@ python scripts/pretrain_supcon.py \
   --output checkpoints/supcon_encoder.pt
 ```
 
-Output: `checkpoints/supcon_encoder.pt` (encoder weights only). Load into `Forecaster.image_encoder` before Step 4 if you use this checkpoint; forecaster training below starts from ImageNet by default (`params.yaml` → `model.pretrained: True`).
+Output: `checkpoints/supcon_encoder.pt`. Use it in forecaster training:
+
+```yaml
+# params.yaml
+train_forecaster:
+  model:
+    encoder_checkpoint: checkpoints/supcon_encoder.pt
+```
+
+When set, ImageNet init is skipped and the SupCon encoder is loaded before `train_forecaster.py` runs.
 
 ### Step 4 — Train the Forecaster (WACV Phase 2)
 

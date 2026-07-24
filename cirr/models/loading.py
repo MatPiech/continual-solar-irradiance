@@ -23,6 +23,18 @@ _DEFAULT_HPARAMS: dict = {
 }
 
 
+def load_image_encoder_checkpoint(model: Forecaster, checkpoint_path: Path | str, device: str = "cpu") -> None:
+    """Load encoder weights from ``pretrain_supcon.py`` output or a Lightning ckpt."""
+    data = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if isinstance(data, dict) and "image_encoder" in data:
+        state = data["image_encoder"]
+    elif isinstance(data, dict) and "state_dict" in data:
+        state = {k.removeprefix("image_encoder."): v for k, v in data["state_dict"].items() if k.startswith("image_encoder.")}
+    else:
+        raise ValueError(f"Unrecognized encoder checkpoint format: {checkpoint_path}")
+    model.image_encoder.load_state_dict(state, strict=False)
+
+
 def load_forecaster_from_checkpoint(
     checkpoint_path: Path,
     device: str = "cpu",
