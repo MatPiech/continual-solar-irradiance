@@ -1,4 +1,5 @@
 from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 
 import click
@@ -111,7 +112,7 @@ def evaluate_smart_persistence_model(
         last_clear_sky = clear_sky_dict.get(last_timestamp)
 
         # Get clear sky irradiance for target time
-        target_timestamp = last_timestamp + pd.Timedelta(minutes=forecasting_horizon)
+        target_timestamp = last_timestamp + timedelta(minutes=int(forecasting_horizon))
         target_clear_sky = clear_sky_dict.get(target_timestamp)
 
         if last_clear_sky is not None and target_clear_sky is not None and last_clear_sky > 0:
