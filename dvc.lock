@@ -3,19 +3,20 @@ stages:
   get_data:
     cmd: bash scripts/get_data.sh
     outs:
-    - path: data/Raw/Folsom_irradiance.csv
+    - path: data/folsom_raw/Folsom_irradiance.csv
       hash: md5
       md5: f7deba7ccd089dbd3f52a46405a7dfc2
       size: 76536976
-    - path: data/Raw/images/
+    - path: data/folsom_raw/images/
       hash: md5
       md5: de689666f9b1cf3c403f9de20e84e378.dir
       size: 64056845701
       nfiles: 775918
   convert_timestamps:
-    cmd: python scripts/convert_timestamps.py --data-raw data/Raw --output-path data/Prepared/images
+    cmd: python scripts/convert_timestamps.py --data-raw data/folsom_raw
+      --output-path data/folsom_prepared/images
     deps:
-    - path: data/Raw/images/
+    - path: data/folsom_raw/images/
       hash: md5
       md5: 234b68378a387383601e76c4800ec5b7.dir
       size: 63496
@@ -25,21 +26,22 @@ stages:
       md5: f38bbee75b58b0acb9dcb88ce5f3a601
       size: 920
     outs:
-    - path: data/Prepared/images
+    - path: data/folsom_prepared/images
       hash: md5
       md5: dd6cd7f293eaf3dfb5178f5bd19c0097.dir
       size: 63904746427
       nfiles: 773978
   clean_dataframe:
-    cmd: python scripts/clean_dataframe.py --data-raw data/Raw --images-path data/Prepared/images
-      --output-path data/Prepared/cleaned_irradiance.csv
+    cmd: python scripts/clean_dataframe.py --data-raw data/folsom_raw
+      --images-path data/folsom_prepared/images --output-path
+      data/folsom_prepared/cleaned_irradiance.csv
     deps:
-    - path: data/Prepared/images
+    - path: data/folsom_prepared/images
       hash: md5
       md5: dd6cd7f293eaf3dfb5178f5bd19c0097.dir
       size: 63904746427
       nfiles: 773978
-    - path: data/Raw/Folsom_irradiance.csv
+    - path: data/folsom_raw/Folsom_irradiance.csv
       hash: md5
       md5: f7deba7ccd089dbd3f52a46405a7dfc2
       size: 76536976
@@ -48,15 +50,16 @@ stages:
       md5: 496c3732d2858e429230b0cbac4510b0
       size: 1579
     outs:
-    - path: data/Prepared/cleaned_irradiance.csv
+    - path: data/folsom_prepared/cleaned_irradiance.csv
       hash: md5
       md5: 04425339057a4d994421b7b02a7b97f5
       size: 48285445
   export_periods:
-    cmd: python scripts/export_periods.py --cleaned-dataframe-path data/Prepared/cleaned_irradiance.csv
-      --time-window 15 --time-shift 5 --history-size 4 --output-path data/Prepared/periods.pickle
+    cmd: python scripts/export_periods.py --cleaned-dataframe-path
+      data/folsom_prepared/cleaned_irradiance.csv --time-window 15 --time-shift 5
+      --history-size 4 --output-path data/folsom_prepared/periods.pickle
     deps:
-    - path: data/Prepared/cleaned_irradiance.csv
+    - path: data/folsom_prepared/cleaned_irradiance.csv
       hash: md5
       md5: 04425339057a4d994421b7b02a7b97f5
       size: 48285445
@@ -70,7 +73,7 @@ stages:
         export_periods.time_shift: 5
         export_periods.time_window: 15
     outs:
-    - path: data/Prepared/periods.pickle
+    - path: data/folsom_prepared/periods.pickle
       hash: md5
       md5: 69485f800ce7b1a3c4e1ab00f957c566
       size: 127099759

@@ -1,12 +1,12 @@
 from pathlib import Path
+import pickle
 
 import albumentations as A
 from lightning import LightningDataModule
 import numpy as np
-import pandas as pd
 import torch.utils.data
 
-from cirr.datamodules.datasets import FolsomDataset
+from cirr.datamodules.datasets import SkyImageDataset
 
 
 class ForecastingDataModule(LightningDataModule):
@@ -37,12 +37,14 @@ class ForecastingDataModule(LightningDataModule):
 
         self._transforms = A.ReplayCompose(
             [
+                A.CenterCrop(height=1520, width=1520),
                 A.Resize(image_size[1], image_size[0]),
             ]
         )
         self._augmentations = A.ReplayCompose(
             [
                 # transforms
+                A.CenterCrop(height=1520, width=1520),
                 A.Resize(image_size[1], image_size[0]),
                 # geometry augmentations
                 A.Affine(rotate=(-10, 10), translate_percent=(-10, 10), scale=(0.9, 1.1)),
@@ -57,11 +59,18 @@ class ForecastingDataModule(LightningDataModule):
 
     def setup(self, stage: str) -> None:
         with self._periods_path.open("rb") as f:
-            periods = pd.read_pickle(f)
+            periods = pickle.load(f)
 
-        test_periods = list(filter(lambda p: p["history"][-1]["image_name"].startswith("2016"), periods))
-        train_val_periods = list(filter(lambda p: not p["history"][-1]["image_name"].startswith("2016"), periods))
+        # Determine split year: use 2016 if available, otherwise use median year
+        years = set()
+        for period in periods:
+            year = period["history"][-1]["image_name"][:4]
+            years.add(year)
 
+        split_year = "2016" if "2016" in years else sorted(years)[len(years) // 2]
+
+        test_periods = list(filter(lambda p: p["history"][-1]["image_name"].startswith(split_year), periods))
+        train_val_periods = list(filter(lambda p: not p["history"][-1]["image_name"].startswith(split_year), periods))
         # number of days for validatation dataset to get 80-20 ratio of train-val datasets
         val_size = 146
         np.random.seed(self._seed)
@@ -77,7 +86,7 @@ class ForecastingDataModule(LightningDataModule):
         val_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] in val_dates, train_val_periods))
         train_periods = list(filter(lambda p: p["history"][-1]["image_name"][:8] not in val_dates, train_val_periods))
 
-        self._train_dataset = FolsomDataset(
+        self._train_dataset = SkyImageDataset(
             data_root=self._data_root,
             periods=train_periods,
             transforms=self._augmentations if self._augment else self._transforms,
@@ -85,7 +94,7 @@ class ForecastingDataModule(LightningDataModule):
             image_mean=self._image_mean,
             image_std=self._image_std,
         )
-        self._val_dataset = FolsomDataset(
+        self._val_dataset = SkyImageDataset(
             data_root=self._data_root,
             periods=val_periods,
             transforms=self._transforms,
@@ -93,7 +102,7 @@ class ForecastingDataModule(LightningDataModule):
             image_mean=self._image_mean,
             image_std=self._image_std,
         )
-        self._test_dataset = FolsomDataset(
+        self._test_dataset = SkyImageDataset(
             data_root=self._data_root,
             periods=test_periods,
             transforms=self._transforms,

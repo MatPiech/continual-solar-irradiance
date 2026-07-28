@@ -1,7 +1,8 @@
 import lightning.pytorch as pl
 import timm
 import torch
-from torch.optim import Optimizer
+import torch.nn as nn
+import torch.nn.functional as F
 import torchmetrics
 
 
@@ -19,34 +20,44 @@ class Forecaster(pl.LightningModule):
 
         self._lr = lr
         self._lr_patience = lr_patience
+        self.loss_name = loss_function
 
+        # 1. Flag to check if we are doing Uncertainty Quantification
+        self.is_probabilistic = loss_function == "GNLL"
+
+        # 2. Image Encoder
         self.image_encoder = timm.create_model(
             model_name.replace("timm-", ""),
             pretrained=pretrained,
-            num_classes=1,
+            num_classes=0,  # num_classes=0 removes the final classification layer automatically in newer timm versions
             in_chans=input_channels,
         )
-        self.num_features = self.image_encoder.fc.in_features
-        self.image_encoder.fc = torch.nn.Identity()
 
-        self.num_features += 4  # Add 4 historical irradiances
-        self.network_head = torch.nn.Sequential(
-            torch.nn.Linear(self.num_features, 256),
-            torch.nn.ReLU(inplace=False),
-            torch.nn.Linear(256, 1),
+        # Handling timm version differences for retrieving feature dim
+        if hasattr(self.image_encoder, "num_features"):
+            self.num_features = self.image_encoder.num_features
+        else:
+            # Fallback for some models
+            self.num_features = self.image_encoder.fc.in_features
+            self.image_encoder.fc = torch.nn.Identity()
+
+        # 3. Dynamic Head Construction
+        # If Probabilistic (GNLL), we need 2 outputs [Mean, Var].
+        # For MSE/MAE, we only need 1 [Mean].
+        output_dim = 2 if self.is_probabilistic else 1
+
+        fusion_input_dim = self.num_features + 4  # Image features + 4 history values
+
+        self.network_head = nn.Sequential(
+            nn.Linear(fusion_input_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, output_dim),
         )
 
-        if loss_function == "MSE":
-            self.loss = torch.nn.MSELoss()
-        elif loss_function == "MAE":
-            self.loss = torch.nn.L1Loss()
-        elif loss_function == "SmoothL1":
-            self.loss = torch.nn.SmoothL1Loss()
-        elif loss_function == "Huber":
-            self.loss = torch.nn.HuberLoss(delta=0.1)
-        else:
-            raise NotImplementedError(f"Unsupported loss function: {loss_function}")
+        # 4. Initialize Loss & Metrics
+        self.loss_fn = self._configure_loss(loss_function)
 
+        # Standard metrics for solar forecasting
         metrics = torchmetrics.MetricCollection(
             [
                 torchmetrics.MeanSquaredError(),
@@ -54,59 +65,113 @@ class Forecaster(pl.LightningModule):
                 torchmetrics.MeanAbsolutePercentageError(),
             ]
         )
-
         self.train_metrics = metrics.clone("train_")
         self.val_metrics = metrics.clone("val_")
         self.test_metrics = metrics.clone("test_")
 
         self.save_hyperparameters()
 
-    def optimizer_zero_grad(self, epoch: int, batch_idx: int, optimizer: Optimizer):
-        optimizer.zero_grad(set_to_none=True)
+    def _configure_loss(self, loss_name):
+        """Factory method to get the correct loss function."""
+        if loss_name == "GNLL":
+            return nn.GaussianNLLLoss()
+        elif loss_name == "MSE":
+            return nn.MSELoss()
+        elif loss_name == "MAE":
+            return nn.L1Loss()
+        elif loss_name == "SmoothL1":
+            return nn.SmoothL1Loss()
+        elif loss_name == "Huber":
+            return nn.HuberLoss(delta=0.1)
+        else:
+            raise ValueError(f"Unsupported loss function: {loss_name}")
 
-    def forward(self, x: torch.Tensor, irradiance_history: torch.Tensor) -> torch.Tensor:
-        x = self.image_encoder(x)
-        x = self.network_head(torch.cat([x, irradiance_history], dim=1))
-        return x
+    def forward(self, x: torch.Tensor, irradiance_history: torch.Tensor):
+        """
+        Unified forward pass.
+        Returns: (mean, variance)
+        Note: 'variance' will be None if using MSE/MAE.
+        """
+        # 1. Encode Image
+        img_feats = self.image_encoder(x)
 
-    def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor | None:
-        source_images, source_irradiances, target_irradiances = batch
-        predicted_irradiances = self.forward(source_images, source_irradiances)
+        # 2. Fuse with History
+        fused = torch.cat([img_feats, irradiance_history], dim=1)
 
-        loss = self.loss(predicted_irradiances, target_irradiances)
-        if torch.isinf(loss):
-            return None
+        # 3. Predict
+        out = self.network_head(fused)
 
-        self.log("train_loss", loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
-        self.train_metrics.update(predicted_irradiances, target_irradiances)
-        self.log_dict(self.train_metrics, sync_dist=True)
+        if self.is_probabilistic:
+            # Split: [Batch, 2] -> Mean [Batch, 1], Variance [Batch, 1]
+            mean = out[:, 0].unsqueeze(1)
+            # Softplus + epsilon ensures variance > 0
+            log_var = out[:, 1].unsqueeze(1)
+            variance = F.softplus(log_var) + 1e-6
+            return mean, variance
+        else:
+            # Standard Regression: [Batch, 1]
+            return out, None
+
+    def _shared_step(self, batch, stage):
+        """
+        Handles the logic for Train, Val, and Test to avoid code duplication.
+        """
+        source_images, source_irradiances, target_irradiances, _ = batch
+
+        # Forward pass
+        pred_mean, pred_var = self(source_images, source_irradiances)
+
+        # Compute Loss
+        if self.is_probabilistic:
+            loss = self.loss_fn(pred_mean, target_irradiances, pred_var)
+            # Log uncertainty only if available and trainer is registered
+            if hasattr(self, "_trainer") and self._trainer is not None:
+                self.log(f"{stage}_uncertainty_mean", pred_var.mean(), on_epoch=True, sync_dist=True)
+        else:
+            loss = self.loss_fn(pred_mean, target_irradiances)
+
+        # Compute Standard Metrics (Accuracy)
+        # Metrics always compare (Prediction vs Target), ignoring variance
+        if stage == "train":
+            self.train_metrics(pred_mean, target_irradiances)
+            if hasattr(self, "_trainer") and self._trainer is not None:
+                self.log_dict(self.train_metrics, on_step=False, on_epoch=True, sync_dist=True)
+        elif stage == "val":
+            self.val_metrics(pred_mean, target_irradiances)
+            if hasattr(self, "_trainer") and self._trainer is not None:
+                self.log_dict(self.val_metrics, on_step=False, on_epoch=True, sync_dist=True)
+        elif stage == "test":
+            self.test_metrics(pred_mean, target_irradiances)
+            if hasattr(self, "_trainer") and self._trainer is not None:
+                self.log_dict(self.test_metrics, on_step=False, on_epoch=True, sync_dist=True)
+
+        if hasattr(self, "_trainer") and self._trainer is not None:
+            self.log(f"{stage}_loss", loss, on_step=(stage == "train"), on_epoch=True, sync_dist=True, prog_bar=True)
 
         return loss
 
-    def validation_step(self, batch: torch.Tensor, batch_idx: int) -> None:
-        source_images, source_irradiances, target_irradiances = batch
-        predicted_irradiances = self.forward(source_images, source_irradiances)
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
 
-        loss = self.loss(predicted_irradiances, target_irradiances)
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, "val")
 
-        self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.val_metrics.update(predicted_irradiances, target_irradiances)
-        self.log_dict(self.val_metrics, sync_dist=True)
+    def test_step(self, batch, batch_idx):
+        return self._shared_step(batch, "test")
 
-    def test_step(self, batch: torch.Tensor, batch_idx: int):
-        source_images, source_irradiances, target_irradiances = batch
-        predicted_irradiances = self.forward(source_images, source_irradiances)
-
-        loss = self.loss(predicted_irradiances, target_irradiances)
-
-        self.log("test_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.test_metrics.update(predicted_irradiances, target_irradiances)
-        self.log_dict(self.test_metrics, sync_dist=True)
+    def optimizer_zero_grad(self, epoch, batch_idx, optimizer):
+        optimizer.zero_grad(set_to_none=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self._lr)
-        reduce_lr_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=self._lr_patience, min_lr=1e-6, verbose=True
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=self._lr_patience, min_lr=1e-6
         )
-
-        return {"optimizer": optimizer, "lr_scheduler": reduce_lr_on_plateau, "monitor": "train_loss_epoch"}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",  # Ensure this matches the log name in validation_step
+                "frequency": 1,
+            },
+        }
