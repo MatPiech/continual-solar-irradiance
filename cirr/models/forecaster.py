@@ -1,28 +1,27 @@
-from typing import Optional
-
 import lightning.pytorch as pl
 import timm
 import torch
-import torchmetrics
 from torch.optim import Optimizer
+import torchmetrics
 
 
 class Forecaster(pl.LightningModule):
-    def __init__(self,
-                 model_name: str,
-                 pretrained: bool,
-                 input_channels: int,
-                 loss_function: str,
-                 lr: float,
-                 lr_patience: int,
-                 ):
+    def __init__(
+        self,
+        model_name: str,
+        pretrained: bool,
+        input_channels: int,
+        loss_function: str,
+        lr: float,
+        lr_patience: int,
+    ):
         super().__init__()
 
         self._lr = lr
         self._lr_patience = lr_patience
 
         self.image_encoder = timm.create_model(
-            model_name.replace('timm-', ''),
+            model_name.replace("timm-", ""),
             pretrained=pretrained,
             num_classes=1,
             in_chans=input_channels,
@@ -37,26 +36,28 @@ class Forecaster(pl.LightningModule):
             torch.nn.Linear(256, 1),
         )
 
-        if loss_function == 'MSE':
+        if loss_function == "MSE":
             self.loss = torch.nn.MSELoss()
-        elif loss_function == 'MAE':
+        elif loss_function == "MAE":
             self.loss = torch.nn.L1Loss()
-        elif loss_function == 'SmoothL1':
+        elif loss_function == "SmoothL1":
             self.loss = torch.nn.SmoothL1Loss()
-        elif loss_function == 'Huber':
+        elif loss_function == "Huber":
             self.loss = torch.nn.HuberLoss(delta=0.1)
         else:
-            raise NotImplementedError(f'Unsupported loss function: {loss_function}')
+            raise NotImplementedError(f"Unsupported loss function: {loss_function}")
 
-        metrics = torchmetrics.MetricCollection([
-            torchmetrics.MeanSquaredError(),
-            torchmetrics.MeanAbsoluteError(),
-            torchmetrics.MeanAbsolutePercentageError(),
-        ])
+        metrics = torchmetrics.MetricCollection(
+            [
+                torchmetrics.MeanSquaredError(),
+                torchmetrics.MeanAbsoluteError(),
+                torchmetrics.MeanAbsolutePercentageError(),
+            ]
+        )
 
-        self.train_metrics = metrics.clone('train_')
-        self.val_metrics = metrics.clone('val_')
-        self.test_metrics = metrics.clone('test_')
+        self.train_metrics = metrics.clone("train_")
+        self.val_metrics = metrics.clone("val_")
+        self.test_metrics = metrics.clone("test_")
 
         self.save_hyperparameters()
 
@@ -68,7 +69,7 @@ class Forecaster(pl.LightningModule):
         x = self.network_head(torch.cat([x, irradiance_history], dim=1))
         return x
 
-    def training_step(self, batch: torch.Tensor, batch_idx: int) -> Optional[torch.Tensor]:
+    def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor | None:
         source_images, source_irradiances, target_irradiances = batch
         predicted_irradiances = self.forward(source_images, source_irradiances)
 
@@ -76,7 +77,7 @@ class Forecaster(pl.LightningModule):
         if torch.isinf(loss):
             return None
 
-        self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("train_loss", loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
         self.train_metrics.update(predicted_irradiances, target_irradiances)
         self.log_dict(self.train_metrics, sync_dist=True)
 
@@ -88,7 +89,7 @@ class Forecaster(pl.LightningModule):
 
         loss = self.loss(predicted_irradiances, target_irradiances)
 
-        self.log('val_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
         self.val_metrics.update(predicted_irradiances, target_irradiances)
         self.log_dict(self.val_metrics, sync_dist=True)
 
@@ -98,23 +99,14 @@ class Forecaster(pl.LightningModule):
 
         loss = self.loss(predicted_irradiances, target_irradiances)
 
-        self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("test_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
         self.test_metrics.update(predicted_irradiances, target_irradiances)
         self.log_dict(self.test_metrics, sync_dist=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self._lr)
         reduce_lr_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.5,
-            patience=self._lr_patience,
-            min_lr=1e-6,
-            verbose=True
+            optimizer, mode="min", factor=0.5, patience=self._lr_patience, min_lr=1e-6, verbose=True
         )
 
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': reduce_lr_on_plateau,
-            'monitor': 'train_loss_epoch'
-        }
+        return {"optimizer": optimizer, "lr_scheduler": reduce_lr_on_plateau, "monitor": "train_loss_epoch"}

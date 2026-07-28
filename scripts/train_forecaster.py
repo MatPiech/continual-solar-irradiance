@@ -2,35 +2,35 @@ import os
 from pathlib import Path
 
 import click
+from dotenv import find_dotenv, load_dotenv
 import dvc.api
 import lightning.pytorch as pl
-import torch
-from dotenv import find_dotenv, load_dotenv
-from lightning.pytorch.callbacks import ModelCheckpoint, ModelSummary, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, ModelSummary
 from lightning.pytorch.loggers import NeptuneLogger
 from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import OmegaConf
+import torch
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 
-from continual_solar_irradiance.datamodules.forecasting import ForecastingDataModule
-from continual_solar_irradiance.models.forecaster import Forecaster
-from continual_solar_irradiance.utils import utils
+from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.models.forecaster import Forecaster
+from cirr.utils import utils
 
 log = utils.get_logger(__name__)
 
 
 @click.command()
-@click.option('--data-root', type=click.Path(exists=True, path_type=Path), required=True)
+@click.option("--data-root", type=click.Path(exists=True, path_type=Path), required=True)
 def train_forecaster(data_root: Path):
-    load_dotenv(find_dotenv('.env'))
+    load_dotenv(find_dotenv(".env"))
 
-    cfg = OmegaConf.create(dvc.api.params_show()['train_forecaster'])
+    cfg = OmegaConf.create(dvc.api.params_show()["train_forecaster"])
 
     pl.seed_everything(seed=cfg.seed)
 
     datamodule = ForecastingDataModule(
         root_data_path=data_root,
-        periods_path=data_root / 'periods.pickle',
+        periods_path=data_root / "periods.pickle",
         augment=cfg.datamodule.augment,
         image_size=cfg.datamodule.image_size,
         image_mean=cfg.datamodule.image_mean,
@@ -52,7 +52,7 @@ def train_forecaster(data_root: Path):
     checkpoint_callback = ModelCheckpoint(**cfg.callbacks.model_checkpoint)
     model_summary_callback = ModelSummary(max_depth=1)
     early_stopping_callback = EarlyStopping(**cfg.callbacks.early_stopping)
-    lr_monitor = LearningRateMonitor(logging_interval='step')
+    lr_monitor = LearningRateMonitor(logging_interval="step")
 
     callbacks = [
         checkpoint_callback,
@@ -62,8 +62,8 @@ def train_forecaster(data_root: Path):
 
     if not cfg.debug:
         logger = NeptuneLogger(
-            api_key=os.environ['NEPTUNE_API_TOKEN'],
-            project=os.environ['NEPTUNE_PROJECT'],
+            api_key=os.environ["NEPTUNE_API_TOKEN"],
+            project=os.environ["NEPTUNE_PROJECT"],
             log_model_checkpoints=False,
         )
         callbacks.append(lr_monitor)
@@ -72,12 +72,12 @@ def train_forecaster(data_root: Path):
     else:
         logger = None
 
-    torch.set_float32_matmul_precision('medium')
+    torch.set_float32_matmul_precision("medium")
     trainer = pl.Trainer(
         logger=logger,
         callbacks=callbacks,
         devices=cfg.trainer.devices if not None else -1,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
         strategy=DDPStrategy(
             ddp_comm_wrapper=default.fp16_compress_wrapper,
             gradient_as_bucket_view=True,
@@ -94,20 +94,20 @@ def train_forecaster(data_root: Path):
 
     if not cfg.test_only:
         if cfg.model.compile:
-            log.info('Compiling model')
+            log.info("Compiling model")
             model = torch.compile(model)
 
-        log.info('Starting training process')
+        log.info("Starting training process")
         trainer.fit(model, datamodule)
 
-        log.info('Starting testing process for the best checkpoint')
-        trainer.test(model, datamodule, ckpt_path='best')
-        log.info(f'Best model checkpoint: {trainer.checkpoint_callback.best_model_path}')
+        log.info("Starting testing process for the best checkpoint")
+        trainer.test(model, datamodule, ckpt_path="best")
+        log.info(f"Best model checkpoint: {trainer.checkpoint_callback.best_model_path}")
     else:
         assert cfg.restore_from_ckpt is not None
-        log.info(f'Starting testing process for {cfg.restore_from_ckpt} checkpoint')
+        log.info(f"Starting testing process for {cfg.restore_from_ckpt} checkpoint")
         trainer.test(model, datamodule, ckpt_path=cfg.restore_from_ckpt)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_forecaster()

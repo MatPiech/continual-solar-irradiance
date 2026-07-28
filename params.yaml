@@ -28,7 +28,7 @@ train_forecaster:
     devices: 1
     precision: bf16-mixed
     min_epochs: 5
-    max_epochs: 20
+    max_epochs: 30
 
   #### MODEL ####
   model:
