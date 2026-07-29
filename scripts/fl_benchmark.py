@@ -71,6 +71,7 @@ import torch
 from cirr.continual import build_gated_thresholds, train_gated_day
 from cirr.data.loading import load_dataset
 from cirr.fl.kc_prototypes import (
+    DEFAULT_KC_EDGES,
     PROTO_CLASS_NAMES,
     aggregate_global_prototypes,
     extract_day_prototypes,
@@ -198,6 +199,7 @@ def _process_client_day(
 
         loss = 0.0
         gate_stats: dict[str, int | float] = {}
+        proto_bin_edges: tuple[float, float] = DEFAULT_KC_EDGES
         if train:
             if gated and gate_optimizer is not None and gate_prototypes is not None:
                 gate_stats = train_gated_day(
@@ -242,13 +244,20 @@ def _process_client_day(
                     client_name=name,
                     global_prototypes=global_prototypes,
                     proto_lambda=proto_lambda,
+                    proto_bin_edges=proto_bin_edges,
                 )
 
         # Step 4: Extract per-class prototypes (FedProto — after training
         # so features reflect the updated model)
         day_protos: dict[int, tuple[torch.Tensor, int]] = {}
         if train and extract_prototypes and day_samples:
-            day_protos = extract_day_prototypes(model, day_samples, device, adapt_batch_size)
+            day_protos = extract_day_prototypes(
+                model,
+                day_samples,
+                device,
+                adapt_batch_size,
+                edges=proto_bin_edges,
+            )
 
         # Step 5: Update recent FIFO buffer
         if train and recent_buffer_size > 0:
@@ -267,6 +276,7 @@ def _process_client_day(
         "rmse": metrics.get("rmse", float("nan")),
         "loss": loss,
         "day_prototypes": day_protos,
+        "proto_bin_edges": proto_bin_edges,
         "gate_stats": gate_stats,
         "gate_opened": bool(gate_stats.get("backprop", 0)),
     }
@@ -514,9 +524,12 @@ def run_fl_benchmark(
 
     # --- FedProto state: per-class prototype accumulators and per-client global prototypes ---
     _proto_accum: list[dict[int, tuple[torch.Tensor, int]]] = [{} for _ in clients]
+    # Aggregate KC bin edges over each sync interval (defaults unless overridden).
+    _proto_edge_accum: list[dict[str, float]] = [{"low_sum": 0.0, "high_sum": 0.0, "count": 0.0} for _ in clients]
     # Per-client personalised global prototypes (attention-weighted).
     # After the first FedProto sync this becomes a list of dicts, one per client.
     _per_client_global_protos: list[dict[int, torch.Tensor]] | None = None
+    fedproto_round_diagnostics: list[dict[str, Any]] = []
 
     # --- Gated FL state ---
     _is_gated = algorithm == "gated"
@@ -689,6 +702,11 @@ def run_fl_benchmark(
             # FedProto: accumulate per-class prototypes for this client
             if _is_fedproto and result.get("day_prototypes"):
                 accumulate_prototypes(_proto_accum[i], result["day_prototypes"])
+            if _is_fedproto and result.get("proto_bin_edges") is not None:
+                low_edge, high_edge = result["proto_bin_edges"]
+                _proto_edge_accum[i]["low_sum"] += float(low_edge)
+                _proto_edge_accum[i]["high_sum"] += float(high_edge)
+                _proto_edge_accum[i]["count"] += 1.0
 
             if _is_gated and result.get("gate_opened"):
                 day_gate_samples = [datasets[i][idx] for idx in day_maps[i].get(_day_key, [])[:64]]
@@ -800,8 +818,43 @@ def run_fl_benchmark(
                                 _w_str = "  ".join(f"{client_names[j]}={_attn_weights[cls][i][j]:.3f}" for j in present)
                                 print(f"  {'':6}                {client_names[i]:>12s} → {_w_str}")
 
+                # Export-ready diagnostics rows for reproducibility / paper appendix.
+                for cls in _all_classes:
+                    cls_name = PROTO_CLASS_NAMES.get(cls, str(cls))
+                    for i in range(len(client_names)):
+                        support_count = 0
+                        if cls in _proto_accum[i]:
+                            support_count = int(_proto_accum[i][cls][1])
+                        if _proto_edge_accum[i]["count"] > 0:
+                            low_mean = _proto_edge_accum[i]["low_sum"] / _proto_edge_accum[i]["count"]
+                            high_mean = _proto_edge_accum[i]["high_sum"] / _proto_edge_accum[i]["count"]
+                        else:
+                            low_mean, high_mean = float("nan"), float("nan")
+
+                        for j in range(len(client_names)):
+                            attn_ij = float(
+                                _attn_weights.get(cls, [[0.0] * len(client_names) for _ in range(len(client_names))])[i][j]
+                            )
+                            fedproto_round_diagnostics.append(
+                                {
+                                    "fl_round": fl_round_idx,
+                                    "day": day_key,
+                                    "class_id": int(cls),
+                                    "class_name": cls_name,
+                                    "source_client_idx": int(i),
+                                    "source_client": client_names[i],
+                                    "target_client_idx": int(j),
+                                    "target_client": client_names[j],
+                                    "attention_weight": attn_ij,
+                                    "source_support_count": support_count,
+                                    "source_kc_edge_low_mean": low_mean,
+                                    "source_kc_edge_high_mean": high_mean,
+                                }
+                            )
+
                 # Reset accumulators for next sync interval
                 _proto_accum = [{} for _ in clients]
+                _proto_edge_accum = [{"low_sum": 0.0, "high_sum": 0.0, "count": 0.0} for _ in clients]
 
             elif algorithm == "gated":
                 gated_indices = [
@@ -992,6 +1045,7 @@ def run_fl_benchmark(
         "per_day": per_day,
         "per_round": per_round,
         "overall_metrics": overall_metrics,
+        "fedproto_round_diagnostics": fedproto_round_diagnostics,
         "models": ditto_models if algorithm == "ditto" else models,
         "last_global_state_dict": last_global_state_dict,
     }
@@ -1216,6 +1270,7 @@ def run_fl_benchmark(
         "Directory to save results.  Creates:\n"
         "  <dir>/per_day.csv     — daily MAE/RMSE for all clients.\n"
         "  <dir>/per_round.csv   — per-FL-round statistics.\n"
+        "  <dir>/fedproto_round_diagnostics.csv — per-round FedProto attention/support/edge logs (fedproto only).\n"
         "  <dir>/summary.json    — overall metrics and config."
     ),
 )
@@ -1321,6 +1376,11 @@ def main(
             df_round = pd.DataFrame(results["per_round"])
             df_round.to_csv(save_results / "per_round.csv", index=False)
 
+        # FedProto diagnostics (only populated for --algorithm fedproto)
+        if results.get("fedproto_round_diagnostics"):
+            df_proto_diag = pd.DataFrame(results["fedproto_round_diagnostics"])
+            df_proto_diag.to_csv(save_results / "fedproto_round_diagnostics.csv", index=False)
+
         # Per-client model checkpoints (last model state after simulation)
         ckpt_dir = save_results / "checkpoints"
         ckpt_dir.mkdir(exist_ok=True)
@@ -1337,7 +1397,11 @@ def main(
             print(f"  {_global_path}")
 
         # Summary JSON (exclude large per_day / per_round lists and non-serialisable models)
-        summary = {k: v for k, v in results.items() if k not in ("per_day", "per_round", "models", "last_global_state_dict")}
+        summary = {
+            k: v
+            for k, v in results.items()
+            if k not in ("per_day", "per_round", "fedproto_round_diagnostics", "models", "last_global_state_dict")
+        }
         summary["config"] = {
             "checkpoint": str(checkpoint),
             "clients": [(name, str(path)) for name, path in clients],
@@ -1366,6 +1430,8 @@ def main(
         print(f"  per_day.csv   ({len(results['per_day'])} rows)")
         if results["per_round"]:
             print(f"  per_round.csv ({len(results['per_round'])} rows)")
+        if results.get("fedproto_round_diagnostics"):
+            print(f"  fedproto_round_diagnostics.csv ({len(results['fedproto_round_diagnostics'])} rows)")
         print("  summary.json")
         _n_global = 1 if results["last_global_state_dict"] is not None else 0
         print(f"  checkpoints/  ({len(_final_models)} local models{', 1 global' if _n_global else ''})")

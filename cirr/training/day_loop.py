@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from cirr.fl.kc_prototypes import classify_irradiance
+from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, classify_irradiance
 from cirr.models.forecaster import Forecaster
 
 
@@ -83,6 +83,7 @@ def train_day(
     client_name: str = "",
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
+    proto_bin_edges: tuple[float, float] | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     extra_loss_fn: Callable[[torch.Tensor, Forecaster], torch.Tensor] | None = None,
     shuffle_each_epoch: bool = True,
@@ -123,6 +124,8 @@ def train_day(
     proto_on_device: dict[int, torch.Tensor] = {}
     if use_proto:
         proto_on_device = {cls: proto.detach().to(device) for cls, proto in global_prototypes.items()}
+        if proto_bin_edges is None:
+            proto_bin_edges = DEFAULT_KC_EDGES
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -188,7 +191,7 @@ def train_day(
                 proto_loss = torch.tensor(0.0, device=device)
                 n_proto = 0
                 for b in range(imgs.size(0)):
-                    cls = classify_irradiance(tgts[b].item())
+                    cls = classify_irradiance(float(tgts[b].item()), proto_bin_edges or DEFAULT_KC_EDGES)
                     if cls in proto_on_device:
                         proto_loss = proto_loss + F.mse_loss(img_feats[b], proto_on_device[cls])
                         n_proto += 1
