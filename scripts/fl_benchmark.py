@@ -882,6 +882,10 @@ def run_fl_benchmark(
                     if gated_proto_accum:
                         global_csi_protos = aggregate_prototypes(gated_proto_accum)
                         for i in range(len(clients)):
+                            # Keep LOSO holdout's local gating prototypes untouched:
+                            # it is intentionally excluded from federation.
+                            if loso_holdout and client_names[i] == loso_holdout:
+                                continue
                             _gated_prototypes[i] = global_csi_protos
                     print(f"  {'':6}      [gated] Aggregated adapters from {len(gated_indices)} gated client(s)")
                 else:
