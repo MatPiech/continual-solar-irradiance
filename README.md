@@ -70,6 +70,7 @@ continual-solar-irradiance/
 | `scripts/evaluate_sm_rls.py` | Sherman–Morrison RLS head |
 | `scripts/evaluate_gated.py` | CSI prototype gating |
 | `scripts/local_training.py` | Per-day local continual training |
+| `scripts/local_gated_training.py` | Per-day local continual training with delayed prototype gating |
 | **Federated & benchmarks** | |
 | `scripts/fl_benchmark.py` | Multi-site FL benchmark |
 | `scripts/fl_edge_overhead_benchmark.py` | FL round platform cost (edge devices) |
@@ -420,6 +421,12 @@ python scripts/evaluate_gated.py \
 python scripts/local_training.py \
   --checkpoint checkpoints/epoch_024.ckpt \
   --dataset-path data/poznan_prepared
+
+python scripts/local_gated_training.py \
+  --checkpoint checkpoints/epoch_024.ckpt \
+  --dataset-path data/poznan_prepared \
+  --gate-calibration-samples 300 \
+  --gate-horizon-steps 3
 
 python scripts/fl_benchmark.py \
   --checkpoint checkpoints/epoch_007.ckpt \
