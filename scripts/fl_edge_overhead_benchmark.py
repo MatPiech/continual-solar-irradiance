@@ -18,8 +18,8 @@ Measured dimensions
 
 Methodology notes
 -----------------
-* FedProto follows the same weather-class thresholds and attention-weighted
-  personalised prototype aggregation as ``fl_benchmark.py``.
+* FedProto follows the same data-driven weather-class binning and
+  attention-weighted personalised prototype aggregation as ``fl_benchmark.py``.
 * FedBN, FedPer, FedProx, Ditto, and FedEMA are benchmarked according to the
   *current implementation* in this repository. In particular, FedBN and
   FedPer still upload full client state dicts and receive full merged models;
@@ -46,6 +46,7 @@ import torch
 import torch.nn.functional as F
 
 from cirr.fl.kc_prototypes import (
+    DEFAULT_KC_EDGES,
     aggregate_global_prototypes,
     classify_irradiance,
     extract_day_prototypes,
@@ -205,6 +206,7 @@ def _train_local_model(
     mu: float = 0.0,
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
+    proto_bin_edges: tuple[float, float] | None = None,
 ) -> None:
     model.train()
     optimizer = torch.optim.AdamW(
@@ -225,6 +227,8 @@ def _train_local_model(
     use_proto = global_prototypes is not None and proto_lambda > 0.0
     if use_proto:
         proto_on_device = {key: value.detach().to(device) for key, value in global_prototypes.items()}
+        if proto_bin_edges is None:
+            proto_bin_edges = DEFAULT_KC_EDGES
 
     for _ in range(epochs):
         for start in range(0, len(samples), batch_size):
@@ -259,7 +263,10 @@ def _train_local_model(
                 proto_loss = torch.tensor(0.0, device=device)
                 proto_count = 0
                 for batch_idx in range(images.size(0)):
-                    cls = classify_irradiance(float(targets[batch_idx].item()))
+                    cls = classify_irradiance(
+                        float(targets[batch_idx].item()),
+                        proto_bin_edges or DEFAULT_KC_EDGES,
+                    )
                     if cls in proto_on_device:
                         proto_loss = proto_loss + F.mse_loss(image_features[batch_idx], proto_on_device[cls])
                         proto_count += 1
@@ -330,7 +337,13 @@ def _benchmark_algorithm(
     ]
 
     initial_proto_accum = [
-        extract_day_prototypes(model, samples, device, batch_size)
+        extract_day_prototypes(
+            model,
+            samples,
+            device,
+            batch_size,
+            edges=DEFAULT_KC_EDGES,
+        )
         for model, samples in zip(clients, client_samples, strict=False)
     ]
     proto_cache, _ = aggregate_global_prototypes(initial_proto_accum)
@@ -374,6 +387,7 @@ def _benchmark_algorithm(
                 mu=fedprox_mu if algorithm == "fedprox" else 0.0,
                 global_prototypes=proto_cache[client_idx] if algorithm == "fedproto" else None,
                 proto_lambda=fedproto_lambda if algorithm == "fedproto" else 0.0,
+                proto_bin_edges=DEFAULT_KC_EDGES if algorithm == "fedproto" else None,
             )
             _sync_device(device)
             local_train_s.append(perf_counter() - train_start)
@@ -382,7 +396,13 @@ def _benchmark_algorithm(
 
             if algorithm == "fedproto":
                 proto_start = perf_counter()
-                client_proto = extract_day_prototypes(model, client_samples[client_idx], device, batch_size)
+                client_proto = extract_day_prototypes(
+                    model,
+                    client_samples[client_idx],
+                    device,
+                    batch_size,
+                    edges=DEFAULT_KC_EDGES,
+                )
                 _sync_device(device)
                 proto_extract_s.append(perf_counter() - proto_start)
                 round_proto_accum.append(client_proto)
