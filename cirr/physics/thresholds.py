@@ -33,10 +33,13 @@ def fit_thresholds(
 def compute_intra_bin_distances(
     embeddings: torch.Tensor,
     bin_indices: list[int],
+    metric: str = "euclidean",
 ) -> dict[int, list[float]]:
-    """Compute Euclidean distance of each embedding to its bin centroid."""
+    """Compute distance of each embedding to its bin centroid."""
     if embeddings.ndim != 2:
         raise ValueError("embeddings must be [N, D]")
+    if metric not in {"euclidean", "cosine"}:
+        raise ValueError("metric must be 'euclidean' or 'cosine'")
 
     by_bin: dict[int, list[torch.Tensor]] = {}
     for idx, b in enumerate(bin_indices):
@@ -45,7 +48,12 @@ def compute_intra_bin_distances(
     centroids = {b: torch.stack(v).mean(dim=0) for b, v in by_bin.items()}
     distances: dict[int, list[float]] = {b: [] for b in centroids}
     for idx, b in enumerate(bin_indices):
-        dist = torch.norm(embeddings[idx] - centroids[b], p=2).item()
+        if metric == "cosine":
+            e = torch.nn.functional.normalize(embeddings[idx], dim=0)
+            c = torch.nn.functional.normalize(centroids[b], dim=0)
+            dist = (1.0 - torch.dot(e, c)).item()
+        else:
+            dist = torch.norm(embeddings[idx] - centroids[b], p=2).item()
         distances[b].append(dist)
     return distances
 
