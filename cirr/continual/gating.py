@@ -42,7 +42,7 @@ def evaluate_gate(
     random_gate: bool = False,
     distance_unaware: bool = False,
 ) -> tuple[GateZone, float, float]:
-    dist = prototype_distance(embedding.cpu(), prototype.cpu())
+    dist = prototype_distance(embedding.cpu(), prototype.cpu(), metric="cosine")
     e_rel = relative_clear_sky_error(y_hat, y_t, ghi_clear)
 
     if random_gate:
@@ -225,7 +225,28 @@ def eval_gated_online(
 def build_gated_thresholds(
     model, dataset, device: str, n_samples: int = 300
 ) -> tuple[dict[int, torch.Tensor], dict[int, dict[str, float]]]:
-    samples = [dataset[i] for i in range(min(n_samples, len(dataset)))]
+    total = len(dataset)
+    if total == 0:
+        return {}, {}
+    sample_count = min(n_samples, total)
+    if sample_count >= total:
+        sample_indices = list(range(total))
+    else:
+        # Cover the full dataset instead of only the first window.
+        step = (total - 1) / float(sample_count - 1)
+        sample_indices = sorted({int(round(i * step)) for i in range(sample_count)})
+        if len(sample_indices) < sample_count:
+            missing = sample_count - len(sample_indices)
+            used = set(sample_indices)
+            for idx in range(total):
+                if idx in used:
+                    continue
+                sample_indices.append(idx)
+                missing -= 1
+                if missing == 0:
+                    break
+            sample_indices.sort()
+    samples = [dataset[i] for i in sample_indices]
     prototypes = aggregate_prototypes([extract_prototypes(model, samples, device, batch_size=32)])
 
     embeddings, bins = [], []
@@ -237,4 +258,4 @@ def build_gated_thresholds(
 
     if not embeddings:
         return prototypes, {}
-    return prototypes, fit_thresholds(compute_intra_bin_distances(torch.stack(embeddings), bins))
+    return prototypes, fit_thresholds(compute_intra_bin_distances(torch.stack(embeddings), bins, metric="cosine"))
