@@ -53,12 +53,17 @@ def evaluate_gate(
     if not distance_unaware and dist > tau_ood:
         return GateZone.OOD, dist, e_rel
 
+    # Near-prototype region: use delayed relative clear-sky error as adaptation signal.
     if distance_unaware or dist <= tau_norm:
         if e_rel <= epsilon:
             return GateZone.NORMAL, dist, e_rel
         return GateZone.DRIFT, dist, e_rel
 
-    return GateZone.OOD, dist, e_rel
+    # Ambiguous middle band (tau_norm, tau_ood]:
+    # do not force OOD; decide by physics error just like near-prototype region.
+    if e_rel <= epsilon:
+        return GateZone.NORMAL, dist, e_rel
+    return GateZone.DRIFT, dist, e_rel
 
 
 def should_backprop(zone: GateZone) -> bool:
