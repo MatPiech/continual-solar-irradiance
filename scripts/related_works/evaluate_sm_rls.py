@@ -20,6 +20,12 @@ The head is adapted with a single closed-form RLS step per sample:
 
 where φ is the feature vector entering the layer, e_t = y_t - ŷ_t is the
 prediction error, and λ ∈ (0, 1] is a forgetting factor.
+
+Reference:
+    Zhang, J., Xu, Y., Xue, J., and Xiao, W.
+    Real-time prediction of solar radiation based on online sequential extreme learning machine.
+    In 2018 13th IEEE Conference on Industrial Electronics and Applications (ICIEA). 2018.
+    doi: 10.1109/ICIEA.2018.8397688
 """
 
 from pathlib import Path

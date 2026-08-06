@@ -1,4 +1,4 @@
-"""Evaluate forecasting with the paper-method lagged OGD continual adaptation.
+"""Evaluate forecasting with the lagged OGD continual adaptation.
 
 Implements Algorithm 1 from the paper directly:
 
@@ -13,7 +13,9 @@ Implements Algorithm 1 from the paper directly:
 
 Default thresholds per the paper: T1 = 0.01 kW/m2, T2 = 0.1 kW/m2.
 
-No DualPhaseAdapter, no AR residual filter, no k-NN memory, no dynamic router.
+Reference:
+    Piechocki, M., Kraft, M., Capotondi, A. On-device continual adaptation for reliable solar irradiance forecasting.
+    In Advanced Concepts for Intelligent Vision Systems. 2026. doi: 10.1007/978-3-032-07343-3_28
 """
 
 from pathlib import Path
