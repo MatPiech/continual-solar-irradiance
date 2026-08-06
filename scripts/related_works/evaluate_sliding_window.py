@@ -24,6 +24,11 @@ Example (horizon_steps=15, buffer_size=4):
 
 The causal delay queue and the adaptation buffer are both cleared at day
 boundaries to prevent overnight ground-truth leakage.
+
+Reference:
+    Lara-Benitez, P., Carranza-Garcia, M., Luna-Romera, J., and Riquelme, J.
+    Short-term solar irradiance forecasting in streaming with deep learning.
+    Neurocomputing, doi: 10.1016/j.neucom.2023.126312.
 """
 
 from collections import deque
