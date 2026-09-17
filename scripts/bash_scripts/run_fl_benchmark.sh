@@ -126,7 +126,6 @@ run_algorithm() {
         --fedema-alpha        "${FEDEMA_ALPHA}" \
         --fedproto-lambda     "${FEDPROTO_LAMBDA}" \
         --regime-label        "${REGIME_LABEL}" \
-        --daylight-filter \
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \

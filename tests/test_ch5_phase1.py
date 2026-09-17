@@ -16,7 +16,6 @@ import torch
 from cirr.fl.kc_prototypes import aggregate_global_prototypes, default_edges, make_regime_labeller
 from cirr.fl.server import payload_nbytes
 from cirr.models.forecaster import Forecaster
-from cirr.physics.clear_sky import DAYLIGHT_MAX_ZENITH, is_daylight
 
 _spec = importlib.util.spec_from_file_location("fl_benchmark", Path(__file__).parents[1] / "scripts/fl_benchmark.py")
 fb = importlib.util.module_from_spec(_spec)
@@ -52,15 +51,6 @@ def test_f3_clear_sky_label_differs_from_proxy_at_low_sun():
     # Single-regime collapse (stratify: single)
     single = make_regime_labeller("clear_sky", ())
     assert single(0.25, 0.28) == single(0.9, 1.0) == 0
-
-
-def test_f4_daylight_predicate():
-    lookup = {"20240101_120000": 40.0, "20240101_180000": 88.0}
-    assert is_daylight(lookup, "20240101_120000")
-    assert not is_daylight(lookup, "20240101_180000")
-    assert DAYLIGHT_MAX_ZENITH == 85.0
-    # Unknown timestamps are kept rather than silently emptying the dataset.
-    assert is_daylight(lookup, "20240101_235959")
 
 
 def test_f6_align_target_controls():

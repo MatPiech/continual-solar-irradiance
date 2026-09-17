@@ -107,7 +107,7 @@ from cirr.fl.server import AGGREGATION_FNS, _compute_weight_change, is_bn_key, i
 from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
-from cirr.physics.clear_sky import DAYLIGHT_MAX_ZENITH, is_daylight, load_clear_sky_lookup, load_zenith_lookup
+from cirr.physics.clear_sky import load_clear_sky_lookup
 from cirr.training.day_loop import predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
@@ -299,11 +299,6 @@ def _sp_rmse(stats: tuple[float, int] | None) -> float:
     if not stats or stats[1] == 0:
         return float("nan")
     return float((stats[0] / stats[1]) ** 0.5)
-
-
-def _period_stamp(period: dict[str, Any]) -> str:
-    """``YYYYMMDD_HHMMSS`` key of a period's most recent image."""
-    return period["history"][-1]["image_name"].rsplit(".", 1)[0]
 
 
 def client_mean_prototypes(accum: dict[int, tuple[torch.Tensor, int]]) -> dict[int, torch.Tensor]:
@@ -602,7 +597,6 @@ def run_fl_benchmark(
     participation: str = "full",
     join_days: dict[str, int] | None = None,
     local_history_days: int = 0,
-    daylight_filter: bool = True,
     ft_epochs: int = 1,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
@@ -729,34 +723,16 @@ def run_fl_benchmark(
     # rather than an RMSE so the Forecast-Skill denominator can later be pooled
     # over exactly the days the model was scored on.
     sp_day_stats: list[dict[str, tuple[float, int]]] = []
-    daylight_kept: list[int] = []
     clear_sky_lookups: list[dict[str, float]] = []
     for name, path in clients:
         ds = load_dataset(path, split="test")
         dm = group_indices_by_day(ds.periods)
 
-        # Daylight cut, applied once to the day index map so that training and
-        # evaluation see exactly the same population (Ch.4 and Ch.5 share it).
-        n_before = sum(len(v) for v in dm.values())
-        if daylight_filter:
-            zenith = load_zenith_lookup(path)
-            if not zenith:
-                raise ValueError(
-                    f"{name}: no 'zenith' column in {path}/*clear_sky.csv. "
-                    f"Regenerate it with scripts/clear_sky.py, or pass --no-daylight-filter."
-                )
-            dm = {day: [i for i in idxs if is_daylight(zenith, _period_stamp(ds.periods[i]))] for day, idxs in dm.items()}
-            dm = {day: idxs for day, idxs in dm.items() if idxs}
-        n_after = sum(len(v) for v in dm.values())
-        daylight_kept.append(n_after)
-
         clear_sky_lookups.append(load_clear_sky_lookup(path))
         sp_day_stats.append({})
         datasets.append(ds)
         day_maps.append(dm)
-        _dropped = f"  (daylight filter dropped {n_before - n_after} of {n_before})" if daylight_filter else ""
-        _filter_state = "on" if daylight_filter else "OFF"
-        print(f"  {name}: {n_after} periods{_dropped}  [daylight filter {_filter_state}]")
+        print(f"  {name}: {sum(len(v) for v in dm.values())} periods")
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -1580,8 +1556,6 @@ def run_fl_benchmark(
         "participation": participation,
         "join_days": join_days,
         "local_history_days": local_history_days,
-        "daylight_filter": daylight_filter,
-        "daylight_kept_samples": dict(zip(client_names, daylight_kept, strict=False)),
         "wall_time_s": round(time.time() - started_at, 3),
         "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
         "metrics_daily": metrics_daily,
@@ -1735,12 +1709,6 @@ def run_fl_benchmark(
     default=0,
     show_default=True,
     help="Days of its own past data a joining client may replay (needs --recent-buffer-size > 0).",
-)
-@click.option(
-    "--daylight-filter/--no-daylight-filter",
-    default=True,
-    show_default=True,
-    help=f"Drop samples with apparent solar zenith >= {DAYLIGHT_MAX_ZENITH} deg from training and evaluation.",
 )
 @click.option(
     "--ft-epochs",
@@ -1986,7 +1954,6 @@ def main(
     participation: str,
     join_day: tuple[str, ...],
     local_history_days: int,
-    daylight_filter: bool,
     ft_epochs: int,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
@@ -2038,7 +2005,6 @@ def main(
         participation=participation,
         join_days=join_days,
         local_history_days=local_history_days,
-        daylight_filter=daylight_filter,
         ft_epochs=ft_epochs,
     )
 
@@ -2098,8 +2064,6 @@ def main(
                     "participation": participation,
                     "join_days": join_days,
                     "local_history_days": local_history_days,
-                    "daylight_filter": daylight_filter,
-                    "daylight_max_zenith": DAYLIGHT_MAX_ZENITH,
                     "ft_epochs": ft_epochs,
                     "loso_holdout": loso_holdout,
                     "method_params": {
