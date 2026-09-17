@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from cirr.fl.prototypes import extract_binned_prototypes
 from cirr.models.forecaster import Forecaster
+from cirr.physics.csi import CSI_CLEAR, CSI_OVERCAST, compute_csi
 
 PROTO_OVERCAST = 0
 PROTO_TRANSIENT = 1
@@ -22,6 +25,46 @@ PROTO_CLASS_NAMES = {
 #   clear     : >= 0.65
 DEFAULT_KC_EDGES = (0.30, 0.65)
 DEFAULT_EDGE_QUANTILES = (1.0 / 3.0, 2.0 / 3.0)
+
+# Clear-sky-index regime boundaries, reusing the physics module's cut points so
+# gating and prototype stratification label the sky the same way.
+DEFAULT_CSI_EDGES = (CSI_OVERCAST, CSI_CLEAR)
+
+# Regime label sources.  "proxy" normalises by a fixed 1000 W/m^2 (the target is
+# already stored in kW/m^2), so the same label means different sky states at
+# different latitudes; "clear_sky" divides by the site-and-time Ineichen-Perez
+# clear-sky irradiance and does not.
+REGIME_LABELS = ("proxy", "clear_sky")
+
+
+def classify_value(value: float, edges: tuple[float, ...]) -> int:
+    """Bin *value* against ascending *edges*; no edges means a single regime."""
+    for idx, edge in enumerate(edges):
+        if value < edge:
+            return idx
+    return len(edges)
+
+
+def default_edges(label: str) -> tuple[float, float]:
+    return DEFAULT_KC_EDGES if label == "proxy" else DEFAULT_CSI_EDGES
+
+
+def make_regime_labeller(label: str, edges: tuple[float, ...]) -> Callable[[float, float], int]:
+    """Return ``fn(target, ghi_clear) -> regime id`` for the chosen label source."""
+    if label not in REGIME_LABELS:
+        raise ValueError(f"Unknown regime label {label!r}. Choose from {REGIME_LABELS}.")
+    if label == "proxy":
+        return lambda target, _ghi: classify_value(target, edges)
+    return lambda target, ghi: classify_value(compute_csi(target, ghi), edges)
+
+
+def regime_names(n_classes: int) -> dict[int, str]:
+    """Human-readable regime names; the physical triple keeps its usual names."""
+    if n_classes == 3:
+        return dict(PROTO_CLASS_NAMES)
+    if n_classes == 1:
+        return {0: "all"}
+    return {i: f"regime{i}" for i in range(n_classes)}
 
 
 def classify_irradiance(norm_irradiance: float, edges: tuple[float, float] = DEFAULT_KC_EDGES) -> int:
@@ -64,21 +107,29 @@ def fit_kc_bin_edges(
     return low, high
 
 
+def _sample_ghi_clear(sample: tuple[torch.Tensor, ...]) -> float:
+    ghi = sample[2]
+    return float(ghi.item() if isinstance(ghi, torch.Tensor) else ghi)
+
+
 def extract_day_prototypes(
     model: Forecaster,
     day_samples: list[tuple[torch.Tensor, ...]],
     device: str,
     batch_size: int,
     edges: tuple[float, float] | None = None,
+    labeller: Callable[[float, float], int] | None = None,
 ) -> dict[int, tuple[torch.Tensor, int]]:
-    # Runtime adaptation uses fixed physics defaults unless caller overrides.
-    bin_edges = edges if edges is not None else DEFAULT_KC_EDGES
+    """Extract per-regime prototypes; *labeller* must match the one used in training."""
+    if labeller is None:
+        bin_edges = edges if edges is not None else DEFAULT_KC_EDGES
+        labeller = make_regime_labeller("proxy", bin_edges)
     return extract_binned_prototypes(
         model,
         day_samples,
         device,
         batch_size,
-        lambda sample: classify_irradiance(_sample_target(sample), bin_edges),
+        lambda sample: labeller(_sample_target(sample), _sample_ghi_clear(sample)),
     )
 
 
@@ -93,6 +144,7 @@ def _zscore(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def aggregate_global_prototypes(
     client_protos: list[dict[int, tuple[torch.Tensor, int]]],
+    attention: bool = True,
 ) -> tuple[list[dict[int, torch.Tensor]], dict[int, list[list[float]]]]:
     """Aggregate class prototypes with adaptive attention.
 
@@ -114,7 +166,8 @@ def aggregate_global_prototypes(
     per_client_protos: list[dict[int, torch.Tensor]] = [{} for _ in range(n_clients)]
     attention_weights: dict[int, list[list[float]]] = {}
 
-    for cls in (PROTO_OVERCAST, PROTO_TRANSIENT, PROTO_CLEAR):
+    all_classes = sorted({cls for means in client_means for cls in means})
+    for cls in all_classes:
         present = [i for i in range(n_clients) if cls in client_means[i]]
         if not present:
             continue
@@ -136,10 +189,14 @@ def aggregate_global_prototypes(
         sim_scale = sim_matrix.std(unbiased=False).clamp(min=1e-4)
         sim_logits = sim_matrix / sim_scale
 
-        # Reliability prior: larger support count -> stronger contribution.
-        count_logits = _zscore(torch.log1p(count_vec))
-        attn_logits = sim_logits + count_logits.unsqueeze(0)
-        attn = torch.softmax(attn_logits, dim=1)
+        if attention:
+            # Reliability prior: larger support count -> stronger contribution.
+            count_logits = _zscore(torch.log1p(count_vec))
+            attn_logits = sim_logits + count_logits.unsqueeze(0)
+            attn = torch.softmax(attn_logits, dim=1)
+        else:
+            # Ablation: plain unweighted consensus, every peer counted equally.
+            attn = torch.full((len(present), len(present)), 1.0 / len(present))
         weighted = attn @ proto_stack
 
         cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]

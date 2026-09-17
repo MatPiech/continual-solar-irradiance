@@ -45,3 +45,41 @@ def resolve_clear_sky_value(clear_sky_lookup: dict[str, float], timestamp: str) 
         return clear_sky_lookup.get(minute_key)
 
     return None
+
+
+# Solar zenith beyond which a sample is treated as night/twilight and dropped
+# from training and evaluation.  Shared by every chapter so error populations
+# stay comparable across sites and experiments.
+DAYLIGHT_MAX_ZENITH = 85.0
+
+
+def load_zenith_lookup(dataset_path: Path) -> dict[str, float]:
+    """Load apparent solar zenith (degrees) indexed by ``YYYYMMDD_HHMMSS``.
+
+    Reads the ``zenith`` column of the site's ``*clear_sky.csv``.  Returns an
+    empty dict when the file predates that column, which callers must treat as
+    "cannot filter" and refuse rather than as "no daylight".
+    """
+    clear_sky_files = sorted(dataset_path.glob("*clear_sky.csv"))
+    if not clear_sky_files:
+        return {}
+
+    frame = pd.read_csv(clear_sky_files[0])
+    if "datetime" not in frame.columns or "zenith" not in frame.columns:
+        return {}
+
+    dt = pd.to_datetime(frame["datetime"], errors="coerce")
+    zenith = frame["zenith"].astype(float)
+    valid = ~dt.isna() & zenith.notna()
+    keys = dt.loc[valid].dt.strftime("%Y%m%d_%H%M%S")
+    return dict(zip(keys.tolist(), zenith.loc[valid].tolist(), strict=False))
+
+
+def is_daylight(zenith_lookup: dict[str, float], timestamp: str, max_zenith: float = DAYLIGHT_MAX_ZENITH) -> bool:
+    """True when the sample's apparent zenith is below *max_zenith*.
+
+    Unknown timestamps are kept, so a missing solar table degrades to the
+    unfiltered behaviour instead of silently emptying the dataset.
+    """
+    zenith = resolve_clear_sky_value(zenith_lookup, timestamp)
+    return True if zenith is None else zenith < max_zenith

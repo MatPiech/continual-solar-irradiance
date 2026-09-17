@@ -43,6 +43,9 @@ def generate_clear_sky_reference(
     # Rename 'ghi' to 'ghi_clear' for clarity.
     clearsky_data = clearsky.rename(columns={"ghi": "ghi_clear"})
     clearsky_data.drop(columns=["dni", "dhi"], inplace=True)
+    # Apparent zenith rides along so downstream code can apply a daylight cut
+    # (zenith < 85 deg) without re-deriving solar geometry.
+    clearsky_data["zenith"] = solar_pos["apparent_zenith"]
 
     # Ensure nighttime GHI is 0 and not NaN
     clearsky_data["ghi_clear"] = clearsky_data["ghi_clear"].fillna(0).clip(lower=0)

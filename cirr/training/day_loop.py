@@ -12,8 +12,13 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, classify_irradiance
+from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, make_regime_labeller
 from cirr.models.forecaster import Forecaster
+
+# Upper bound on the adaptive task-loss/prototype-loss ratio used to scale the
+# FedProto regularisation term (see its use in `train_day`). Prevents gradient
+# spikes when a client's embeddings are already very close to their prototype.
+_MAX_PROTO_LOSS_SCALE = 100.0
 
 
 def predict_day(
@@ -83,7 +88,7 @@ def train_day(
     client_name: str = "",
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
-    proto_bin_edges: tuple[float, float] | None = None,
+    classify_fn: Callable[[float, float], int] | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     extra_loss_fn: Callable[[torch.Tensor, Forecaster], torch.Tensor] | None = None,
     shuffle_each_epoch: bool = True,
@@ -124,8 +129,10 @@ def train_day(
     proto_on_device: dict[int, torch.Tensor] = {}
     if use_proto:
         proto_on_device = {cls: proto.detach().to(device) for cls, proto in global_prototypes.items()}
-        if proto_bin_edges is None:
-            proto_bin_edges = DEFAULT_KC_EDGES
+        if classify_fn is None:
+            # Same default as prototype extraction, so the alignment target of a
+            # sample is always the prototype of the regime it was counted into.
+            classify_fn = make_regime_labeller("proxy", DEFAULT_KC_EDGES)
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -150,7 +157,7 @@ def train_day(
 
         _pbar = tqdm(
             batches,
-            desc=f"  [{client_name}] train e{ep+1}/{epochs}",
+            desc=f"  [{client_name}] train e{ep + 1}/{epochs}",
             leave=False,
             unit="batch",
             file=sys.stdout,
@@ -161,10 +168,13 @@ def train_day(
                 imgs = torch.stack([item[0] for item in batch]).to(device)
                 hist = torch.stack([item[1] for item in batch]).to(device)
                 tgts = torch.stack([item[3] for item in batch]).to(device)
+                ghis = [float(item[2]) for item in batch] if use_proto else None
             else:
-                imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)  # type: ignore[index]
-                hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)  # type: ignore[index]
-                tgts = torch.stack([ds[idx][3] for ds, idx in batch]).to(device)  # type: ignore[index]
+                rows = [ds[idx] for ds, idx in batch]  # type: ignore[index]
+                imgs = torch.stack([r[0] for r in rows]).to(device)
+                hist = torch.stack([r[1] for r in rows]).to(device)
+                tgts = torch.stack([r[3] for r in rows]).to(device)
+                ghis = [float(r[2]) for r in rows] if use_proto else None
 
             optimizer.zero_grad()
 
@@ -191,14 +201,21 @@ def train_day(
                 proto_loss = torch.tensor(0.0, device=device)
                 n_proto = 0
                 for b in range(imgs.size(0)):
-                    cls = classify_irradiance(float(tgts[b].item()), proto_bin_edges or DEFAULT_KC_EDGES)
+                    cls = classify_fn(float(tgts[b].item()), (ghis or [0.0])[b])
                     if cls in proto_on_device:
                         proto_loss = proto_loss + F.mse_loss(img_feats[b], proto_on_device[cls])
                         n_proto += 1
                 if n_proto > 0:
                     avg_proto = proto_loss / n_proto
                     task_loss_val = loss.detach()
-                    scale = task_loss_val / (avg_proto.detach() + 1e-8)
+                    # Clamp the scale, not just the epsilon floor: as embeddings
+                    # converge onto their prototype, avg_proto -> 0 and the
+                    # *value* of scale * avg_proto still cancels to ~task_loss,
+                    # but the gradient (scale * d(avg_proto)/dw, since scale is
+                    # detached) does not — it grows unbounded and can spike the
+                    # local update right as the client nears consensus. Capping
+                    # scale bounds that gradient contribution.
+                    scale = (task_loss_val / (avg_proto.detach() + 1e-8)).clamp(max=_MAX_PROTO_LOSS_SCALE)
                     loss = loss + proto_lambda * scale * avg_proto
 
             if extra_loss_fn is not None:

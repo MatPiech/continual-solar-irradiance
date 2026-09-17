@@ -41,6 +41,21 @@ Algorithms
             prototypes (Clear/Overcast/Transient) instead of model weights.
             Local loss is regularised toward global consensus prototypes.
 
+Note on fedbn / fedper communication cost: this script has every client
+upload its *full* state dict regardless of algorithm — fedbn/fedper only
+drop keys server-side during aggregation, so the reduced-bandwidth benefit
+those algorithms are usually chosen for is not exercised here. For actual
+upload/download payload measurements, use
+`scripts/fl_edge_overhead_benchmark.py`.
+
+Weighted aggregation: all weight-based algorithms average clients weighted
+by each client's local sample count since the last round (canonical
+FedAvg's n_k/n weighting), not a uniform per-client mean.
+
+LOSO holdout (`--loso-holdout SITE`): excludes that client from every
+federation round for *any* algorithm — it trains purely locally and never
+contributes to or receives the aggregated result.
+
 Usage
 -----
   python scripts/fl_benchmark.py \\
@@ -54,41 +69,238 @@ Usage
     --save-results results/static_7day
 """
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import copy
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import random
+import subprocess
+import time
 from typing import Any
 
 import click
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 
 from cirr.continual import build_gated_thresholds, train_gated_day
 from cirr.data.loading import load_dataset
+from cirr.evaluation.smart_persistence import predict_periods
 from cirr.fl.kc_prototypes import (
     DEFAULT_KC_EDGES,
     PROTO_CLASS_NAMES,
+    REGIME_LABELS,
     aggregate_global_prototypes,
+    default_edges,
     extract_day_prototypes,
+    make_regime_labeller,
+    regime_names,
 )
 from cirr.fl.prototypes import accumulate_prototypes, aggregate_prototypes, extract_prototypes
-from cirr.fl.server import AGGREGATION_FNS, is_bn_key, is_head_key
+from cirr.fl.server import AGGREGATION_FNS, _compute_weight_change, is_bn_key, is_head_key, payload_nbytes
 from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.physics.clear_sky import DAYLIGHT_MAX_ZENITH, is_daylight, load_clear_sky_lookup, load_zenith_lookup
 from cirr.training.day_loop import predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
 
+# Algorithms that exchange prototypes rather than weights.
+PROTO_ALGORITHMS = ("fedproto",)
+# Controls for the exchanged prototype, used to test whether the mechanism is
+# active at all (H5.2) rather than only whether it is harmless (H5.1).
+ALIGN_TARGETS = ("global", "own", "shuffled", "random")
+
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+
+
+def set_determinism(seed: int) -> None:
+    """Pin every RNG the day loop touches, and ask torch for deterministic kernels."""
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    # warn_only: some timm kernels have no deterministic implementation; a warning
+    # is more useful than refusing to run the benchmark at all.
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:  # provenance is best-effort, never fatal
+        return "unknown"
+
+
+def parse_edges(spec: str | None, label: str) -> tuple[float, ...]:
+    """Parse a comma-separated regime cut-point list; empty string = one regime."""
+    if spec is None:
+        return default_edges(label)
+    spec = spec.strip()
+    if not spec:
+        return ()
+    edges = tuple(float(x) for x in spec.split(","))
+    if list(edges) != sorted(edges):
+        raise ValueError(f"--regime-edges must be ascending, got {edges}")
+    return edges
+
+
+def make_participation(spec: str, client_names: list[str], seed: int) -> Callable[[int, int], bool]:
+    """Build ``participates(client_idx, fl_round) -> bool`` from a schedule spec.
+
+    ``full`` | ``dropout:<p>`` | ``outage:<client>:<start_round>:<n_rounds>``.
+    Dropout draws are seeded from the run seed, so a rerun of the same seed drops
+    the same clients in the same rounds.
+    """
+    if spec == "full":
+        return lambda _i, _r: True
+
+    kind, _, rest = spec.partition(":")
+    if kind == "dropout":
+        prob = float(rest)
+        if not 0.0 <= prob < 1.0:
+            raise ValueError(f"dropout probability must be in [0, 1), got {prob}")
+
+        def _dropout(client_idx: int, fl_round: int) -> bool:
+            rng = random.Random((seed, fl_round, client_idx).__hash__())
+            return rng.random() >= prob
+
+        return _dropout
+
+    if kind == "outage":
+        name, start_s, days_s = rest.split(":")
+        if name not in client_names:
+            raise ValueError(f"outage client {name!r} not among {client_names}")
+        idx, start, span = client_names.index(name), int(start_s), int(days_s)
+        return lambda client_idx, fl_round: not (client_idx == idx and start <= fl_round < start + span)
+
+    raise ValueError(f"Unknown --participation spec {spec!r}")
+
+
+def apply_align_target(
+    per_client_protos: list[dict[int, torch.Tensor]],
+    own_protos: list[dict[int, torch.Tensor]],
+    align_target: str,
+    fl_round: int,
+    seed: int,
+) -> list[dict[int, torch.Tensor]]:
+    """Replace the aggregated prototype with a control variant.
+
+    ``own`` removes the exchange entirely (nothing is sent or received, so the
+    alignment term becomes a self-consistency penalty); ``shuffled`` keeps the
+    received vectors but mis-assigns them across regimes; ``random`` keeps only
+    the magnitude.  Together they separate "collaboration is harmless" from
+    "collaboration does nothing".
+    """
+    if align_target == "global":
+        return per_client_protos
+    if align_target == "own":
+        return [dict(p) for p in own_protos]
+
+    rng = random.Random((seed, fl_round, align_target).__hash__())
+    out: list[dict[int, torch.Tensor]] = []
+    for protos in per_client_protos:
+        classes = sorted(protos)
+        if align_target == "shuffled":
+            shuffled = list(classes)
+            rng.shuffle(shuffled)
+            out.append({cls: protos[other] for cls, other in zip(classes, shuffled, strict=True)})
+        else:  # random, norm-matched
+            out.append(
+                {
+                    cls: torch.randn(
+                        protos[cls].shape,
+                        generator=torch.Generator().manual_seed(rng.randrange(2**31)),
+                    )
+                    * (protos[cls].norm() / math.sqrt(protos[cls].numel()))
+                    for cls in classes
+                }
+            )
+    return out
+
+
+def _seed_history(
+    buffer: RecentBuffer,
+    dataset: Any,
+    day_map: dict[str, list[int]],
+    all_days: list[str],
+    join_day_num: int,
+    history_days: int,
+) -> None:
+    """Give a joining client *history_days* of its own past data, nothing more."""
+    if history_days <= 0:
+        return
+    for day in all_days[max(0, join_day_num - history_days) : join_day_num]:
+        if day in day_map:
+            buffer.add_day(dataset, day_map[day])
+
+
+def _pooled_train(
+    models: list[Forecaster],
+    datasets: list[Any],
+    day_maps: list[dict[str, list[int]]],
+    day_key: str,
+    joined: list[bool],
+    *,
+    adapt_lr: float,
+    adapt_weight_decay: float,
+    adapt_max_grad_norm: float,
+    adapt_batch_size: int,
+    adapt_epochs: int,
+    device: str,
+    rng_seed: int,
+) -> float:
+    """Oracle update: one model, one epoch over the union of every client's day.
+
+    Other clients' samples ride in through the existing replay channel, which is
+    already a list of ``(dataset, index)`` pairs, so no new data path is needed.
+    Every client shares the same model object, so the update reaches all of them.
+    """
+    primary = next((i for i, ok in enumerate(joined) if ok and day_maps[i].get(day_key)), None)
+    if primary is None:
+        return 0.0
+    union = [
+        (datasets[j], idx) for j in range(len(models)) if joined[j] and j != primary for idx in day_maps[j].get(day_key, [])
+    ]
+    return train_day(
+        models[primary],
+        datasets[primary],
+        day_maps[primary][day_key],
+        lr=adapt_lr,
+        weight_decay=adapt_weight_decay,
+        max_grad_norm=adapt_max_grad_norm,
+        batch_size=adapt_batch_size,
+        epochs=adapt_epochs,
+        device=device,
+        replay_entries=union or None,
+        rng_seed=rng_seed,
+        client_name="pooled",
+    )
+
+
+def _period_stamp(period: dict[str, Any]) -> str:
+    """``YYYYMMDD_HHMMSS`` key of a period's most recent image."""
+    return period["history"][-1]["image_name"].rsplit(".", 1)[0]
+
+
+def client_mean_prototypes(accum: dict[int, tuple[torch.Tensor, int]]) -> dict[int, torch.Tensor]:
+    return {cls: feat_sum / count for cls, (feat_sum, count) in accum.items() if count > 0}
 
 
 def _load_checkpoint(checkpoint_path: Path, device: str, freeze_early_backbone: bool = False) -> Forecaster:
@@ -175,6 +387,7 @@ def _process_client_day(
     gate_thresholds: dict[int, dict[str, float]] | None = None,
     gate_optimizer: torch.optim.Optimizer | None = None,
     gate_loss_fn: torch.nn.Module | None = None,
+    classify_fn: Callable[[float, float], int] | None = None,
 ) -> dict[str, Any]:
     """Process prediction + training for one client on one day.
 
@@ -199,6 +412,7 @@ def _process_client_day(
 
         loss = 0.0
         gate_stats: dict[str, int | float] = {}
+        train_steps = 0
         proto_bin_edges: tuple[float, float] = DEFAULT_KC_EDGES
         if train:
             if gated and gate_optimizer is not None and gate_prototypes is not None:
@@ -224,6 +438,10 @@ def _process_client_day(
                     _n = max(0, int(round(len(day_indices) * recent_replay_ratio)))
                     _recent_entries = recent_buffer.sample(_n, seed=rng_seed + 1)
                 _replay = (_reservoir_entries + _recent_entries) or None
+                # Batch count is fully determined by the pool size, so it is
+                # cheaper to derive than to thread a counter through train_day.
+                _pool_size = len(day_indices) + len(_replay or [])
+                train_steps = adapt_epochs * math.ceil(_pool_size / adapt_batch_size)
 
                 # Step 3: Train (reuses cached day_samples to skip redundant dataset loads)
                 loss = train_day(
@@ -244,7 +462,7 @@ def _process_client_day(
                     client_name=name,
                     global_prototypes=global_prototypes,
                     proto_lambda=proto_lambda,
-                    proto_bin_edges=proto_bin_edges,
+                    classify_fn=classify_fn,
                 )
 
         # Step 4: Extract per-class prototypes (FedProto — after training
@@ -257,6 +475,7 @@ def _process_client_day(
                 device,
                 adapt_batch_size,
                 edges=proto_bin_edges,
+                labeller=classify_fn,
             )
 
         # Step 5: Update recent FIFO buffer
@@ -266,12 +485,22 @@ def _process_client_day(
     if stream is not None:
         stream.synchronize()
 
+    # Per-sample regime ids, in the same order as preds/tgts, so error can be
+    # reported per sky regime without a second pass over the data.
+    regimes = (
+        np.array([classify_fn(float(s[3].view(-1)[0]), float(s[2])) for s in day_samples], dtype=np.int16)
+        if (classify_fn is not None and day_samples)
+        else np.array([], dtype=np.int16)
+    )
+
     return {
         "client_idx": client_idx,
         "name": name,
         "n_samples": len(day_indices),
         "preds": preds,
         "tgts": tgts,
+        "regimes": regimes,
+        "train_steps": train_steps,
         "mae": metrics.get("mae", float("nan")),
         "rmse": metrics.get("rmse", float("nan")),
         "loss": loss,
@@ -359,6 +588,15 @@ def run_fl_benchmark(
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
     loso_holdout: str | None = None,
+    regime_label: str = "clear_sky",
+    regime_edges: tuple[float, ...] | None = None,
+    attention: bool = True,
+    align_target: str = "global",
+    participation: str = "full",
+    join_days: dict[str, int] | None = None,
+    local_history_days: int = 0,
+    daylight_filter: bool = True,
+    ft_epochs: int = 1,
 ) -> dict[str, Any]:
     """Run the N-client FL benchmark.
 
@@ -430,42 +668,107 @@ def run_fl_benchmark(
         "per_round"       - list[dict] with per-FL-round aggregation stats,
         "overall_metrics" - dict[client_name -> metric_dict].
     """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    set_determinism(seed)
 
-    if len(clients) < 2:
+    if len(clients) < 2 and algorithm != "pooled":
         raise ValueError("At least two clients are required.")
 
     algorithm = algorithm.lower()
-    if algorithm not in ("static", "isolated", *AGGREGATION_FNS.keys()):
-        raise ValueError(f"Unknown algorithm '{algorithm}'. Choose from: static, isolated, {', '.join(AGGREGATION_FNS)}")
+    _extra_algorithms = ("pooled", "fedavg_ft")
+    if algorithm not in ("static", "isolated", *AGGREGATION_FNS.keys(), *_extra_algorithms):
+        raise ValueError(
+            f"Unknown algorithm '{algorithm}'. Choose from: static, isolated, "
+            f"{', '.join(AGGREGATION_FNS)}, {', '.join(_extra_algorithms)}"
+        )
+    if align_target not in ALIGN_TARGETS:
+        raise ValueError(f"Unknown align target '{align_target}'. Choose from: {', '.join(ALIGN_TARGETS)}")
 
     is_static = algorithm == "static"
+    is_pooled = algorithm == "pooled"
+    join_days = dict(join_days or {})
+
+    # Regime labelling: one labeller drives prototype extraction, the alignment
+    # target inside train_day, and the per-regime error breakdown, so the three
+    # can never disagree about which regime a sample belongs to.
+    edges = default_edges(regime_label) if regime_edges is None else tuple(regime_edges)
+    classify_fn = make_regime_labeller(regime_label, edges)
+    n_regimes = len(edges) + 1
+    regime_name_map = regime_names(n_regimes)
 
     client_names = [name for name, _ in clients]
 
-    print(f"\n{'='*70}")
+    if loso_holdout is not None and loso_holdout not in client_names:
+        raise ValueError(f"--loso-holdout '{loso_holdout}' does not match any client name: {client_names}")
+
+    unknown_joins = set(join_days) - set(client_names)
+    if unknown_joins:
+        raise ValueError(f"--join-day names unknown clients: {sorted(unknown_joins)}")
+    participates = make_participation(participation, client_names, seed)
+
+    print(f"\n{'=' * 70}")
     print(f"  FL Benchmark — algorithm: {algorithm.upper()}  sync_interval: {sync_interval} days  warmup: {warmup_days} days")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     for name, path in clients:
         print(f"  {name:20s}  lr={adapt_lr}  epochs={adapt_epochs}  path={path}")
+    if loso_holdout is not None:
+        print(f"  LOSO holdout: {loso_holdout}  (excluded from every federation round, all algorithms)")
     print()
 
     # --- Load datasets ---
     print("Loading datasets...")
     datasets = []
     day_maps = []
+    sp_day_rmse: list[dict[str, float]] = []
+    sp_overall: list[float] = []
+    daylight_kept: list[int] = []
     for name, path in clients:
         ds = load_dataset(path, split="test")
         dm = group_indices_by_day(ds.periods)
+
+        # Daylight cut, applied once to the day index map so that training and
+        # evaluation see exactly the same population (Ch.4 and Ch.5 share it).
+        n_before = sum(len(v) for v in dm.values())
+        if daylight_filter:
+            zenith = load_zenith_lookup(path)
+            if not zenith:
+                raise ValueError(
+                    f"{name}: no 'zenith' column in {path}/*clear_sky.csv. "
+                    f"Regenerate it with scripts/clear_sky.py, or pass --no-daylight-filter."
+                )
+            dm = {day: [i for i in idxs if is_daylight(zenith, _period_stamp(ds.periods[i]))] for day, idxs in dm.items()}
+            dm = {day: idxs for day, idxs in dm.items() if idxs}
+        n_after = sum(len(v) for v in dm.values())
+        daylight_kept.append(n_after)
+
+        # Smart Persistence over the same filtered population — the Forecast
+        # Skill denominator has to see exactly the samples the model is scored on.
+        cs_lookup = load_clear_sky_lookup(path)
+        day_rmse: dict[str, float] = {}
+        sp_preds_all, sp_tgts_all = [], []
+        for day, idxs in dm.items():
+            preds_sp, tgts_sp, _ = predict_periods([ds.periods[i] for i in idxs], cs_lookup, period_scale=1 / 1000.0)
+            if len(preds_sp):
+                day_rmse[day] = float(np.sqrt(np.mean((preds_sp - tgts_sp) ** 2)))
+                sp_preds_all.append(preds_sp)
+                sp_tgts_all.append(tgts_sp)
+        sp_day_rmse.append(day_rmse)
+        sp_overall.append(
+            float(np.sqrt(np.mean((np.concatenate(sp_preds_all) - np.concatenate(sp_tgts_all)) ** 2)))
+            if sp_preds_all
+            else float("nan")
+        )
+
         datasets.append(ds)
         day_maps.append(dm)
-        print(f"  {name}: {len(ds.periods)} periods")
+        _dropped = f"  (daylight filter dropped {n_before - n_after} of {n_before})" if daylight_filter else ""
+        print(f"  {name}: {n_after} periods{_dropped}  SP RMSE={sp_overall[-1]:.5f}")
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
     models = [_load_checkpoint(checkpoint_path, device, freeze_early_backbone) for _ in clients]
+    if is_pooled:
+        # One shared model: the oracle has no per-site personalisation to lose.
+        models = [models[0] for _ in clients]
     if freeze_early_backbone:
         print(f"  All {len(clients)} clients initialised from the same checkpoint (early backbone frozen).\n")
     else:
@@ -513,6 +816,13 @@ def run_fl_benchmark(
 
     per_day: list[dict[str, Any]] = []
     per_round: list[dict[str, Any]] = []
+    # Long-format logs (Section 5.4 of the benchmark plan)
+    metrics_daily: list[dict[str, Any]] = []
+    metrics_regime: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    round_rows: list[dict[str, Any]] = []
+    attention_rounds: list[np.ndarray] = []
+    started_at = time.time()
     days_since_sync = 0
     fl_round_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
@@ -521,6 +831,11 @@ def run_fl_benchmark(
     # Accumulators for final overall metrics (avoid a second inference pass)
     _all_preds: list[list[np.ndarray]] = [[] for _ in clients]
     _all_tgts: list[list[np.ndarray]] = [[] for _ in clients]
+
+    # Per-client sample counts since the last FL round — used to weight each
+    # client's contribution to weighted aggregation (canonical FedAvg weights
+    # by local sample count rather than averaging clients uniformly).
+    _round_sample_counts: list[int] = [0 for _ in clients]
 
     # --- FedProto state: per-class prototype accumulators and per-client global prototypes ---
     _proto_accum: list[dict[int, tuple[torch.Tensor, int]]] = [{} for _ in clients]
@@ -545,8 +860,6 @@ def run_fl_benchmark(
             _gated_prototypes.append(protos)
             _gated_thresholds.append(thresholds)
             _gated_optimizers.append(torch.optim.AdamW(models[i].network_head.parameters(), lr=adapt_lr))
-        if loso_holdout:
-            print(f"  LOSO holdout site (excluded from federation): {loso_holdout}")
     # Warmup cache — load if available, skipping the warmup simulation
     # -----------------------------------------------------------------------
     _warmup_cache_loaded = False
@@ -634,7 +947,8 @@ def run_fl_benchmark(
             in_warmup = False
 
         day_record: dict[str, Any] = {"day": day_key, "day_num": day_num, "fl_round_after": None, "in_warmup": in_warmup}
-        losses: list[float] = []
+        loss_by_idx: dict[int, float] = {}
+        day_events: dict[int, dict[str, Any]] = {}
 
         # --- Process all clients (parallel or sequential) ---
         _day_key = day_key
@@ -644,6 +958,13 @@ def run_fl_benchmark(
         _prox_mu = fedprox_mu if algorithm == "fedprox" else 0.0
         _is_fedproto = algorithm == "fedproto"
         _is_gated = algorithm == "gated"
+        # A client that has not joined yet is inert: it neither predicts, trains,
+        # nor takes part in a round, and contributes nothing to its own metrics.
+        joined = [day_num >= join_days.get(client_names[i], 0) for i in range(len(clients))]
+        for i, is_joined in enumerate(joined):
+            if is_joined and day_num == join_days.get(client_names[i], 0) and join_days.get(client_names[i], 0) > 0:
+                _seed_history(recent_buffers[i], datasets[i], day_maps[i], all_days, day_num, local_history_days)
+
         client_kwargs = [
             {
                 "client_idx": i,
@@ -678,9 +999,16 @@ def run_fl_benchmark(
                 "gate_thresholds": _gated_thresholds[i] if _is_gated else None,
                 "gate_optimizer": _gated_optimizers[i] if _is_gated else None,
                 "gate_loss_fn": _gated_loss_fn if _is_gated else None,
+                "classify_fn": classify_fn,
             }
             for i in range(len(clients))
+            if joined[i]
         ]
+        # The pooled oracle is one model trained on the union of the day's data:
+        # every client predicts with it first, then a single update is applied.
+        if is_pooled:
+            for kwargs in client_kwargs:
+                kwargs["train"] = False
 
         if _pool is not None:
             futures = [_pool.submit(_process_client_day, **kwargs) for kwargs in client_kwargs]
@@ -688,16 +1016,33 @@ def run_fl_benchmark(
         else:
             client_results = [_process_client_day(**kwargs) for kwargs in client_kwargs]
 
+        if is_pooled and not is_static:
+            _pooled_train(
+                models,
+                datasets,
+                day_maps,
+                day_key,
+                joined,
+                adapt_lr=adapt_lr,
+                adapt_weight_decay=adapt_weight_decay,
+                adapt_max_grad_norm=adapt_max_grad_norm,
+                adapt_batch_size=adapt_batch_size,
+                adapt_epochs=adapt_epochs,
+                device=device,
+                rng_seed=seed + day_num,
+            )
+
         for result in client_results:
             i = result["client_idx"]
             name = result["name"]
             day_record[f"{name}_n"] = result["n_samples"]
             day_record[f"{name}_mae"] = result["mae"]
             day_record[f"{name}_rmse"] = result["rmse"]
+            _round_sample_counts[i] += result["n_samples"]
             if len(result["preds"]) > 0:
                 _all_preds[i].append(result["preds"])
                 _all_tgts[i].append(result["tgts"])
-            losses.append(result["loss"])
+            loss_by_idx[i] = result["loss"]
 
             # FedProto: accumulate per-class prototypes for this client
             if _is_fedproto and result.get("day_prototypes"):
@@ -707,6 +1052,50 @@ def run_fl_benchmark(
                 _proto_edge_accum[i]["low_sum"] += float(low_edge)
                 _proto_edge_accum[i]["high_sum"] += float(high_edge)
                 _proto_edge_accum[i]["count"] += 1.0
+
+            # Long-format daily metrics, including the Forecast-Skill denominator.
+            _m = compute_metrics(result["preds"], result["tgts"]) if result["n_samples"] else {}
+            metrics_daily.append(
+                {
+                    "date": day_key,
+                    "client": name,
+                    "n_samples": result["n_samples"],
+                    "mae": _m.get("mae", float("nan")),
+                    "rmse": _m.get("rmse", float("nan")),
+                    "wape": _m.get("wape", float("nan")),
+                    "smape": _m.get("smape", float("nan")),
+                    "sp_rmse": sp_day_rmse[i].get(day_key, float("nan")),
+                }
+            )
+            _reg = result["regimes"]
+            for cls in sorted(set(_reg.tolist())):
+                _mask = _reg == cls
+                _rm = compute_metrics(result["preds"][_mask], result["tgts"][_mask])
+                metrics_regime.append(
+                    {
+                        "date": day_key,
+                        "client": name,
+                        "regime": regime_name_map.get(int(cls), str(cls)),
+                        "n_samples": int(_mask.sum()),
+                        "mae": _rm["mae"],
+                        "rmse": _rm["rmse"],
+                    }
+                )
+            # Bytes and participation are only known once the round fires, so the
+            # row is kept by reference and completed below.
+            _event = {
+                "date": day_key,
+                "client": name,
+                "samples_after_filter": result["n_samples"],
+                "train_steps": result["train_steps"],
+                "extraction_calls": 1 if result.get("day_prototypes") else 0,
+                "participated": 0,
+                "bytes_up": 0,
+                "bytes_down": 0,
+                "payload_dtype": "float32",
+            }
+            events.append(_event)
+            day_events[i] = _event
 
             if _is_gated and result.get("gate_opened"):
                 day_gate_samples = [datasets[i][idx] for idx in day_maps[i].get(_day_key, [])[:64]]
@@ -726,11 +1115,7 @@ def run_fl_benchmark(
             n_samples = _rec.get(f"{n}_n", 0)
             if n_samples == 0:
                 return f"{'---':>8}  {'---':>8}  {0:>5}"
-            return (
-                f"{_rec.get(f'{n}_mae', float('nan')):>8.6f}"
-                f"  {_rec.get(f'{n}_rmse', float('nan')):>8.6f}"
-                f"  {n_samples:>5}"
-            )
+            return f"{_rec.get(f'{n}_mae', float('nan')):>8.6f}  {_rec.get(f'{n}_rmse', float('nan')):>8.6f}  {n_samples:>5}"
 
         _row = "  ".join(_fmt_client_col(n) for n in client_names)
         print(f"  {day_key:<6}{_warmup_tag}  {_row}", flush=True)
@@ -774,7 +1159,19 @@ def run_fl_benchmark(
         #   - forced round immediately after warmup ends
         #   - periodic round every sync_interval days (post-warmup)
         # ---------------------------------------------------------------
-        _do_aggregate = not is_static and algorithm != "isolated" and (warmup_ended_today or days_since_sync >= sync_interval)
+        # Who takes part in *this* round: joined, not held out, not dropped or
+        # in an outage.  Absent clients neither send nor receive.
+        roster = [
+            i
+            for i in range(len(clients))
+            if joined[i] and (loso_holdout is None or client_names[i] != loso_holdout) and participates(i, fl_round_idx)
+        ]
+        _do_aggregate = (
+            not is_static
+            and algorithm not in ("isolated", "pooled")
+            and bool(roster)
+            and (warmup_ended_today or days_since_sync >= sync_interval)
+        )
         if warmup_ended_today and not in_warmup:
             # Reset counter so the next periodic sync starts fresh
             days_since_sync = 0
@@ -785,7 +1182,47 @@ def run_fl_benchmark(
                 # FedProto: aggregate prototypes, NOT model weights.
                 # Each client keeps its own model entirely local.
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                _per_client_global_protos, _attn_weights = aggregate_global_prototypes(_proto_accum)
+                # LOSO holdout contributes an empty prototype dict: it never
+                # shows up in `present` inside aggregate_global_prototypes, so
+                # it neither influences the consensus prototypes nor receives
+                # any (it gets back an empty dict, i.e. the proto-regularisation
+                # term is a no-op for it) — fully excluded from federation.
+                _proto_accum_for_agg = [(_proto_accum[i] if i in roster else {}) for i in range(len(clients))]
+                _per_client_global_protos, _attn_weights = aggregate_global_prototypes(
+                    _proto_accum_for_agg, attention=attention
+                )
+                _own_protos = [client_mean_prototypes(acc) for acc in _proto_accum]
+                _per_client_global_protos = apply_align_target(
+                    _per_client_global_protos, _own_protos, align_target, fl_round_idx, seed
+                )
+                # Payload actually crossing the wire: accumulated sums + counts up,
+                # the personalised consensus down.  The `own` control exchanges
+                # nothing, so it is charged nothing.
+                for i in roster:
+                    _up_b = 0 if align_target == "own" else payload_nbytes(_proto_accum[i])
+                    _down_b = 0 if align_target == "own" else payload_nbytes(_per_client_global_protos[i])
+                    _ev = day_events.get(i)
+                    if _ev is not None:
+                        _ev.update(participated=1, bytes_up=_up_b, bytes_down=_down_b)
+                for cls in sorted({c for pcp in _per_client_global_protos for c in pcp}):
+                    for i in roster:
+                        if cls in _per_client_global_protos[i]:
+                            round_rows.append(
+                                {
+                                    "round": fl_round_idx,
+                                    "date": day_key,
+                                    "client": client_names[i],
+                                    "regime": regime_name_map.get(int(cls), str(cls)),
+                                    "align_loss_mean": loss_by_idx.get(i, float("nan")),
+                                    "update_l2_norm": float("nan"),
+                                    "prototype_norms": float(_per_client_global_protos[i][cls].norm()),
+                                }
+                            )
+                _attn_arr = np.full((len(clients), len(clients), n_regimes), np.nan, dtype=np.float32)
+                for cls, mat in _attn_weights.items():
+                    if 0 <= int(cls) < n_regimes:
+                        _attn_arr[:, :, int(cls)] = np.asarray(mat, dtype=np.float32)
+                attention_rounds.append(_attn_arr)
                 wc = 0.0  # no weight-level change
 
                 # Log per-client prototype norms and attention weights
@@ -867,6 +1304,7 @@ def run_fl_benchmark(
                     new_global, wc = AGGREGATION_FNS["gated"](
                         last_global_state_dict or models[0].state_dict(),
                         gated_states,
+                        weights=[_round_sample_counts[i] for i in gated_indices],
                     )
                     last_global_state_dict = copy.deepcopy(new_global)
                     for i, model in enumerate(models):
@@ -894,22 +1332,34 @@ def run_fl_benchmark(
 
             else:
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                # Weight-based FL algorithms
+                # Weight-based FL algorithms (this also covers ditto's
+                # global copy — its personalised model is handled separately,
+                # every day, outside this aggregation block).
                 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-                agg_fn = AGGREGATION_FNS[algorithm]
-                state_dicts = _state_dicts if _state_dicts is not None else [m.state_dict() for m in models]
+                agg_fn = AGGREGATION_FNS["fedavg" if algorithm == "fedavg_ft" else algorithm]
+                state_dicts_all = _state_dicts if _state_dicts is not None else [m.state_dict() for m in models]
+
+                # `roster` already excludes the LOSO holdout, clients that have
+                # not joined, and clients absent under the participation
+                # schedule.  Absent clients neither contribute their weights nor
+                # receive the aggregate back (distribution loop below).
+                _participating = roster
+                state_dicts = [state_dicts_all[i] for i in _participating]
+                _weights = [_round_sample_counts[i] for i in _participating]
 
                 # Capture local-only layers before aggregation
                 if algorithm == "fedbn":
-                    local_bn = [_extract_local_keys(sd, is_bn_key) for sd in state_dicts]
+                    local_bn = [_extract_local_keys(sd, is_bn_key) for sd in state_dicts_all]
                 if algorithm == "fedper":
-                    local_head = [_extract_local_keys(sd, is_head_key) for sd in state_dicts]
+                    local_head = [_extract_local_keys(sd, is_head_key) for sd in state_dicts_all]
 
-                new_global, wc = agg_fn(state_dicts[0], state_dicts)
+                new_global, wc = agg_fn(state_dicts[0], state_dicts, weights=_weights)
                 last_global_state_dict = copy.deepcopy(new_global)
 
                 # Distribute back — restore local layers per client
                 for i, model in enumerate(models):
+                    if i not in roster:
+                        continue  # absent this round: stays fully local, untouched
                     merged = new_global
                     if algorithm == "fedbn":
                         merged = _restore_local_keys(merged, local_bn[i])
@@ -917,64 +1367,44 @@ def run_fl_benchmark(
                         merged = _restore_local_keys(merged, local_head[i])
                     elif algorithm == "fedema":
                         # Soft interpolation: w ← α·w_local + (1-α)·w_global
-                        merged = _ema_interpolate(state_dicts[i], new_global, fedema_alpha)
+                        merged = _ema_interpolate(state_dicts_all[i], new_global, fedema_alpha)
                     model.load_state_dict(merged)
-
-            # Ditto: train personalised models with proximal toward the
-            # *freshly aggregated* global consensus.  Only the global
-            # model participates in FedAvg; the personalised model stays
-            # local and is never shared — it just trains on the current
-            # day's data anchored to the new global.
-            if algorithm == "ditto":
-
-                def _ditto_train_client(
-                    i: int,
-                    day_key: str = day_key,
-                    day_num: int = day_num,
-                    last_global_state_dict: dict[str, Any] | None = last_global_state_dict,
-                ) -> None:
-                    _d_name = client_names[i]
-                    _d_indices = day_maps[i].get(day_key, [])
-                    _d_seed = seed + day_num * len(clients) + i
-                    # Assemble same replay mix the global model used
-                    _d_reservoir: list[tuple[Any, int]] = []
-                    if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
-                        _d_reservoir = sample_replay_for_day(
-                            _folsom_replay_buffer,
-                            max(0, int(round(len(_d_indices) * replay_ratio))),
-                            seed=_d_seed,
+                    _ev = day_events.get(i)
+                    if _ev is not None:
+                        _ev.update(
+                            participated=1,
+                            bytes_up=payload_nbytes(state_dicts_all[i]),
+                            bytes_down=payload_nbytes(merged),
                         )
-                    _d_recent: list[tuple[Any, int]] = []
-                    if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
-                        _d_recent = recent_buffers[i].sample(
-                            max(0, int(round(len(_d_indices) * recent_replay_ratio))),
-                            seed=_d_seed + 1,
-                        )
-                    _d_replay = (_d_reservoir + _d_recent) or None
-                    train_day(
-                        ditto_models[i],
-                        datasets[i],
-                        _d_indices,
-                        lr=adapt_lr,
-                        weight_decay=adapt_weight_decay,
-                        max_grad_norm=adapt_max_grad_norm,
-                        batch_size=adapt_batch_size,
-                        epochs=adapt_epochs,
-                        device=device,
-                        replay_entries=_d_replay,
-                        global_state_dict=last_global_state_dict,
-                        mu=ditto_lambda,
-                        rng_seed=_d_seed,
-                        client_name=f"{_d_name} ditto",
+                    round_rows.append(
+                        {
+                            "round": fl_round_idx,
+                            "date": day_key,
+                            "client": client_names[i],
+                            "regime": "all",
+                            "align_loss_mean": float("nan"),
+                            "update_l2_norm": _compute_weight_change(state_dicts_all[i], merged),
+                            "prototype_norms": float("nan"),
+                        }
                     )
 
-                if _pool is not None:
-                    ditto_futures = [_pool.submit(_ditto_train_client, i) for i in range(len(clients))]
-                    for fut in ditto_futures:
-                        fut.result()
-                else:
-                    for i in range(len(clients)):
-                        _ditto_train_client(i)
+                # FedAvg + local fine-tuning: recover the personalisation that
+                # averaging just erased, before the next day's evaluation.
+                if algorithm == "fedavg_ft":
+                    for i in roster:
+                        train_day(
+                            models[i],
+                            datasets[i],
+                            day_maps[i].get(day_key, []),
+                            lr=adapt_lr,
+                            weight_decay=adapt_weight_decay,
+                            max_grad_norm=adapt_max_grad_norm,
+                            batch_size=adapt_batch_size,
+                            epochs=ft_epochs,
+                            device=device,
+                            rng_seed=seed + day_num * len(clients) + i,
+                            client_name=f"{client_names[i]} ft",
+                        )
 
             round_tag = "[WARMUP END] " if warmup_ended_today else ""
             per_day[-1]["fl_round_after"] = fl_round_idx
@@ -991,15 +1421,81 @@ def run_fl_benchmark(
             if not warmup_ended_today:
                 days_since_sync = 0
             fl_round_idx += 1
+            # This round's counts have now been used for weighted aggregation
+            # (or, for fedproto, ignored in favour of prototype support
+            # counts) — start accumulating fresh for the next round.
+            _round_sample_counts = [0 for _ in clients]
 
             _loss_str = "  ".join(
-                f"{_name}={_loss:.5f}"
-                for _name, _loss in zip(client_names, losses, strict=False)
-                if day_record.get(f"{_name}_n", 0) > 0
+                f"{client_names[_i]}={_loss:.5f}"
+                for _i, _loss in sorted(loss_by_idx.items())
+                if day_record.get(f"{client_names[_i]}_n", 0) > 0
             )
             print(
                 f"  {'':6}      └─ {round_tag}FL Round {fl_round_idx:3d}  ({per_round[-1]['days_in_round']}d)  ΔW={wc:.5f}  losses: {_loss_str}"
             )
+
+        # -----------------------------------------------------------------
+        # Ditto personalised-model training — runs every day (not just on
+        # aggregation rounds), otherwise the personalised model is stale for
+        # every day between sync rounds while still being used for that
+        # day's evaluation metrics (`_infer_models` above). Anchored to the
+        # latest known global consensus; the LOSO holdout trains with no
+        # anchor (mu=0) since it never participates in federation either way.
+        # -----------------------------------------------------------------
+        if algorithm == "ditto" and not is_static:
+
+            def _ditto_train_client(
+                i: int,
+                day_key: str = day_key,
+                day_num: int = day_num,
+                last_global_state_dict: dict[str, Any] | None = last_global_state_dict,
+            ) -> None:
+                _d_name = client_names[i]
+                _d_indices = day_maps[i].get(day_key, [])
+                _d_seed = seed + day_num * len(clients) + i
+                _is_holdout = loso_holdout is not None and client_names[i] == loso_holdout
+                _d_mu = 0.0 if _is_holdout else ditto_lambda
+                _d_anchor = None if _is_holdout else last_global_state_dict
+                # Assemble same replay mix the global model used
+                _d_reservoir: list[tuple[Any, int]] = []
+                if replay_buffer_size > 0 and replay_ratio > 0.0 and _folsom_replay_buffer:
+                    _d_reservoir = sample_replay_for_day(
+                        _folsom_replay_buffer,
+                        max(0, int(round(len(_d_indices) * replay_ratio))),
+                        seed=_d_seed,
+                    )
+                _d_recent: list[tuple[Any, int]] = []
+                if recent_buffer_size > 0 and recent_replay_ratio > 0.0:
+                    _d_recent = recent_buffers[i].sample(
+                        max(0, int(round(len(_d_indices) * recent_replay_ratio))),
+                        seed=_d_seed + 1,
+                    )
+                _d_replay = (_d_reservoir + _d_recent) or None
+                train_day(
+                    ditto_models[i],
+                    datasets[i],
+                    _d_indices,
+                    lr=adapt_lr,
+                    weight_decay=adapt_weight_decay,
+                    max_grad_norm=adapt_max_grad_norm,
+                    batch_size=adapt_batch_size,
+                    epochs=adapt_epochs,
+                    device=device,
+                    replay_entries=_d_replay,
+                    global_state_dict=_d_anchor,
+                    mu=_d_mu,
+                    rng_seed=_d_seed,
+                    client_name=f"{_d_name} ditto",
+                )
+
+            if _pool is not None:
+                ditto_futures = [_pool.submit(_ditto_train_client, i) for i in range(len(clients))]
+                for fut in ditto_futures:
+                    fut.result()
+            else:
+                for i in range(len(clients)):
+                    _ditto_train_client(i)
 
     # Shut down thread pool
     if _pool is not None:
@@ -1012,15 +1508,21 @@ def run_fl_benchmark(
     for i, name in enumerate(client_names):
         if _all_preds[i]:
             overall_metrics[name] = compute_metrics(np.concatenate(_all_preds[i]), np.concatenate(_all_tgts[i]))
+            # Forecast skill against Smart Persistence over the same population.
+            _sp = sp_overall[i]
+            overall_metrics[name]["sp_rmse"] = _sp
+            overall_metrics[name]["fs"] = (
+                100.0 * (1.0 - overall_metrics[name]["rmse"] / _sp) if _sp and np.isfinite(_sp) else float("nan")
+            )
         else:
             overall_metrics[name] = {}
 
     _nw = max(10, max(len(n) for n in client_names))
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"  Final Results — {algorithm.upper()}  (FL rounds fired: {fl_round_idx})")
-    print(f"{'='*80}")
-    print(f"  {'Client':<{_nw}}  {'MAE':>9}  {'RMSE':>9}  {'WAPE':>8}  {'SMAPE':>8}  {'Count':>8}")
-    print(f"  {'-'*_nw}  {'-'*9}  {'-'*9}  {'-'*8}  {'-'*8}  {'-'*8}")
+    print(f"{'=' * 80}")
+    print(f"  {'Client':<{_nw}}  {'MAE':>9}  {'RMSE':>9}  {'WAPE':>8}  {'SMAPE':>8}  {'FS':>7}  {'Count':>8}")
+    print(f"  {'-' * _nw}  {'-' * 9}  {'-' * 9}  {'-' * 8}  {'-' * 8}  {'-' * 7}  {'-' * 8}")
     for name in client_names:
         m = overall_metrics[name]
         print(
@@ -1029,12 +1531,30 @@ def run_fl_benchmark(
             f"{m.get('rmse', float('nan')):>9.5f}  "
             f"{m.get('wape', float('nan')):>7.2f}%  "
             f"{m.get('smape', float('nan')):>7.2f}%  "
+            f"{m.get('fs', float('nan')):>6.2f}%  "
             f"{m.get('count', 0):>8}"
         )
-    print(f"{'='*80}\n")
+    print(f"{'=' * 80}\n")
 
     return {
         "algorithm": algorithm,
+        "regime_label": regime_label,
+        "regime_edges": list(edges),
+        "attention": "on" if attention else "uniform",
+        "align_target": align_target,
+        "participation": participation,
+        "join_days": join_days,
+        "local_history_days": local_history_days,
+        "daylight_filter": daylight_filter,
+        "daylight_kept_samples": dict(zip(client_names, daylight_kept, strict=False)),
+        "wall_time_s": round(time.time() - started_at, 3),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "metrics_daily": metrics_daily,
+        "metrics_regime": metrics_regime,
+        "events": events,
+        "round_rows": round_rows,
+        "attention_rounds": attention_rounds,
+        "regime_names": regime_name_map,
         "sync_interval": sync_interval,
         "num_days": len(all_days),
         "start_day": start_day,
@@ -1081,7 +1601,20 @@ def run_fl_benchmark(
 @click.option(
     "--algorithm",
     type=click.Choice(
-        ["static", "isolated", "fedavg", "fedbn", "fedper", "fedprox", "ditto", "fedema", "fedproto", "gated"],
+        [
+            "static",
+            "isolated",
+            "pooled",
+            "fedavg",
+            "fedavg_ft",
+            "fedbn",
+            "fedper",
+            "fedprox",
+            "ditto",
+            "fedema",
+            "fedproto",
+            "gated",
+        ],
         case_sensitive=False,
     ),
     default="fedbn",
@@ -1097,8 +1630,89 @@ def run_fl_benchmark(
         "  ditto    — dual-model with personalised proximal anchor.\n"
         "  fedema   — FedAvg + EMA interpolation at distribution.\n"
         "  fedproto — share per-class feature prototypes, not weights.\n"
-        "  gated — CSI-binned prototypes + adapter aggregation from gated clients."
+        "  gated — CSI-binned prototypes + adapter aggregation from gated clients.\n"
+        "  pooled — oracle: one model trained daily on the union of all clients.\n"
+        "  fedavg_ft — FedAvg followed by local fine-tuning after each round."
     ),
+)
+@click.option(
+    "--regime-label",
+    type=click.Choice(REGIME_LABELS, case_sensitive=False),
+    default="clear_sky",
+    show_default=True,
+    help=(
+        "Source of the sky-regime label used for prototype stratification.\n"
+        "  clear_sky — GHI / Ineichen-Perez clear-sky GHI (site- and time-aware).\n"
+        "  proxy     — GHI / 1000 W/m^2 (the pre-2026 behaviour; latitude-dependent)."
+    ),
+)
+@click.option(
+    "--regime-edges",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated ascending regime cut points, e.g. '0.3,0.85'.  "
+        "Default: the label's own defaults.  Empty string = one regime (no stratification)."
+    ),
+)
+@click.option(
+    "--attention",
+    type=click.Choice(["on", "uniform"], case_sensitive=False),
+    default="on",
+    show_default=True,
+    help="Prototype aggregation: similarity+support attention, or a plain unweighted mean.",
+)
+@click.option(
+    "--stratify",
+    type=click.Choice(["on", "single"], case_sensitive=False),
+    default="on",
+    show_default=True,
+    help="'single' collapses every sample into one regime (overrides --regime-edges).",
+)
+@click.option(
+    "--align-target",
+    type=click.Choice(ALIGN_TARGETS, case_sensitive=False),
+    default="global",
+    show_default=True,
+    help=(
+        "Prototype control.  global = the aggregated consensus; own = no exchange "
+        "(zero bytes); shuffled = peers' prototypes assigned to the wrong regimes; "
+        "random = norm-matched Gaussian noise."
+    ),
+)
+@click.option(
+    "--participation",
+    type=str,
+    default="full",
+    show_default=True,
+    help="Round participation: 'full', 'dropout:<p>', or 'outage:<client>:<start_round>:<n_rounds>'.",
+)
+@click.option(
+    "--join-day",
+    "join_day",
+    type=str,
+    multiple=True,
+    help="Late/cold-start join as '<client>:<day_index>'.  Repeat per client.",
+)
+@click.option(
+    "--local-history-days",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Days of its own past data a joining client may replay (needs --recent-buffer-size > 0).",
+)
+@click.option(
+    "--daylight-filter/--no-daylight-filter",
+    default=True,
+    show_default=True,
+    help=f"Drop samples with apparent solar zenith >= {DAYLIGHT_MAX_ZENITH} deg from training and evaluation.",
+)
+@click.option(
+    "--ft-epochs",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Local fine-tuning epochs after each round.  Only used when --algorithm=fedavg_ft.",
 )
 @click.option(
     "--loso-holdout",
@@ -1329,6 +1943,16 @@ def main(
     parallel_clients: int,
     freeze_early_backbone: bool,
     loso_holdout: str | None,
+    regime_label: str,
+    regime_edges: str | None,
+    attention: str,
+    stratify: str,
+    align_target: str,
+    participation: str,
+    join_day: tuple[str, ...],
+    local_history_days: int,
+    daylight_filter: bool,
+    ft_epochs: int,
 ) -> None:
     """Run the FL benchmark comparing federation algorithms on solar irradiance forecasting."""
     # Build ordered client list from all --dataset flags
@@ -1338,6 +1962,12 @@ def main(
         raw = ds.parent.name if ds.name == "." else ds.name
         name = raw.removesuffix("_prepared")
         clients.append((name, ds))
+
+    edges = () if stratify == "single" else parse_edges(regime_edges, regime_label)
+    join_days = {}
+    for spec in join_day:
+        name, _, day = spec.partition(":")
+        join_days[name] = int(day)
 
     results = run_fl_benchmark(
         checkpoint_path=checkpoint,
@@ -1366,14 +1996,87 @@ def main(
         parallel_clients=parallel_clients,
         freeze_early_backbone=freeze_early_backbone,
         loso_holdout=loso_holdout,
+        regime_label=regime_label,
+        regime_edges=edges,
+        attention=attention == "on",
+        align_target=align_target,
+        participation=participation,
+        join_days=join_days,
+        local_history_days=local_history_days,
+        daylight_filter=daylight_filter,
+        ft_epochs=ft_epochs,
     )
 
     if save_results is not None:
         save_results.mkdir(parents=True, exist_ok=True)
 
-        # Per-day CSV
+        # Per-day CSV (wide, kept for backward compatibility with older analyses)
         df_day = pd.DataFrame(results["per_day"])
         df_day.to_csv(save_results / "per_day.csv", index=False)
+
+        # Long-format logs consumed by the Chapter 5 analysis
+        pd.DataFrame(results["metrics_daily"]).to_csv(save_results / "metrics_daily.csv", index=False)
+        pd.DataFrame(results["metrics_regime"]).to_csv(save_results / "metrics_regime.csv", index=False)
+        pd.DataFrame(results["events"]).to_csv(save_results / "events.csv", index=False)
+        pd.DataFrame(results["round_rows"]).to_csv(save_results / "rounds.csv", index=False)
+        _attn = results["attention_rounds"]
+        np.save(
+            save_results / "attention.npy",
+            np.stack(_attn) if _attn else np.empty((0, len(results["client_names"]), len(results["client_names"]), 0)),
+        )
+
+        # Fully resolved configuration + provenance, so a run can be replayed
+        # without reconstructing the command line.
+        with (save_results / "config.yaml").open("w") as fh:
+            yaml.safe_dump(
+                {
+                    "git_commit": git_commit(),
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": sha256_file(checkpoint),
+                    "command": "fl_benchmark",
+                    "algorithm": algorithm,
+                    "clients": [(name, str(path)) for name, path in clients],
+                    "sync_interval": sync_interval,
+                    "num_days": num_days,
+                    "start_day": start_day,
+                    "warmup_days": warmup_days,
+                    "seed": seed,
+                    "device": device,
+                    "adapt": {
+                        "lr": adapt_lr,
+                        "weight_decay": adapt_weight_decay,
+                        "max_grad_norm": adapt_max_grad_norm,
+                        "batch_size": adapt_batch_size,
+                        "epochs": adapt_epochs,
+                    },
+                    "replay": {
+                        "buffer_size": replay_buffer_size,
+                        "ratio": replay_ratio,
+                        "recent_buffer_size": recent_buffer_size,
+                        "recent_ratio": recent_replay_ratio,
+                    },
+                    "regime_label": regime_label,
+                    "regime_edges": list(edges),
+                    "attention": attention,
+                    "stratify": stratify,
+                    "align_target": align_target,
+                    "participation": participation,
+                    "join_days": join_days,
+                    "local_history_days": local_history_days,
+                    "daylight_filter": daylight_filter,
+                    "daylight_max_zenith": DAYLIGHT_MAX_ZENITH,
+                    "ft_epochs": ft_epochs,
+                    "loso_holdout": loso_holdout,
+                    "method_params": {
+                        "fedprox_mu": fedprox_mu,
+                        "ditto_lambda": ditto_lambda,
+                        "fedema_alpha": fedema_alpha,
+                        "fedproto_lambda": fedproto_lambda,
+                    },
+                },
+                fh,
+                sort_keys=False,
+            )
 
         # Per-round CSV
         if results["per_round"]:
@@ -1404,7 +2107,19 @@ def main(
         summary = {
             k: v
             for k, v in results.items()
-            if k not in ("per_day", "per_round", "fedproto_round_diagnostics", "models", "last_global_state_dict")
+            if k
+            not in (
+                "per_day",
+                "per_round",
+                "fedproto_round_diagnostics",
+                "models",
+                "last_global_state_dict",
+                "metrics_daily",
+                "metrics_regime",
+                "events",
+                "round_rows",
+                "attention_rounds",
+            )
         }
         summary["config"] = {
             "checkpoint": str(checkpoint),
@@ -1436,6 +2151,8 @@ def main(
             print(f"  per_round.csv ({len(results['per_round'])} rows)")
         if results.get("fedproto_round_diagnostics"):
             print(f"  fedproto_round_diagnostics.csv ({len(results['fedproto_round_diagnostics'])} rows)")
+        print("  metrics_daily.csv / metrics_regime.csv / events.csv / rounds.csv / attention.npy")
+        print("  config.yaml")
         print("  summary.json")
         _n_global = 1 if results["last_global_state_dict"] is not None else 0
         print(f"  checkpoints/  ({len(_final_models)} local models{', 1 global' if _n_global else ''})")
