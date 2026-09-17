@@ -126,3 +126,29 @@ def test_f11_regime_metrics_shape():
     """Per-regime rows must partition the day, not resample it."""
     regimes = np.array([0, 0, 1, 2, 2, 2], dtype=np.int16)
     assert sum(int((regimes == c).sum()) for c in set(regimes.tolist())) == len(regimes)
+
+
+def test_forecast_skill_denominator_is_day_scoped():
+    """FS must pool Smart Persistence over the evaluated days only.
+
+    Regression guard for a wiring run that scored 3 days of model error against
+    a whole-calendar Smart Persistence RMSE, which inflated Forecast Skill
+    (Poznan showed 62.9% on two April days).
+    """
+    # (sum squared error, n) per day: two calm days, one volatile day.
+    stats = {"0401": (1.0, 100), "0402": (1.0, 100), "0715": (400.0, 100)}
+    assert fb._sp_rmse(stats["0401"]) == pytest.approx(0.1)
+    assert fb._sp_rmse(None) != fb._sp_rmse(stats["0401"])  # missing day -> nan, never 0
+    assert np.isnan(fb._sp_rmse(None)) and np.isnan(fb._sp_rmse((1.0, 0)))
+
+    evaluated = {"0401", "0402"}
+    sse = sum(stats[d][0] for d in evaluated)
+    n = sum(stats[d][1] for d in evaluated)
+    scoped = (sse / n) ** 0.5
+    all_days = (sum(v[0] for v in stats.values()) / sum(v[1] for v in stats.values())) ** 0.5
+    assert scoped == pytest.approx(0.1)
+    assert all_days > 4 * scoped, "whole-calendar denominator must differ from the day-scoped one"
+
+    model_rmse = 0.09
+    assert 100 * (1 - model_rmse / scoped) == pytest.approx(10.0)  # honest skill
+    assert 100 * (1 - model_rmse / all_days) > 80.0  # what the bug reported

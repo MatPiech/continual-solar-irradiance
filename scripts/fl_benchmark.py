@@ -294,6 +294,13 @@ def _pooled_train(
     )
 
 
+def _sp_rmse(stats: tuple[float, int] | None) -> float:
+    """RMSE from a (sum of squared errors, count) pair."""
+    if not stats or stats[1] == 0:
+        return float("nan")
+    return float((stats[0] / stats[1]) ** 0.5)
+
+
 def _period_stamp(period: dict[str, Any]) -> str:
     """``YYYYMMDD_HHMMSS`` key of a period's most recent image."""
     return period["history"][-1]["image_name"].rsplit(".", 1)[0]
@@ -718,9 +725,12 @@ def run_fl_benchmark(
     print("Loading datasets...")
     datasets = []
     day_maps = []
-    sp_day_rmse: list[dict[str, float]] = []
-    sp_overall: list[float] = []
+    # Smart-Persistence squared-error sums and counts per day.  Kept as (sse, n)
+    # rather than an RMSE so the Forecast-Skill denominator can later be pooled
+    # over exactly the days the model was scored on.
+    sp_day_stats: list[dict[str, tuple[float, int]]] = []
     daylight_kept: list[int] = []
+    clear_sky_lookups: list[dict[str, float]] = []
     for name, path in clients:
         ds = load_dataset(path, split="test")
         dm = group_indices_by_day(ds.periods)
@@ -740,28 +750,13 @@ def run_fl_benchmark(
         n_after = sum(len(v) for v in dm.values())
         daylight_kept.append(n_after)
 
-        # Smart Persistence over the same filtered population — the Forecast
-        # Skill denominator has to see exactly the samples the model is scored on.
-        cs_lookup = load_clear_sky_lookup(path)
-        day_rmse: dict[str, float] = {}
-        sp_preds_all, sp_tgts_all = [], []
-        for day, idxs in dm.items():
-            preds_sp, tgts_sp, _ = predict_periods([ds.periods[i] for i in idxs], cs_lookup, period_scale=1 / 1000.0)
-            if len(preds_sp):
-                day_rmse[day] = float(np.sqrt(np.mean((preds_sp - tgts_sp) ** 2)))
-                sp_preds_all.append(preds_sp)
-                sp_tgts_all.append(tgts_sp)
-        sp_day_rmse.append(day_rmse)
-        sp_overall.append(
-            float(np.sqrt(np.mean((np.concatenate(sp_preds_all) - np.concatenate(sp_tgts_all)) ** 2)))
-            if sp_preds_all
-            else float("nan")
-        )
-
+        clear_sky_lookups.append(load_clear_sky_lookup(path))
+        sp_day_stats.append({})
         datasets.append(ds)
         day_maps.append(dm)
         _dropped = f"  (daylight filter dropped {n_before - n_after} of {n_before})" if daylight_filter else ""
-        print(f"  {name}: {n_after} periods{_dropped}  SP RMSE={sp_overall[-1]:.5f}")
+        _filter_state = "on" if daylight_filter else "OFF"
+        print(f"  {name}: {n_after} periods{_dropped}  [daylight filter {_filter_state}]")
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -782,6 +777,25 @@ def run_fl_benchmark(
     if num_days > 0:
         all_days = all_days[:num_days]
     print(f"Simulating {len(all_days)} days starting {all_days[0]} → {all_days[-1]}\n")
+
+    # Smart Persistence, restricted to the days actually simulated.  Computing it
+    # over the whole calendar would put a year-wide RMSE in the denominator of a
+    # Forecast Skill whose numerator covers only this run's days.
+    print("Smart Persistence reference:")
+    for i, (name, _path) in enumerate(clients):
+        for day in all_days:
+            idxs = day_maps[i].get(day, [])
+            if not idxs:
+                continue
+            preds_sp, tgts_sp, _ = predict_periods(
+                [datasets[i].periods[j] for j in idxs], clear_sky_lookups[i], period_scale=1 / 1000.0
+            )
+            if len(preds_sp):
+                sp_day_stats[i][day] = (float(np.sum((preds_sp - tgts_sp) ** 2)), len(preds_sp))
+        _sse = sum(v[0] for v in sp_day_stats[i].values())
+        _n = sum(v[1] for v in sp_day_stats[i].values())
+        print(f"  {name}: RMSE={np.sqrt(_sse / _n):.5f} over {_n} samples" if _n else f"  {name}: no samples")
+    print()
 
     # --- Progress table header ---
     _col_w = 8 + 2 + 8 + 2 + 5  # MAE(8) + 2sp + RMSE(8) + 2sp + N(5) = 25
@@ -823,6 +837,8 @@ def run_fl_benchmark(
     round_rows: list[dict[str, Any]] = []
     attention_rounds: list[np.ndarray] = []
     started_at = time.time()
+    # Days on which each client actually produced predictions.
+    evaluated_days: list[set[str]] = [set() for _ in clients]
     days_since_sync = 0
     fl_round_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
@@ -895,6 +911,16 @@ def run_fl_benchmark(
             per_day = _cache["per_day"]
             _all_preds = _cache["all_preds"]
             _all_tgts = _cache["all_tgts"]
+            # Long-format logs and the Forecast-Skill day set must come back too,
+            # or a cached run silently loses its warmup days from every log while
+            # an uncached run keeps them.
+            metrics_daily = _cache.get("metrics_daily", [])
+            metrics_regime = _cache.get("metrics_regime", [])
+            events = _cache.get("events", [])
+            for _rec in per_day:
+                for _ci, _cname in enumerate(client_names):
+                    if _rec.get(f"{_cname}_n", 0) > 0:
+                        evaluated_days[_ci].add(_rec["day"])
             # Restore recent FIFO buffer states
             # Cache stores lightweight (client_index, sample_index) pairs;
             # reconstruct (dataset, sample_index) using the current run's datasets.
@@ -1042,6 +1068,7 @@ def run_fl_benchmark(
             if len(result["preds"]) > 0:
                 _all_preds[i].append(result["preds"])
                 _all_tgts[i].append(result["tgts"])
+                evaluated_days[i].add(day_key)
             loss_by_idx[i] = result["loss"]
 
             # FedProto: accumulate per-class prototypes for this client
@@ -1064,7 +1091,7 @@ def run_fl_benchmark(
                     "rmse": _m.get("rmse", float("nan")),
                     "wape": _m.get("wape", float("nan")),
                     "smape": _m.get("smape", float("nan")),
-                    "sp_rmse": sp_day_rmse[i].get(day_key, float("nan")),
+                    "sp_rmse": _sp_rmse(sp_day_stats[i].get(day_key)),
                 }
             )
             _reg = result["regimes"]
@@ -1145,6 +1172,9 @@ def run_fl_benchmark(
                     "per_day": list(per_day),
                     "all_preds": [[a.copy() for a in preds] for preds in _all_preds],
                     "all_tgts": [[a.copy() for a in tgts] for tgts in _all_tgts],
+                    "metrics_daily": list(metrics_daily),
+                    "metrics_regime": list(metrics_regime),
+                    "events": list(events),
                     "recent_states": _recent_states,
                 },
                 _warmup_cache_file,
@@ -1508,11 +1538,16 @@ def run_fl_benchmark(
     for i, name in enumerate(client_names):
         if _all_preds[i]:
             overall_metrics[name] = compute_metrics(np.concatenate(_all_preds[i]), np.concatenate(_all_tgts[i]))
-            # Forecast skill against Smart Persistence over the same population.
-            _sp = sp_overall[i]
+            # Forecast skill against Smart Persistence pooled over exactly the
+            # days this client contributed predictions on — same days, same
+            # samples, so numerator and denominator are comparable.
+            _sse = sum(sp_day_stats[i][d][0] for d in evaluated_days[i] if d in sp_day_stats[i])
+            _n = sum(sp_day_stats[i][d][1] for d in evaluated_days[i] if d in sp_day_stats[i])
+            _sp = float(np.sqrt(_sse / _n)) if _n else float("nan")
             overall_metrics[name]["sp_rmse"] = _sp
+            overall_metrics[name]["sp_count"] = _n
             overall_metrics[name]["fs"] = (
-                100.0 * (1.0 - overall_metrics[name]["rmse"] / _sp) if _sp and np.isfinite(_sp) else float("nan")
+                100.0 * (1.0 - overall_metrics[name]["rmse"] / _sp) if _n and np.isfinite(_sp) and _sp > 0 else float("nan")
             )
         else:
             overall_metrics[name] = {}
