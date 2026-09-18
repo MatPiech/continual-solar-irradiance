@@ -429,6 +429,7 @@ def _process_client_day(
     prox_mu: float,
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
+    proto_scale_cap: float = 0.0,
     extract_prototypes: bool = False,
     train: bool = True,
     gated: bool = False,
@@ -511,6 +512,7 @@ def _process_client_day(
                     client_name=name,
                     global_prototypes=global_prototypes,
                     proto_lambda=proto_lambda,
+                    proto_scale_cap=proto_scale_cap,
                     classify_fn=classify_fn,
                 )
 
@@ -634,6 +636,7 @@ def run_fl_benchmark(
     ditto_lambda: float = 0.0,
     fedema_alpha: float = 0.5,
     fedproto_lambda: float = 0.1,
+    proto_scale_cap: float = 0.0,
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
     loso_holdout: str | None = None,
@@ -1055,6 +1058,7 @@ def run_fl_benchmark(
                 if (_is_fedproto and _per_client_global_protos is not None)
                 else None,
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
+                "proto_scale_cap": proto_scale_cap,
                 "extract_prototypes": _is_fedproto and not in_warmup,
                 "train": not is_static,
                 "gated": _is_gated,
@@ -1625,6 +1629,7 @@ def run_fl_benchmark(
         "regime_edges": list(edges),
         "proto_min_ghi_clear": proto_min_ghi_clear,
         "min_ghi_clear": min_ghi_clear,
+        "proto_scale_cap": proto_scale_cap,
         "attention": ("fixed" if attention_temperature is not None else "on") if attention else "uniform",
         "attention_temperature": attention_temperature,
         "align_target": align_target,
@@ -1737,6 +1742,18 @@ def run_fl_benchmark(
     help=(
         "Comma-separated ascending regime cut points, e.g. '0.3,0.85'.  "
         "Default: the label's own defaults.  Empty string = one regime (no stratification)."
+    ),
+)
+@click.option(
+    "--proto-scale-cap",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help=(
+        "Upper bound on the adaptive task-loss/prototype-loss ratio.  0 = no cap, which "
+        "makes --fedproto-lambda mean what it documents (0.1 = the alignment term is 10 % "
+        "of the task loss).  A cap of 100 was in force 2026-09-17..19 and bound on every "
+        "batch, cutting the term to ~1e-6 of the task loss; pass 100 to reproduce those runs."
     ),
 )
 @click.option(
@@ -2061,6 +2078,7 @@ def main(
     regime_edges: str | None,
     proto_min_ghi_clear: float,
     min_ghi_clear: float,
+    proto_scale_cap: float,
     attention: str,
     attention_temperature: float,
     stratify: str,
@@ -2116,6 +2134,7 @@ def main(
         regime_edges=edges,
         proto_min_ghi_clear=proto_min_ghi_clear,
         min_ghi_clear=min_ghi_clear,
+        proto_scale_cap=proto_scale_cap,
         attention=attention != "uniform",
         attention_temperature=attention_temperature if attention == "fixed" else None,
         align_target=align_target,
@@ -2177,6 +2196,7 @@ def main(
                     "regime_edges": list(edges),
                     "proto_min_ghi_clear": proto_min_ghi_clear,
                     "min_ghi_clear": min_ghi_clear,
+                    "proto_scale_cap": proto_scale_cap,
                     "attention": attention,
                     "attention_temperature": attention_temperature,
                     "stratify": stratify,

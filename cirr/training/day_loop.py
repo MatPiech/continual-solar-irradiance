@@ -15,10 +15,18 @@ from tqdm import tqdm
 from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, make_regime_labeller
 from cirr.models.forecaster import Forecaster
 
-# Upper bound on the adaptive task-loss/prototype-loss ratio used to scale the
-# FedProto regularisation term (see its use in `train_day`). Prevents gradient
-# spikes when a client's embeddings are already very close to their prototype.
-_MAX_PROTO_LOSS_SCALE = 100.0
+# Default upper bound on the adaptive task-loss/prototype-loss ratio (see its use
+# in `train_day`).  0 disables the cap, which is the default.
+#
+# A cap of 100 was in force from 2026-09-17 to 2026-09-19 and silently switched the
+# alignment term off: the natural scale is task_loss/avg_proto, and with embeddings
+# sitting ~1e-4 from their class mean that ratio is 4e6-1e7, so the cap bound on
+# every batch and cut the term to ~1e-6 of the task loss instead of the documented
+# lambda (0.1 = 10 %).  Measured gradient contribution fell to 2.5e-7 of the task
+# gradient, which is why own / shuffled / random / lambda x30 were all
+# indistinguishable.  Gradient clipping (--adapt-max-grad-norm, 1.0 by default)
+# already bounds the update, so the cap's stated purpose is covered without it.
+_DEFAULT_PROTO_SCALE_CAP = 0.0
 
 
 def predict_day(
@@ -88,6 +96,7 @@ def train_day(
     client_name: str = "",
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
+    proto_scale_cap: float = _DEFAULT_PROTO_SCALE_CAP,
     classify_fn: Callable[[float, float], int] | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     extra_loss_fn: Callable[[torch.Tensor, Forecaster], torch.Tensor] | None = None,
@@ -217,7 +226,9 @@ def train_day(
                     # detached) does not — it grows unbounded and can spike the
                     # local update right as the client nears consensus. Capping
                     # scale bounds that gradient contribution.
-                    scale = (task_loss_val / (avg_proto.detach() + 1e-8)).clamp(max=_MAX_PROTO_LOSS_SCALE)
+                    scale = task_loss_val / (avg_proto.detach() + 1e-8)
+                    if proto_scale_cap > 0:
+                        scale = scale.clamp(max=proto_scale_cap)
                     loss = loss + proto_lambda * scale * avg_proto
 
             if extra_loss_fn is not None:
