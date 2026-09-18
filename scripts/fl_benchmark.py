@@ -219,7 +219,14 @@ def apply_align_target(
         classes = sorted(protos)
         if align_target == "shuffled":
             shuffled = list(classes)
-            rng.shuffle(shuffled)
+            # A plain permutation is the identity with probability 1/C! — one round in
+            # six at C = 3 — which silently turns the control into a no-op and dilutes
+            # the H5.2 contrast.  Draw a derangement instead, so every regime really
+            # does receive another regime's prototype.  (C < 2 has no derangement.)
+            while len(classes) > 1:
+                rng.shuffle(shuffled)
+                if all(a != b for a, b in zip(classes, shuffled, strict=True)):
+                    break
             out.append({cls: protos[other] for cls, other in zip(classes, shuffled, strict=True)})
         else:  # random, norm-matched
             out.append(
@@ -593,6 +600,7 @@ def run_fl_benchmark(
     regime_label: str = "clear_sky",
     regime_edges: tuple[float, ...] | None = None,
     attention: bool = True,
+    attention_temperature: float | None = None,
     align_target: str = "global",
     participation: str = "full",
     join_days: dict[str, int] | None = None,
@@ -817,6 +825,8 @@ def run_fl_benchmark(
     evaluated_days: list[set[str]] = [set() for _ in clients]
     days_since_sync = 0
     fl_round_idx = 0
+    # Counts every sync *opportunity*, fired or not — see the participation draw below.
+    sync_opportunity_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
     in_warmup = warmup_days > 0
 
@@ -1167,17 +1177,28 @@ def run_fl_benchmark(
         # ---------------------------------------------------------------
         # Who takes part in *this* round: joined, not held out, not dropped or
         # in an outage.  Absent clients neither send nor receive.
-        roster = [
-            i
-            for i in range(len(clients))
-            if joined[i] and (loso_holdout is None or client_names[i] != loso_holdout) and participates(i, fl_round_idx)
-        ]
-        _do_aggregate = (
-            not is_static
-            and algorithm not in ("isolated", "pooled")
-            and bool(roster)
-            and (warmup_ended_today or days_since_sync >= sync_interval)
-        )
+        _federates = not is_static and algorithm not in ("isolated", "pooled")
+        _sync_due = warmup_ended_today or days_since_sync >= sync_interval
+        roster: list[int] = []
+        if _federates and _sync_due:
+            # Key the participation draw on the sync OPPORTUNITY, not on fl_round_idx.
+            # fl_round_idx advances only when a round actually fires, so keying on it
+            # made a round in which everybody dropped redraw the identical outcome at
+            # every later opportunity: the all-dropped state was absorbing and
+            # federation stopped for good (dropout:0.5 fired ~7 of 48 rounds).
+            roster = [
+                i
+                for i in range(len(clients))
+                if joined[i]
+                and (loso_holdout is None or client_names[i] != loso_holdout)
+                and participates(i, sync_opportunity_idx)
+            ]
+            sync_opportunity_idx += 1
+        _do_aggregate = _federates and _sync_due and bool(roster)
+        if _sync_due and not warmup_ended_today:
+            # Rounds keep their cadence even when nobody turns up for one, so a missed
+            # round costs one round rather than retrying every day until someone shows.
+            days_since_sync = 0
         if warmup_ended_today and not in_warmup:
             # Reset counter so the next periodic sync starts fresh
             days_since_sync = 0
@@ -1195,7 +1216,7 @@ def run_fl_benchmark(
                 # term is a no-op for it) — fully excluded from federation.
                 _proto_accum_for_agg = [(_proto_accum[i] if i in roster else {}) for i in range(len(clients))]
                 _per_client_global_protos, _attn_weights = aggregate_global_prototypes(
-                    _proto_accum_for_agg, attention=attention
+                    _proto_accum_for_agg, attention=attention, temperature=attention_temperature
                 )
                 _own_protos = [client_mean_prototypes(acc) for acc in _proto_accum]
                 _per_client_global_protos = apply_align_target(
@@ -1551,7 +1572,8 @@ def run_fl_benchmark(
         "algorithm": algorithm,
         "regime_label": regime_label,
         "regime_edges": list(edges),
-        "attention": "on" if attention else "uniform",
+        "attention": ("fixed" if attention_temperature is not None else "on") if attention else "uniform",
+        "attention_temperature": attention_temperature,
         "align_target": align_target,
         "participation": participation,
         "join_days": join_days,
@@ -1666,10 +1688,22 @@ def run_fl_benchmark(
 )
 @click.option(
     "--attention",
-    type=click.Choice(["on", "uniform"], case_sensitive=False),
+    type=click.Choice(["on", "fixed", "uniform"], case_sensitive=False),
     default="on",
     show_default=True,
-    help="Prototype aggregation: similarity+support attention, or a plain unweighted mean.",
+    help=(
+        "Prototype aggregation.  on = similarity+support attention at an adaptive "
+        "temperature (the implemented mechanism); fixed = the same attention at the "
+        "static tau of --attention-temperature (the mechanism the thesis text "
+        "describes); uniform = a plain unweighted mean."
+    ),
+)
+@click.option(
+    "--attention-temperature",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Softmax temperature tau, used only when --attention=fixed.",
 )
 @click.option(
     "--stratify",
@@ -1949,6 +1983,7 @@ def main(
     regime_label: str,
     regime_edges: str | None,
     attention: str,
+    attention_temperature: float,
     stratify: str,
     align_target: str,
     participation: str,
@@ -2000,7 +2035,8 @@ def main(
         loso_holdout=loso_holdout,
         regime_label=regime_label,
         regime_edges=edges,
-        attention=attention == "on",
+        attention=attention != "uniform",
+        attention_temperature=attention_temperature if attention == "fixed" else None,
         align_target=align_target,
         participation=participation,
         join_days=join_days,
@@ -2059,6 +2095,7 @@ def main(
                     "regime_label": regime_label,
                     "regime_edges": list(edges),
                     "attention": attention,
+                    "attention_temperature": attention_temperature,
                     "stratify": stratify,
                     "align_target": align_target,
                     "participation": participation,

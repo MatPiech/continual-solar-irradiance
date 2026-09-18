@@ -145,13 +145,17 @@ def _zscore(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 def aggregate_global_prototypes(
     client_protos: list[dict[int, tuple[torch.Tensor, int]]],
     attention: bool = True,
+    temperature: float | None = None,
 ) -> tuple[list[dict[int, torch.Tensor]], dict[int, list[list[float]]]]:
     """Aggregate class prototypes with adaptive attention.
 
     Attention logits combine:
     - cosine similarity between client prototypes (content relevance)
     - support-count prior (prototype reliability)
-    Similarity scaling is data-driven (pairwise std), avoiding static temperature.
+    Similarity scaling is data-driven (pairwise std) by default.  Passing
+    *temperature* replaces that adaptive scale with a fixed tau, which is what the
+    thesis text describes (tau = 0.5); everything else, including the support-count
+    prior, is held identical so the two differ only in the scale.
     """
     n_clients = len(client_protos)
 
@@ -185,8 +189,11 @@ def aggregate_global_prototypes(
         normed = proto_stack / norms
         sim_matrix = normed @ normed.T
 
-        # Adaptive similarity scale (temperature): use matrix std over present clients.
-        sim_scale = sim_matrix.std(unbiased=False).clamp(min=1e-4)
+        # Similarity scale (temperature): adaptive by default (matrix std over the present clients), or a fixed tau when one is given.
+        if temperature is None:
+            sim_scale = sim_matrix.std(unbiased=False).clamp(min=1e-4)
+        else:
+            sim_scale = torch.tensor(float(temperature)).clamp(min=1e-4)
         sim_logits = sim_matrix / sim_scale
 
         if attention:
@@ -201,7 +208,11 @@ def aggregate_global_prototypes(
 
         cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]
         for ki, i in enumerate(present):
-            per_client_protos[i][cls] = weighted[ki]
+            # .clone(): `weighted[ki]` is a row VIEW of the (n_present, d) stack, and
+            # torch.save serialises a view's whole backing storage — which made the
+            # logged prototype payload scale with the number of participating peers
+            # (3x at three clients) instead of being a single d-vector per regime.
+            per_client_protos[i][cls] = weighted[ki].clone()
             for kj, j in enumerate(present):
                 cls_attn[i][j] = attn[ki, kj].item()
         attention_weights[cls] = cls_attn
