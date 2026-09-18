@@ -202,7 +202,9 @@ def train_day(
                 n_proto = 0
                 for b in range(imgs.size(0)):
                     cls = classify_fn(float(tgts[b].item()), (ghis or [0.0])[b])
-                    if cls in proto_on_device:
+                    # cls < 0 marks a sample with no usable clear-sky value; it is
+                    # trained on as usual but pulled toward no prototype.
+                    if cls >= 0 and cls in proto_on_device:
                         proto_loss = proto_loss + F.mse_loss(img_feats[b], proto_on_device[cls])
                         n_proto += 1
                 if n_proto > 0:

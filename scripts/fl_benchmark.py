@@ -99,6 +99,7 @@ from cirr.fl.kc_prototypes import (
     aggregate_global_prototypes,
     default_edges,
     extract_day_prototypes,
+    DEFAULT_MIN_GHI_CLEAR,
     make_regime_labeller,
     regime_names,
 )
@@ -107,7 +108,7 @@ from cirr.fl.server import AGGREGATION_FNS, _compute_weight_change, is_bn_key, i
 from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
-from cirr.physics.clear_sky import load_clear_sky_lookup
+from cirr.physics.clear_sky import load_clear_sky_lookup, resolve_clear_sky_value
 from cirr.training.day_loop import predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
@@ -122,6 +123,45 @@ ALIGN_TARGETS = ("global", "own", "shuffled", "random")
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+
+
+def filter_lit_days(
+    day_map: dict[str, list[int]],
+    periods: list[dict[str, Any]],
+    lookup: dict[str, float],
+    min_ghi_clear: float,
+) -> tuple[dict[str, list[int]], int]:
+    """Drop samples whose clear-sky GHI is below *min_ghi_clear* (kW/m^2).
+
+    Applied once, where the day index map is built, so local training, evaluation,
+    prototype extraction and the Smart-Persistence denominator all score exactly the
+    same population — there is no second place for the filter to disagree with itself.
+
+    Night samples are trivially predictable (target and prediction are both ~0) and
+    their share differs sharply by site: 0 % at Folsom, whose camera records 06-20 h,
+    against 19 % at Karpicko and 31 % at Poznan, which record around the clock.
+    Leaving them in depresses the Polish sites' error for *every* method and makes
+    cross-site comparison meaningless.  0 disables the filter.
+
+    Days left with no lit sample are dropped entirely, which is the same state the
+    simulation already uses for a day a client has no data for.
+    """
+    if min_ghi_clear <= 0.0:
+        return day_map, 0
+    kept: dict[str, list[int]] = {}
+    dropped = 0
+    for day, idxs in day_map.items():
+        lit = []
+        for j in idxs:
+            stamp = periods[j]["history"][-1]["image_name"].rsplit(".", 1)[0]
+            ghi = resolve_clear_sky_value(lookup, stamp)
+            if ghi is not None and ghi >= min_ghi_clear:
+                lit.append(j)
+            else:
+                dropped += 1
+        if lit:
+            kept[day] = lit
+    return kept, dropped
 
 
 def set_determinism(seed: int) -> None:
@@ -599,6 +639,8 @@ def run_fl_benchmark(
     loso_holdout: str | None = None,
     regime_label: str = "clear_sky",
     regime_edges: tuple[float, ...] | None = None,
+    proto_min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
+    min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
     attention: bool = True,
     attention_temperature: float | None = None,
     align_target: str = "global",
@@ -700,7 +742,7 @@ def run_fl_benchmark(
     # target inside train_day, and the per-regime error breakdown, so the three
     # can never disagree about which regime a sample belongs to.
     edges = default_edges(regime_label) if regime_edges is None else tuple(regime_edges)
-    classify_fn = make_regime_labeller(regime_label, edges)
+    classify_fn = make_regime_labeller(regime_label, edges, proto_min_ghi_clear)
     n_regimes = len(edges) + 1
     regime_name_map = regime_names(n_regimes)
 
@@ -735,12 +777,21 @@ def run_fl_benchmark(
     for name, path in clients:
         ds = load_dataset(path, split="test")
         dm = group_indices_by_day(ds.periods)
+        lookup = load_clear_sky_lookup(path)
+        dm, _dropped = filter_lit_days(dm, ds.periods, lookup, min_ghi_clear)
 
-        clear_sky_lookups.append(load_clear_sky_lookup(path))
+        clear_sky_lookups.append(lookup)
         sp_day_stats.append({})
         datasets.append(ds)
         day_maps.append(dm)
-        print(f"  {name}: {sum(len(v) for v in dm.values())} periods")
+        _kept = sum(len(v) for v in dm.values())
+        if _dropped:
+            print(
+                f"  {name}: {_kept} periods, {len(dm)} days "
+                f"({_dropped} dropped below {min_ghi_clear * 1000:.0f} W/m^2 clear-sky)"
+            )
+        else:
+            print(f"  {name}: {_kept} periods, {len(dm)} days")
 
     # --- Load models (all clients start from the same checkpoint) ---
     print(f"\nLoading checkpoint: {checkpoint_path}")
@@ -1572,6 +1623,8 @@ def run_fl_benchmark(
         "algorithm": algorithm,
         "regime_label": regime_label,
         "regime_edges": list(edges),
+        "proto_min_ghi_clear": proto_min_ghi_clear,
+        "min_ghi_clear": min_ghi_clear,
         "attention": ("fixed" if attention_temperature is not None else "on") if attention else "uniform",
         "attention_temperature": attention_temperature,
         "align_target": align_target,
@@ -1684,6 +1737,30 @@ def run_fl_benchmark(
     help=(
         "Comma-separated ascending regime cut points, e.g. '0.3,0.85'.  "
         "Default: the label's own defaults.  Empty string = one regime (no stratification)."
+    ),
+)
+@click.option(
+    "--min-ghi-clear",
+    type=float,
+    default=DEFAULT_MIN_GHI_CLEAR,
+    show_default=True,
+    help=(
+        "Minimum clear-sky GHI in kW/m^2 for a sample to enter the simulation at all. "
+        "Applied once where the day index map is built, so training, evaluation, "
+        "prototypes and the Forecast-Skill denominator all score the same population. "
+        "0 keeps every sample, including night."
+    ),
+)
+@click.option(
+    "--proto-min-ghi-clear",
+    type=float,
+    default=DEFAULT_MIN_GHI_CLEAR,
+    show_default=True,
+    help=(
+        "Minimum clear-sky GHI in kW/m^2 for a sample to carry a sky regime.  Samples "
+        "below it are still predicted and still counted in the metrics, but contribute "
+        "to no prototype and are pulled toward none.  0 disables the floor and restores "
+        "the pre-2026-09 behaviour, in which night frames landed in the clear regime."
     ),
 )
 @click.option(
@@ -1982,6 +2059,8 @@ def main(
     loso_holdout: str | None,
     regime_label: str,
     regime_edges: str | None,
+    proto_min_ghi_clear: float,
+    min_ghi_clear: float,
     attention: str,
     attention_temperature: float,
     stratify: str,
@@ -2035,6 +2114,8 @@ def main(
         loso_holdout=loso_holdout,
         regime_label=regime_label,
         regime_edges=edges,
+        proto_min_ghi_clear=proto_min_ghi_clear,
+        min_ghi_clear=min_ghi_clear,
         attention=attention != "uniform",
         attention_temperature=attention_temperature if attention == "fixed" else None,
         align_target=align_target,
@@ -2094,6 +2175,8 @@ def main(
                     },
                     "regime_label": regime_label,
                     "regime_edges": list(edges),
+                    "proto_min_ghi_clear": proto_min_ghi_clear,
+                    "min_ghi_clear": min_ghi_clear,
                     "attention": attention,
                     "attention_temperature": attention_temperature,
                     "stratify": stratify,

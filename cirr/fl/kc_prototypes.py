@@ -13,11 +13,29 @@ from cirr.physics.csi import CSI_CLEAR, CSI_OVERCAST, compute_csi
 PROTO_OVERCAST = 0
 PROTO_TRANSIENT = 1
 PROTO_CLEAR = 2
+# Samples with no usable clear-sky irradiance get this id and are excluded from
+# prototype extraction and from the alignment loss.  They are still predicted and
+# still counted in the error metrics — this is about what defines a sky regime,
+# not about which samples are evaluated.
+PROTO_UNLIT = -1
 PROTO_CLASS_NAMES = {
     PROTO_OVERCAST: "overcast",
     PROTO_TRANSIENT: "transient",
     PROTO_CLEAR: "clear",
 }
+
+# Minimum clear-sky GHI (kW/m^2) for a sample to carry a sky regime at all.
+# Below this the clear-sky index is meaningless: compute_csi clamps the
+# denominator at 1e-3 kW/m^2, so a night frame with ghi_clear == 0 yields
+# CSI = target/0.001, and any sensor noise above 0.85 W/m^2 was being labelled
+# "clear".  That put ~40 % night frames into the clear prototype at Karpicko and
+# Poznan while leaving daylight-only Folsom untouched — exactly the cross-site
+# incomparability the clear-sky label exists to remove.
+#
+# The floor is set to the clamp itself (1 W/m^2 = 1e-3 kW/m^2): every sample that
+# survives it has ghi_clear >= the clamp, so the clamp can never bind on an
+# eligible sample and CSI is always a true ratio rather than a division by eps.
+DEFAULT_MIN_GHI_CLEAR = 0.001
 
 # Physics-informed default KC/Kt regime boundaries:
 #   overcast  : < 0.30
@@ -49,22 +67,41 @@ def default_edges(label: str) -> tuple[float, float]:
     return DEFAULT_KC_EDGES if label == "proxy" else DEFAULT_CSI_EDGES
 
 
-def make_regime_labeller(label: str, edges: tuple[float, ...]) -> Callable[[float, float], int]:
-    """Return ``fn(target, ghi_clear) -> regime id`` for the chosen label source."""
+def make_regime_labeller(
+    label: str,
+    edges: tuple[float, ...],
+    min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
+) -> Callable[[float, float], int]:
+    """Return ``fn(target, ghi_clear) -> regime id`` for the chosen label source.
+
+    Returns ``PROTO_UNLIT`` when the clear-sky irradiance is below *min_ghi_clear*,
+    so that one function decides both eligibility and label and the two call sites
+    (prototype extraction and the alignment loss) cannot drift apart.  The floor is
+    applied for both label sources, so the proxy and clear_sky arms differ only in
+    the label and not in which samples build a prototype.
+    """
     if label not in REGIME_LABELS:
         raise ValueError(f"Unknown regime label {label!r}. Choose from {REGIME_LABELS}.")
-    if label == "proxy":
-        return lambda target, _ghi: classify_value(target, edges)
-    return lambda target, ghi: classify_value(compute_csi(target, ghi), edges)
+    base = (
+        (lambda target, _ghi: classify_value(target, edges))
+        if label == "proxy"
+        else (lambda target, ghi: classify_value(compute_csi(target, ghi), edges))
+    )
+    if min_ghi_clear <= 0.0:
+        return base
+    return lambda target, ghi: base(target, ghi) if ghi >= min_ghi_clear else PROTO_UNLIT
 
 
 def regime_names(n_classes: int) -> dict[int, str]:
     """Human-readable regime names; the physical triple keeps its usual names."""
+    names = {PROTO_UNLIT: "unlit"}
     if n_classes == 3:
-        return dict(PROTO_CLASS_NAMES)
-    if n_classes == 1:
-        return {0: "all"}
-    return {i: f"regime{i}" for i in range(n_classes)}
+        names.update(PROTO_CLASS_NAMES)
+    elif n_classes == 1:
+        names[0] = "all"
+    else:
+        names.update({i: f"regime{i}" for i in range(n_classes)})
+    return names
 
 
 def classify_irradiance(norm_irradiance: float, edges: tuple[float, float] = DEFAULT_KC_EDGES) -> int:

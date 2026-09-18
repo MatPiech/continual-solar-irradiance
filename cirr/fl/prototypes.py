@@ -35,6 +35,8 @@ def extract_binned_prototypes(
             features = model.extract_proto_features(imgs)
             for b, sample in enumerate(batch):
                 cls = classify_fn(sample)
+                if cls < 0:
+                    continue  # no usable sky regime: never contributes to a prototype
                 feat = features[b].cpu()
                 if cls not in proto_sums:
                     proto_sums[cls] = torch.zeros_like(feat)
