@@ -109,7 +109,7 @@ from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.physics.clear_sky import load_clear_sky_lookup, resolve_clear_sky_value
-from cirr.training.day_loop import predict_day, train_day
+from cirr.training.day_loop import ALIGN_LOSSES, predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
@@ -430,6 +430,8 @@ def _process_client_day(
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
     proto_scale_cap: float = 0.0,
+    align_loss: str = "mse",
+    align_temperature: float = 0.1,
     extract_prototypes: bool = False,
     train: bool = True,
     gated: bool = False,
@@ -513,14 +515,17 @@ def _process_client_day(
                     global_prototypes=global_prototypes,
                     proto_lambda=proto_lambda,
                     proto_scale_cap=proto_scale_cap,
+                    align_loss=align_loss,
+                    align_temperature=align_temperature,
                     classify_fn=classify_fn,
                 )
 
         # Step 4: Extract per-class prototypes (FedProto — after training
         # so features reflect the updated model)
         day_protos: dict[int, tuple[torch.Tensor, int]] = {}
+        proto_stats: dict[str, float] = {}
         if train and extract_prototypes and day_samples:
-            day_protos = extract_day_prototypes(
+            day_protos, proto_stats = extract_day_prototypes(
                 model,
                 day_samples,
                 device,
@@ -556,6 +561,7 @@ def _process_client_day(
         "rmse": metrics.get("rmse", float("nan")),
         "loss": loss,
         "day_prototypes": day_protos,
+        "proto_stats": proto_stats,
         "proto_bin_edges": proto_bin_edges,
         "gate_stats": gate_stats,
         "gate_opened": bool(gate_stats.get("backprop", 0)),
@@ -637,6 +643,8 @@ def run_fl_benchmark(
     fedema_alpha: float = 0.5,
     fedproto_lambda: float = 0.1,
     proto_scale_cap: float = 0.0,
+    align_loss: str = "mse",
+    align_temperature: float = 0.1,
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
     loso_holdout: str | None = None,
@@ -879,6 +887,9 @@ def run_fl_benchmark(
     evaluated_days: list[set[str]] = [set() for _ in clients]
     days_since_sync = 0
     fl_round_idx = 0
+    # Latest collapse diagnostics per client, refreshed by each day's prototype pass.
+    _collapse_stats: dict[int, dict[str, float]] = {}
+    _collapse_warned = False
     # Counts every sync *opportunity*, fired or not — see the participation draw below.
     sync_opportunity_idx = 0
     last_global_state_dict: dict[str, Any] | None = None  # updated after every FL round
@@ -1059,6 +1070,8 @@ def run_fl_benchmark(
                 else None,
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
                 "proto_scale_cap": proto_scale_cap,
+                "align_loss": align_loss,
+                "align_temperature": align_temperature,
                 "extract_prototypes": _is_fedproto and not in_warmup,
                 "train": not is_static,
                 "gated": _is_gated,
@@ -1111,6 +1124,8 @@ def run_fl_benchmark(
                 _all_tgts[i].append(result["tgts"])
                 evaluated_days[i].add(day_key)
             loss_by_idx[i] = result["loss"]
+            if result.get("proto_stats"):
+                _collapse_stats[i] = result["proto_stats"]
 
             # FedProto: accumulate per-class prototypes for this client
             if _is_fedproto and result.get("day_prototypes"):
@@ -1298,8 +1313,27 @@ def run_fl_benchmark(
                                     "align_loss_mean": loss_by_idx.get(i, float("nan")),
                                     "update_l2_norm": float("nan"),
                                     "prototype_norms": float(_per_client_global_protos[i][cls].norm()),
+                                    # Collapse diagnostics: a representation collapse
+                                    # shows up as feature_norm_mean falling while
+                                    # pairwise_cos_mean rises toward 1.
+                                    "feature_norm_mean": _collapse_stats.get(i, {}).get(
+                                        "feature_norm_mean", float("nan")
+                                    ),
+                                    "pairwise_cos_mean": _collapse_stats.get(i, {}).get(
+                                        "pairwise_cos_mean", float("nan")
+                                    ),
                                 }
                             )
+                _cos = [
+                    s.get("pairwise_cos_mean", float("nan")) for s in _collapse_stats.values()
+                ]
+                _cos = [c for c in _cos if c == c]
+                if _cos and max(_cos) > 0.95 and not _collapse_warned:
+                    _collapse_warned = True
+                    print(
+                        f"  {'':6}      [warn] mean pairwise cosine {max(_cos):.4f} > 0.95 — the "
+                        "representation is collapsing; prototypes carry little information"
+                    )
                 _attn_arr = np.full((len(clients), len(clients), n_regimes), np.nan, dtype=np.float32)
                 for cls, mat in _attn_weights.items():
                     if 0 <= int(cls) < n_regimes:
@@ -1630,6 +1664,8 @@ def run_fl_benchmark(
         "proto_min_ghi_clear": proto_min_ghi_clear,
         "min_ghi_clear": min_ghi_clear,
         "proto_scale_cap": proto_scale_cap,
+        "align_loss": align_loss,
+        "align_temperature": align_temperature,
         "attention": ("fixed" if attention_temperature is not None else "on") if attention else "uniform",
         "attention_temperature": attention_temperature,
         "align_target": align_target,
@@ -1743,6 +1779,25 @@ def run_fl_benchmark(
         "Comma-separated ascending regime cut points, e.g. '0.3,0.85'.  "
         "Default: the label's own defaults.  Empty string = one regime (no stratification)."
     ),
+)
+@click.option(
+    "--align-loss",
+    type=click.Choice(ALIGN_LOSSES, case_sensitive=False),
+    default="mse",
+    show_default=True,
+    help=(
+        "Prototype alignment objective.  mse = pull every embedding onto its regime "
+        "centroid (the original; collapses the representation).  prototypical = cosine "
+        "cross-entropy of each regime's batch centroid against all prototypes, which "
+        "leaves within-regime spread free and pushes away from other regimes."
+    ),
+)
+@click.option(
+    "--align-temperature",
+    type=float,
+    default=0.1,
+    show_default=True,
+    help="Softmax temperature for --align-loss prototypical.",
 )
 @click.option(
     "--proto-scale-cap",
@@ -2079,6 +2134,8 @@ def main(
     proto_min_ghi_clear: float,
     min_ghi_clear: float,
     proto_scale_cap: float,
+    align_loss: str,
+    align_temperature: float,
     attention: str,
     attention_temperature: float,
     stratify: str,
@@ -2135,6 +2192,8 @@ def main(
         proto_min_ghi_clear=proto_min_ghi_clear,
         min_ghi_clear=min_ghi_clear,
         proto_scale_cap=proto_scale_cap,
+        align_loss=align_loss,
+        align_temperature=align_temperature,
         attention=attention != "uniform",
         attention_temperature=attention_temperature if attention == "fixed" else None,
         align_target=align_target,
@@ -2197,6 +2256,8 @@ def main(
                     "proto_min_ghi_clear": proto_min_ghi_clear,
                     "min_ghi_clear": min_ghi_clear,
                     "proto_scale_cap": proto_scale_cap,
+                    "align_loss": align_loss,
+                    "align_temperature": align_temperature,
                     "attention": attention,
                     "attention_temperature": attention_temperature,
                     "stratify": stratify,

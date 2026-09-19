@@ -156,7 +156,7 @@ def extract_day_prototypes(
     batch_size: int,
     edges: tuple[float, float] | None = None,
     labeller: Callable[[float, float], int] | None = None,
-) -> dict[int, tuple[torch.Tensor, int]]:
+) -> tuple[dict[int, tuple[torch.Tensor, int]], dict[str, float]]:
     """Extract per-regime prototypes; *labeller* must match the one used in training."""
     if labeller is None:
         bin_edges = edges if edges is not None else DEFAULT_KC_EDGES
