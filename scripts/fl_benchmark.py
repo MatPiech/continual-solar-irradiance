@@ -645,6 +645,8 @@ def run_fl_benchmark(
     proto_scale_cap: float = 0.0,
     align_loss: str = "mse",
     align_temperature: float = 0.1,
+    regime_elevation_bins: int = 1,
+    align_gate: str = "off",
     parallel_clients: int = 1,
     freeze_early_backbone: bool = False,
     loso_holdout: str | None = None,
@@ -753,9 +755,9 @@ def run_fl_benchmark(
     # target inside train_day, and the per-regime error breakdown, so the three
     # can never disagree about which regime a sample belongs to.
     edges = default_edges(regime_label) if regime_edges is None else tuple(regime_edges)
-    classify_fn = make_regime_labeller(regime_label, edges, proto_min_ghi_clear)
-    n_regimes = len(edges) + 1
-    regime_name_map = regime_names(n_regimes)
+    classify_fn = make_regime_labeller(regime_label, edges, proto_min_ghi_clear, regime_elevation_bins)
+    n_regimes = (len(edges) + 1) * max(regime_elevation_bins, 1)
+    regime_name_map = regime_names(n_regimes, regime_elevation_bins)
 
     client_names = [name for name, _ in clients]
 
@@ -887,6 +889,17 @@ def run_fl_benchmark(
     evaluated_days: list[set[str]] = [set() for _ in clients]
     days_since_sync = 0
     fl_round_idx = 0
+    # --align-gate rolling: per client, keep the 7-day rolling MAE observed at the last
+    # round boundary and whether the alignment is currently allowed.  If a client's
+    # rolling error got worse across a round in which the alignment was active, the
+    # alignment is switched off for that client and retried after _GATE_RETRY rounds.
+    # The evaluation is free: predict_day already scores each day on pre-update weights.
+    _gate_on: list[bool] = [True] * len(clients)
+    _gate_prev: list[float] = [float("nan")] * len(clients)
+    _gate_wait: list[int] = [0] * len(clients)
+    _gate_hist: list[list[float]] = [[] for _ in clients]
+    _GATE_RETRY = 5
+
     # Latest collapse diagnostics per client, refreshed by each day's prototype pass.
     _collapse_stats: dict[int, dict[str, float]] = {}
     _collapse_warned = False
@@ -1066,7 +1079,7 @@ def run_fl_benchmark(
                 "global_state_dict": _global_sd,
                 "prox_mu": _prox_mu,
                 "global_prototypes": _per_client_global_protos[i]
-                if (_is_fedproto and _per_client_global_protos is not None)
+                if (_is_fedproto and _per_client_global_protos is not None and _gate_on[i])
                 else None,
                 "proto_lambda": fedproto_lambda if _is_fedproto else 0.0,
                 "proto_scale_cap": proto_scale_cap,
@@ -1126,6 +1139,8 @@ def run_fl_benchmark(
             loss_by_idx[i] = result["loss"]
             if result.get("proto_stats"):
                 _collapse_stats[i] = result["proto_stats"]
+            if align_gate == "rolling" and result["mae"] == result["mae"]:
+                _gate_hist[i].append(float(result["mae"]))
 
             # FedProto: accumulate per-class prototypes for this client
             if _is_fedproto and result.get("day_prototypes"):
@@ -1347,9 +1362,9 @@ def run_fl_benchmark(
                 print(f"  {'':6}      [proto] Aggregated {_n_classes} class prototypes (attention-weighted):")
                 # Per-client sample counts
                 for ci, cname in enumerate(client_names):
-                    _counts = {PROTO_CLASS_NAMES[c]: cnt for c, (_, cnt) in _proto_accum[ci].items()}
+                    _counts = {regime_name_map.get(c, str(c)): cnt for c, (_, cnt) in _proto_accum[ci].items()}
                     _norms = {
-                        PROTO_CLASS_NAMES[c]: _per_client_global_protos[ci][c].norm().item()
+                        regime_name_map.get(c, str(c)): _per_client_global_protos[ci][c].norm().item()
                         for c in _per_client_global_protos[ci]
                     }
                     if _counts:
@@ -1359,7 +1374,7 @@ def run_fl_benchmark(
                 # Attention matrix per class
                 for cls in _all_classes:
                     if cls in _attn_weights:
-                        cname = PROTO_CLASS_NAMES[cls]
+                        cname = regime_name_map.get(cls, str(cls))
                         present = [
                             i
                             for i in range(len(client_names))
@@ -1373,7 +1388,7 @@ def run_fl_benchmark(
 
                 # Export-ready diagnostics rows for reproducibility / paper appendix.
                 for cls in _all_classes:
-                    cls_name = PROTO_CLASS_NAMES.get(cls, str(cls))
+                    cls_name = regime_name_map.get(cls, str(cls))
                     for i in range(len(client_names)):
                         support_count = 0
                         if cls in _proto_accum[i]:
@@ -1522,6 +1537,21 @@ def run_fl_benchmark(
                             client_name=f"{client_names[i]} ft",
                         )
 
+            if align_gate == "rolling":
+                for i in range(len(clients)):
+                    cur = float(np.mean(_gate_hist[i][-7:])) if len(_gate_hist[i]) >= 3 else float("nan")
+                    if _gate_on[i] and cur == cur and _gate_prev[i] == _gate_prev[i] and cur > _gate_prev[i]:
+                        _gate_on[i] = False
+                        _gate_wait[i] = _GATE_RETRY
+                    elif not _gate_on[i]:
+                        _gate_wait[i] -= 1
+                        if _gate_wait[i] <= 0:
+                            _gate_on[i] = True
+                    _gate_prev[i] = cur
+                _closed = [client_names[i] for i in range(len(clients)) if not _gate_on[i]]
+                if _closed:
+                    print(f"  {'':6}      [gate] alignment paused for {', '.join(_closed)}")
+
             round_tag = "[WARMUP END] " if warmup_ended_today else ""
             per_day[-1]["fl_round_after"] = fl_round_idx
             per_round.append(
@@ -1666,6 +1696,8 @@ def run_fl_benchmark(
         "proto_scale_cap": proto_scale_cap,
         "align_loss": align_loss,
         "align_temperature": align_temperature,
+        "regime_elevation_bins": regime_elevation_bins,
+        "align_gate": align_gate,
         "attention": ("fixed" if attention_temperature is not None else "on") if attention else "uniform",
         "attention_temperature": attention_temperature,
         "align_target": align_target,
@@ -1778,6 +1810,28 @@ def run_fl_benchmark(
     help=(
         "Comma-separated ascending regime cut points, e.g. '0.3,0.85'.  "
         "Default: the label's own defaults.  Empty string = one regime (no stratification)."
+    ),
+)
+@click.option(
+    "--regime-elevation-bins",
+    type=int,
+    default=1,
+    show_default=True,
+    help=(
+        "Cross the sky-condition regimes with N clear-sky-irradiance levels (a proxy for "
+        "solar elevation), giving C = 3 x N prototypes instead of 3.  Fixed physical edges, "
+        "so a bin means the same thing at every site.  1 disables the second axis."
+    ),
+)
+@click.option(
+    "--align-gate",
+    type=click.Choice(["off", "rolling"], case_sensitive=False),
+    default="off",
+    show_default=True,
+    help=(
+        "'rolling' skips the alignment for a client in the next round whenever its 7-day "
+        "rolling MAE worsened over the round just finished, and retries later.  Keeps the "
+        "exchange only while it is demonstrably not hurting that client."
     ),
 )
 @click.option(
@@ -2136,6 +2190,8 @@ def main(
     proto_scale_cap: float,
     align_loss: str,
     align_temperature: float,
+    regime_elevation_bins: int,
+    align_gate: str,
     attention: str,
     attention_temperature: float,
     stratify: str,
@@ -2194,6 +2250,8 @@ def main(
         proto_scale_cap=proto_scale_cap,
         align_loss=align_loss,
         align_temperature=align_temperature,
+        regime_elevation_bins=regime_elevation_bins,
+        align_gate=align_gate,
         attention=attention != "uniform",
         attention_temperature=attention_temperature if attention == "fixed" else None,
         align_target=align_target,
@@ -2258,6 +2316,8 @@ def main(
                     "proto_scale_cap": proto_scale_cap,
                     "align_loss": align_loss,
                     "align_temperature": align_temperature,
+                    "regime_elevation_bins": regime_elevation_bins,
+                    "align_gate": align_gate,
                     "attention": attention,
                     "attention_temperature": attention_temperature,
                     "stratify": stratify,

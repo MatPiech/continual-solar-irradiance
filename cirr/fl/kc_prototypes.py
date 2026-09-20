@@ -54,6 +54,25 @@ DEFAULT_CSI_EDGES = (CSI_OVERCAST, CSI_CLEAR)
 # clear-sky irradiance and does not.
 REGIME_LABELS = ("proxy", "clear_sky")
 
+# Optional second stratification axis: clear-sky irradiance (kW/m^2), which is a
+# monotone proxy for solar elevation.  Crossing it with the sky-condition bin turns
+# C = 3 mean vectors per round into C = 3 x n_elevation, so the exchange can carry
+# structure instead of three points.
+#
+# Fixed physical edges rather than per-client quantiles or k-means: a cluster index
+# only means something in aggregation if it means the SAME thing at every site.
+# Data-driven clusters would have to be matched across clients before averaging,
+# and mismatched indices would silently average unrelated regions of feature space.
+DEFAULT_ELEVATION_EDGES = (0.15, 0.35, 0.60)
+
+
+def elevation_bin(ghi_clear: float, n_bins: int) -> int:
+    """Bin clear-sky irradiance into *n_bins* fixed levels; 1 disables the axis."""
+    if n_bins <= 1:
+        return 0
+    edges = DEFAULT_ELEVATION_EDGES[: n_bins - 1]
+    return classify_value(ghi_clear, edges)
+
 
 def classify_value(value: float, edges: tuple[float, ...]) -> int:
     """Bin *value* against ascending *edges*; no edges means a single regime."""
@@ -71,6 +90,7 @@ def make_regime_labeller(
     label: str,
     edges: tuple[float, ...],
     min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
+    elevation_bins: int = 1,
 ) -> Callable[[float, float], int]:
     """Return ``fn(target, ghi_clear) -> regime id`` for the chosen label source.
 
@@ -87,14 +107,26 @@ def make_regime_labeller(
         if label == "proxy"
         else (lambda target, ghi: classify_value(compute_csi(target, ghi), edges))
     )
+    n_sky = len(edges) + 1
+    if elevation_bins > 1:
+        sky = base
+        base = lambda target, ghi: sky(target, ghi) * elevation_bins + elevation_bin(ghi, elevation_bins)  # noqa: E731
     if min_ghi_clear <= 0.0:
         return base
     return lambda target, ghi: base(target, ghi) if ghi >= min_ghi_clear else PROTO_UNLIT
 
 
-def regime_names(n_classes: int) -> dict[int, str]:
+def regime_names(n_classes: int, elevation_bins: int = 1) -> dict[int, str]:
     """Human-readable regime names; the physical triple keeps its usual names."""
     names = {PROTO_UNLIT: "unlit"}
+    if elevation_bins > 1:
+        sky = regime_names(n_classes // elevation_bins)
+        names.update({
+            c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
+            for c in range(n_classes // elevation_bins)
+            for e in range(elevation_bins)
+        })
+        return names
     if n_classes == 3:
         names.update(PROTO_CLASS_NAMES)
     elif n_classes == 1:
