@@ -150,7 +150,8 @@ spending GPU-hours.
 
 ### 5.1 Window selection
 
-**15 to 21 June**, recorded in `configs/ch4_smoke_window.yaml`. Keep the manifest; the device
+**15 to 17 June**, recorded in `configs/ch4_smoke_window.yaml`: the first 3 days of the 7-day
+candidate below, cut by author decision to keep the smoke short (7,873 samples). Keep the manifest; the device
 measurements replay the same window.
 
 Selected by measurement rather than by the Chapter 5 rule, which has no solution here. Coverage
@@ -164,9 +165,13 @@ mixed-regime error to exercise the full-model action. The March-to-May preferenc
 from the federated plan and does not survive contact with these sites. Folsom caps near 0.98
 because its camera records 06-20 h rather than full daylight, so 1.0 is unreachable anywhere.
 
-Cheaper alternative if runtime matters more than regime variety: 21 to 27 January, 0.918 worst
-day but 10,593 samples. Measured throughput is 13.5 ms/sample frozen, 16.1 NOTE, 23.6 for the
-conditional policy, putting the June smoke near 1.5 h and the January one near 45 min.
+Cold-season alternative: 21 to 27 January, 0.918 worst day but 10,593 samples over 7 days.
+Measured throughput is 13.5 ms/sample frozen, 16.1 NOTE and 23.6 for the conditional policy.
+
+**Few-shot 7d cannot run on a 3-day window.** `evaluate_fewshot` fits on the first
+`fewshot_days` days and predicts on the remainder, so a 3-day window leaves it nothing to
+predict. It runs on 15 to 24 June for the executability check only, recorded in the manifest as
+`fewshot_d7_exception`; its metrics are not comparable with the other configurations.
 
 ### 5.2 Configurations to smoke-test
 
