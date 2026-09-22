@@ -20,14 +20,19 @@ SMOKE = ROOT / "results" / "ch4" / "smoke"
 LOGS = ROOT / "logs" / "ch4" / "smoke"
 MANIFEST = yaml.safe_load((ROOT / "configs" / "ch4_smoke_window.yaml").read_text())
 
-SITES = ["folsom", "karpicko", "poznan"]
 METHODS = ["baseline", "note_reg_all", "memo_reg_all", "fewshot_d1", "fewshot_d7", "sliding_window", "sm_rls", "conditional"]
+# Poznan carries one verification run rather than the full method set (author
+# decision 2026-09-22), so every per-site check reads this map instead of
+# assuming each site has every method.
+SITE_METHODS = {"folsom": METHODS, "karpicko": METHODS, "poznan": ["conditional"]}
+SITES = list(SITE_METHODS)
+COMPARISON_SITES = [s for s, ms in SITE_METHODS.items() if len(ms) > 1]
 EXTRA = [
     ("karpicko", "conditional", "seed0_repeat"),
     ("karpicko", "memo_reg_all", "seed1"),
     ("karpicko", "regression_legacy", "seed0"),
 ]
-ALL_RUNS = [(s, m, "seed0") for s in SITES for m in METHODS] + EXTRA
+ALL_RUNS = [(site, m, "seed0") for site, ms in SITE_METHODS.items() for m in ms] + EXTRA
 
 # fewshot_d7 runs on the manifest's exception window, so it is excluded wherever
 # a check compares populations against the 3-day smoke window.
@@ -194,7 +199,7 @@ def s6() -> None:
             if not (e[a] == e[f"lit_{a}"] + e[f"dark_{a}"]).all():
                 bad.append(f"{s}/{m}: lit+dark != {a}")
         if "scope_changed_if_raw" in e:
-            n = int(e.scope_changed_if_raw.sum())
+            n = int(e["scope_changed_if_raw"].sum())
             sentinel.append(f"{s}/{m}: scope_changed_if_raw={n}")
             if n:
                 bad.append(f"{s}/{m}: the clamp bound on {n} samples")
@@ -208,12 +213,12 @@ def s6() -> None:
 
 def s7() -> None:
     lines, bad = [], []
-    for site in SITES:
+    for site in COMPARISON_SITES:
         base = summary(site, "baseline")["pooled"]["mae"]
         e = load(site, "conditional", "events.csv")
-        lines.append(
-            f"{site}: static pooled MAE {base * 1000:.4f} W/m^2, conditional updates {int(e.head.sum() + e.whole.sum())}"
-        )
+        # bracket access throughout: the "head" action column shadows DataFrame.head
+        updates = int(e["head"].sum() + e["whole"].sum())
+        lines.append(f"{site}: static pooled MAE {base * 1000:.4f} W/m^2, conditional updates {updates}")
         if not np.isfinite(base):
             bad.append(f"{site}: static MAE not finite")
     record("S7", "Static reference", "FAIL" if bad else "PASS", "\n".join(bad) if bad else "\n".join(lines))
@@ -227,6 +232,9 @@ def s8() -> None:
             for s_, m, k in WINDOW_RUNS
             if s_ == site and (rundir(site, m, k) / "summary.json").exists()
         }
+        if len(frames) < 2:
+            lines.append(f"{site}: single run, no cross-method comparison available")
+            continue
         ref = None
         for m, d in frames.items():
             sp = d.set_index("date").sp_rmse
@@ -298,30 +306,69 @@ def s10() -> None:
     )
 
 
+# Methods that fit once, offline, before the stream.  Their cost does not scale
+# with campaign length the way a per-sample online method's does, so a flat
+# ms/sample extrapolation would multiply a fixed fit by the whole campaign.
+OFFLINE_FIT = ("fewshot_d1", "fewshot_d7")
+CAMPAIGN_DAYS = 300
+CAMPAIGN_SAMPLES = CAMPAIGN_DAYS * 800
+
+
 def s11() -> None:
     rows = []
-    for s, m, k in present():
-        d = summary(s, m, k)
+    for site, method, key in present():
+        d = summary(site, method, key)
         rows.append(
-            (f"{s}/{m}/{k}", d["wall_time_s"], d["n_samples"], d["wall_time_s"] / d["n_samples"] * 1000, d["peak_rss_mb"])
+            (
+                f"{site}/{method}/{key}",
+                site,
+                method,
+                d["wall_time_s"],
+                d["n_samples"],
+                d["wall_time_s"] / d["n_samples"] * 1000,
+                d["peak_rss_mb"],
+            )
         )
-    rows.sort(key=lambda r: -r[1])
-    total = sum(r[1] for r in rows)
+    rows.sort(key=lambda r: -r[3])
+
+    # the frozen run is the per-sample inference rate an offline-fit method pays
+    # once its fitting is done
+    infer_rate = {}
+    for site in COMPARISON_SITES:
+        d = summary(site, "baseline")
+        infer_rate[site] = d["wall_time_s"] / d["n_samples"]
+
     lines = [
-        f"total wall time {total / 60:.1f} min over {len(rows)} runs",
+        f"total wall time {sum(r[3] for r in rows) / 60:.1f} min over {len(rows)} runs",
         "",
         "| run | wall (s) | samples | ms/sample | peak RSS (MB) |",
         "|---|---|---|---|---|",
     ]
-    lines += [f"| {n} | {w:.0f} | {s_:d} | {ms:.1f} | {r:.0f} |" for n, w, s_, ms, r in rows]
-    slowest = rows[0]
-    year = slowest[3] / 1000 * 300 * 800 / 3600
-    lines.append("")
-    lines.append(
-        f"slowest per sample: {slowest[0]} at {slowest[3]:.1f} ms; "
-        f"extrapolated to a 300-day site (~800 lit samples/day) that is {year:.1f} h"
-    )
-    record("S11", "Runtime", "PASS" if year < 4 else "WARN", "\n".join(lines))
+    lines += [f"| {n} | {w:.0f} | {ns:d} | {ms:.1f} | {rss:.0f} |" for n, _s, _m, w, ns, ms, rss in rows]
+
+    lines += [
+        "",
+        f"Extrapolated to one {CAMPAIGN_DAYS}-day site (~800 lit samples/day):",
+        "",
+        "| configuration | model | extrapolated |",
+        "|---|---|---|",
+    ]
+    worst = (0.0, "")
+    for name, site, method, wall, ns, ms, _rss in rows:
+        if method in OFFLINE_FIT and site in infer_rate:
+            rate = infer_rate[site]
+            fixed = max(wall - ns * rate, 0.0)  # everything that is not inference
+            hours = (fixed + CAMPAIGN_SAMPLES * rate) / 3600
+            model = f"fixed fit {fixed / 60:.0f} min + inference at {rate * 1000:.1f} ms/sample"
+        else:
+            hours = ms / 1000 * CAMPAIGN_SAMPLES / 3600
+            model = f"per-sample at {ms:.1f} ms"
+        lines.append(f"| {name} | {model} | {hours:.1f} h |")
+        if hours > worst[0]:
+            worst = (hours, name)
+
+    lines += ["", f"worst configuration: {worst[1]} at {worst[0]:.1f} h per site"]
+    record("S11", "Runtime", "PASS" if worst[0] < 4 else "WARN", "\n".join(lines))
 
 
 def main() -> None:

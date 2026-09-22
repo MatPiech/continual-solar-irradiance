@@ -28,7 +28,7 @@ decide whether the error trigger is doing any work.
    asked for, so write them in full.
 2. **Stop at every checkpoint.** At Checkpoints A, B, C and D, summarize and wait for approval.
 3. **Do not invent values.** If the code does not answer a question, mark it **OPEN**.
-4. **Protect existing results.** Work on branch `ch4-benchmarks`. Never overwrite or delete an
+4. **Protect existing results.** Work on branch `feature/adaptation`. Never overwrite or delete an
    existing folder under `results/`. New output goes to `results/ch4/`. Commit at the end of
    each phase with a message naming the phase.
 5. **Reuse Chapter 5's machinery.** The federated campaign already solved the population,
@@ -228,11 +228,40 @@ Stop. Launch no full campaign until the user approves the smoke report.
 Sites: Folsom 2016 (363 days), Karpicko (301), Poznań (215 or 204, per Q7). Expect 1 to 2
 GPU-hours per site-method run.
 
-### Tier 1 (must, 3 sites)
+### Tier 1 (must, 36 runs, about 33 GPU-hours)
 
-| Experiment | Configurations | Seeds | Runs |
-|---|---|---|---|
-| Main comparison | Static, Smart Persistence, MEMO, NOTE, RLS, sliding window, few-shot 1d, few-shot 7d, conditional | 3 for the stochastic methods, 1 for the deterministic ones | 45 |
+Campaign populations after the daylight filter: Folsom 362 days / 245,538 lit samples, Karpicko
+298 / 179,858, Poznań 213 / 123,523.
+
+| Method | Seeds | Why that many |
+|---|---|---|
+| Static, SM-RLS, sliding window, conditional | 1 | No stochastic operation anywhere in the path |
+| NOTE | 1 | Verified: seeds 0 and 7 give bit-identical daily metrics |
+| MEMO | 1 | Author decision, 2026-09-23. Three seeds would have added about 20 h for the method that tracks the frozen baseline most closely |
+| Few-shot 1d, few-shot 7d | 3 | The train/val split and the shuffle genuinely move results |
+
+That is 12 runs per site. **Seed count is not a proxy for repeatability here.** For the six
+single-seed methods a repeat is bit-identical, so between-run variance is zero by construction and
+a single run *is* the population value. What remains uncharacterised is sensitivity to the source
+checkpoint and to the data order, which is fixed by time — the chapter's "single-run results"
+limitation should be restated in those terms rather than as unmeasured noise.
+
+Estimates come from the per-method rates measured in the smoke (`docs/CH4_SMOKE_REPORT.md` §7)
+applied to the full campaign populations, plus 10 min per conditional run for the retention pass.
+
+| | GPU-hours |
+|---|---|
+| MEMO, three sites | 7.1 |
+| Few-shot, both variants, three seeds, three sites | 11.1 |
+| Conditional, three sites (including retention) | 3.6 |
+| Everything else | 10.9 |
+| **Total** | **32.7** |
+
+**Four-server split.** `scripts/bash_scripts/run_ch4_tier1.sh <1|2|3|4>` owns a disjoint slice,
+balanced longest-run-first: 8.4 h / 8.0 h / 8.4 h / 8.0 h, so the tier completes in **about 8.5
+hours wall clock**. Runs are independent and write to disjoint folders, so the servers share
+nothing but the repository and `data/`. Any run whose `summary.json` exists is skipped, so a slice
+can be restarted or moved to another machine without losing work.
 
 ### Checkpoint D
 
@@ -322,7 +351,7 @@ Checkpoint A, not at the end.
 
 - [ ] `docs/CH4_PLAN_VALIDATION.md` (Phase 0)
 - [ ] Chapter edits of §8 applied at Checkpoint A
-- [ ] F1 to F12 committed on `ch4-benchmarks`, with skipped items listed
+- [ ] F1 to F12 committed on `feature/adaptation`, with skipped items listed
 - [ ] `configs/ch4_smoke_window.yaml` and `docs/CH4_SMOKE_REPORT.md` (Phase 2)
 - [ ] Tier 1 and 2 results under `results/ch4/` with an empty `failures.log`
 - [ ] Tables, figures and `docs/CH4_ANALYSIS_REPORT.md` (Phase 4)

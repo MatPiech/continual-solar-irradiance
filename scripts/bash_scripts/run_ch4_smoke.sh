@@ -10,7 +10,11 @@ cd "$(dirname "$0")/../.."
 PY=${PY:-$HOME/.conda/envs/irr/bin/python}
 START=0615
 DAYS=3
-SITES=(folsom karpicko poznan)
+# Poznan carries a single verification run rather than the full set (author
+# decision 2026-09-22): the smoke proves the site loads and scores, while the
+# method comparison is exercised at Folsom and Karpicko.
+SITES=(folsom karpicko)
+VERIFY_SITE=poznan
 OUT=results/ch4/smoke
 LOG=logs/ch4/smoke
 mkdir -p "$LOG"
@@ -63,6 +67,13 @@ for site in "${SITES[@]}"; do
         --out-dir "$OUT/$site/conditional/seed0"
   fi
 done
+
+# Poznan: one configuration, the section's own policy, which exercises the two
+# update actions, the events schema, the clamp sentinel and the retention pass.
+run "${VERIFY_SITE}_cond" "$VERIFY_SITE/conditional/seed0" $PY $COND \
+    --dataset-path "data/${VERIFY_SITE}_prepared" --start-day $START --num-days $DAYS --seed 0 \
+    --retention-source data/folsom_prepared --retention-early-days 2 --retention-source-days 2 \
+    --out-dir "$OUT/$VERIFY_SITE/conditional/seed0"
 
 # S3 determinism: repeat seed 0 and run seed 1, one site is enough
 run "karpicko_cond_seed0_repeat" "karpicko/conditional/seed0_repeat" $PY $COND \

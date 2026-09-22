@@ -39,6 +39,7 @@ import time
 from typing import Any
 
 import click
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -193,6 +194,51 @@ def _fewshot_compute_loss(model: Forecaster, pred_mean: torch.Tensor, target: to
     return F.mse_loss(pred_mean, target)
 
 
+class _PairDataset(torch.utils.data.Dataset):
+    """Indexes a list of ``(dataset, index)`` pairs as one dataset.
+
+    The few-shot fit pools the deployment site with a Folsom replay buffer, so its
+    samples come from two datasets.  Wrapping the pairs lets a DataLoader decode
+    and transform them in worker processes; before this the fit indexed the
+    datasets inline and spent about 1.5 s per batch of 64 with the GPU idle.
+    """
+
+    def __init__(self, pairs: list[tuple[Any, int]]):
+        self._pairs = pairs
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ds, idx = self._pairs[i]
+        image, history, _ghi_clear, target, _name = ds[idx]
+        return image, history, target
+
+
+def _worker_init(_worker_id: int) -> None:
+    # Each worker decodes with OpenCV; leaving its thread pool enabled makes the
+    # workers fight each other for the same cores.
+    cv2.setNumThreads(0)
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def _fewshot_loader(pairs: list[tuple[Any, int]], batch_size: int, workers: int, shuffle: bool, seed: int):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.DataLoader(
+        _PairDataset(pairs),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=workers > 0,
+        persistent_workers=workers > 0,
+        worker_init_fn=_worker_init if workers > 0 else None,
+        generator=generator,
+    )
+
+
 @torch.enable_grad()
 def _fewshot_fit(
     model: Forecaster,
@@ -208,6 +254,7 @@ def _fewshot_fit(
     val_ratio: float,
     seed: int,
     device: str,
+    workers: int = 0,
 ) -> dict[str, float]:
     """Fit model once on adaptation data with early stopping."""
     pooled_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in adaptation_indices] + replay_samples
@@ -235,6 +282,11 @@ def _fewshot_fit(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # Built once: persistent workers survive the epoch loop, and the seeded
+    # generator keeps the shuffle reproducible, which S3 asserts.
+    train_loader = _fewshot_loader(train_samples, batch_size, workers, shuffle=True, seed=seed)
+    val_loader = _fewshot_loader(val_samples, batch_size, workers, shuffle=False, seed=seed) if val_samples else None
+
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     best_monitor = float("inf")
     best_epoch = 0
@@ -250,22 +302,19 @@ def _fewshot_fit(
 
     for epoch_idx in range(epochs):
         model.train()
-        rng.shuffle(train_samples)
         train_losses: list[float] = []
 
-        train_starts = list(range(0, len(train_samples), batch_size))
         with tqdm(
-            train_starts,
+            train_loader,
             desc=f"Few-shot epoch {epoch_idx + 1}/{epochs}",
             unit="batch",
             leave=False,
             file=sys.stderr,
         ) as batch_bar:
-            for start in batch_bar:
-                batch = train_samples[start : start + batch_size]
-                images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
-                histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
+            for images, histories, targets in batch_bar:
+                images = images.to(device, non_blocking=True)
+                histories = histories.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
 
                 optimizer.zero_grad()
                 pred_mean = _predict_single(model, images, histories)
@@ -279,14 +328,13 @@ def _fewshot_fit(
                 batch_bar.set_postfix(train=f"{running_train:.4f}")
 
         model.eval()
-        if val_samples:
+        if val_loader is not None:
             with torch.no_grad():
                 val_losses: list[float] = []
-                for start in range(0, len(val_samples), batch_size):
-                    batch = val_samples[start : start + batch_size]
-                    images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
-                    histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                    targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
+                for images, histories, targets in val_loader:
+                    images = images.to(device, non_blocking=True)
+                    histories = histories.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
                     pred_mean = _predict_single(model, images, histories)
                     val_loss = _fewshot_compute_loss(model, pred_mean, targets)
                     val_losses.append(float(val_loss.item()))
@@ -294,7 +342,7 @@ def _fewshot_fit(
         else:
             monitor = float(np.mean(train_losses)) if train_losses else float("inf")
         train_mean = float(np.mean(train_losses)) if train_losses else float("nan")
-        val_mean = monitor if val_samples else float("nan")
+        val_mean = monitor if val_loader is not None else float("nan")
 
         epochs_trained += 1
         if monitor + min_delta < best_monitor:
@@ -307,7 +355,7 @@ def _fewshot_fit(
             stale_epochs += 1
             improved = "no"
 
-        monitor_name = "val" if val_samples else "train"
+        monitor_name = "val" if val_loader is not None else "train"
         print(
             f"Few-shot epoch {epoch_idx + 1:>3}/{epochs}: "
             f"train_loss={train_mean:.6f} "
@@ -352,6 +400,7 @@ def evaluate_fewshot(
     fewshot_min_delta: float,
     fewshot_val_ratio: float,
     fewshot_seed: int,
+    fewshot_workers: int,
     fewshot_replay_ratio: float,
     fewshot_replay_buffer_size: int,
     folsom_path: Path,
@@ -415,6 +464,7 @@ def evaluate_fewshot(
         min_delta=fewshot_min_delta,
         val_ratio=fewshot_val_ratio,
         seed=fewshot_seed,
+        workers=fewshot_workers,
         device=device,
     )
 
@@ -484,6 +534,14 @@ def evaluate_fewshot(
     help="Daylight filter (kW/m^2), shared with the federated benchmark. 0 disables it.",
 )
 @click.option("--seed", type=int, default=0, show_default=True)
+@click.option(
+    "--fewshot-workers",
+    type=click.IntRange(min=0),
+    default=8,
+    show_default=True,
+    help="DataLoader workers for the few-shot fit. The fit decodes and transforms every image, "
+    "so at 0 it is data-loading bound with the GPU idle.",
+)
 @click.option(
     "--dataset-path",
     type=click.Path(exists=True, path_type=Path),
@@ -677,6 +735,7 @@ def main(
     fewshot_min_delta: float,
     fewshot_val_ratio: float,
     fewshot_seed: int,
+    fewshot_workers: int,
     fewshot_replay_ratio: float,
     num_days: int,
     start_day: str,
@@ -800,6 +859,7 @@ def main(
             fewshot_min_delta=fewshot_min_delta,
             fewshot_val_ratio=fewshot_val_ratio,
             fewshot_seed=fewshot_seed,
+            fewshot_workers=fewshot_workers,
             fewshot_replay_ratio=fewshot_replay_ratio,
             fewshot_replay_buffer_size=computed_replay_buffer_size,
             folsom_path=folsom_path,
@@ -844,6 +904,7 @@ def main(
             fewshot_patience=fewshot_patience,
             fewshot_val_ratio=fewshot_val_ratio,
             fewshot_seed=fewshot_seed,
+            fewshot_workers=fewshot_workers,
             fewshot_replay_ratio=fewshot_replay_ratio,
         )
         if adaptation_stats is not None:

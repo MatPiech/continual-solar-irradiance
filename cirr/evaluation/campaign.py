@@ -156,12 +156,20 @@ def score_without_adaptation(
     return result.overall_metrics
 
 
+# Periods carry irradiance in W/m^2 while the clear-sky lookup is kW/m^2, so the
+# baseline must be told to convert.  Without it the clear-sky index is off by
+# 1000, the ratio saturates at its clamp, and the resulting "RMSE" is a mixture
+# of the two units.  Chapter 5's scripts/compute_sp_metrics.py passes the same
+# scale for the same reason.
+PERIOD_SCALE = 1 / 1000.0
+
+
 def smart_persistence_daily(data: CampaignData, horizon_minutes: int = 15) -> dict[str, float]:
-    """Per-day Smart Persistence RMSE on exactly the scored population."""
+    """Per-day Smart Persistence RMSE, in kW/m^2, on exactly the scored population."""
     out: dict[str, float] = {}
     for day in data.days:
         periods = [data.dataset.periods[j] for j in data.day_map[day]]
-        preds, tgts, _naive = predict_periods(periods, data.lookup, horizon_minutes)
+        preds, tgts, _naive = predict_periods(periods, data.lookup, horizon_minutes, period_scale=PERIOD_SCALE)
         out[day] = float(np.sqrt(np.mean((preds - tgts) ** 2)))
     return out
 
