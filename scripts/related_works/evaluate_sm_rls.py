@@ -29,16 +29,24 @@ Reference:
 """
 
 from pathlib import Path
-from typing import Any, Literal
+import time
+from typing import Literal
 
 import click
 import numpy as np
 
-from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, run_delayed_online_eval
+from cirr.evaluation.campaign import SOURCE_CHECKPOINT, CampaignData, load_campaign_days, write_campaign
+from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, OnlineEvalResult, run_delayed_online_eval
 from cirr.evaluation.printing import print_overall_metrics
-from cirr.evaluation.runner import load_eval_days, load_eval_model, print_eval_plan, resolve_device, save_online_eval_results
+from cirr.evaluation.runner import load_eval_model, resolve_device
 from cirr.models.forecaster import Forecaster
+from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.sm_rls import ShermanMorrisonHeadUpdater
+from cirr.utils.provenance import set_determinism
+
+# SM-RLS updates the head by a recursive least-squares step rather than a gradient
+# step, but it is still a head-scope action, so it reports as one.
+SM_ACTION = "head"
 
 
 def evaluate(
@@ -46,18 +54,10 @@ def evaluate(
     updater: ShermanMorrisonHeadUpdater,
     update_scope: Literal["last_layer", "full_head"],
     reset_covariance_per_day: bool,
-    dataset: Any,
-    day_index_map: dict[str, list[int]],
-    days_to_eval: list[str],
+    data: CampaignData,
     device: str,
     horizon_steps: int,
-) -> tuple[
-    dict[str, float],
-    dict[str, dict[str, float]],
-    list[dict[str, Any]],
-    dict[str, dict[str, int]],
-    dict[str, int],
-]:
+) -> OnlineEvalResult:
     def on_day_start(_day: str, _ctx: OnlineEvalContext) -> None:
         if reset_covariance_per_day:
             updater.reset_covariance()
@@ -88,13 +88,13 @@ def evaluate(
         ctx.update_stats["updated"] += 1
         ctx.day_update_stats["updated"] += 1
         row["adapted"] = True
-        row["adaptation_scope"] = update_scope
+        row["adaptation_scope"] = SM_ACTION
 
     result = run_delayed_online_eval(
         model,
-        dataset,
-        day_index_map,
-        days_to_eval,
+        data.dataset,
+        data.day_map,
+        data.days,
         device,
         horizon_steps,
         on_revealed,
@@ -115,13 +115,7 @@ def evaluate(
         f"  scope={update_scope}",
         flush=True,
     )
-    return (
-        result.overall_metrics,
-        result.per_day_metrics,
-        result.predictions_data,
-        result.per_day_adaptation,
-        result.update_stats,
-    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -133,229 +127,129 @@ def evaluate(
 @click.option(
     "--checkpoint",
     type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to model checkpoint file.",
+    default=str(SOURCE_CHECKPOINT),
+    show_default=True,
+    help="Source model. The default is the checkpoint Chapter 5 uses.",
 )
 @click.option(
     "--dataset-path",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="Path to prepared dataset directory (e.g. data/poznan_prepared).",
+    help="Prepared dataset directory (e.g. data/poznan_prepared).",
 )
 @click.option(
-    "--horizon-steps",
-    type=click.IntRange(min=1),
-    default=15,
-    show_default=True,
-    help="Causal delay in samples between prediction and label availability.",
+    "--out-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Run folder. Defaults to results/ch4/<site>/sm_rls/seed<k>.",
 )
 @click.option(
-    "--update-scope",
-    type=click.Choice(["last_layer", "full_head"], case_sensitive=False),
-    default="last_layer",
-    show_default=True,
-    help="SM-RLS update scope applied to every delayed sample.",
-)
-@click.option(
-    "--lambda-init",
+    "--min-ghi-clear",
     type=float,
-    default=1.0,
+    default=DEFAULT_MIN_GHI_CLEAR,
     show_default=True,
-    help="Initialises P = (1/lambda_init)*I.  Larger ⟹ stronger regularisation.",
+    help="Daylight filter (kW/m^2), shared with the federated benchmark. 0 disables it.",
 )
-@click.option(
-    "--forgetting-factor",
-    type=click.FloatRange(min=1e-6, max=1.0),
-    default=1.0,
-    show_default=True,
-    help="Exponential forgetting factor λ ∈ (0, 1]. 1.0 = no forgetting (standard RLS).",
-)
-@click.option(
-    "--full-head-regularization-mult",
-    type=click.FloatRange(min=1.0),
-    default=100.0,
-    show_default=True,
-    help="Extra regularization factor for full-head hidden-layer RLS (larger = more conservative).",
-)
-@click.option(
-    "--error-clip",
-    type=click.FloatRange(min=1e-6),
-    default=0.2,
-    show_default=True,
-    help="Absolute clip applied to per-sample error before SM-RLS update.",
-)
-@click.option(
-    "--max-last-layer-update-norm",
-    type=click.FloatRange(min=1e-8),
-    default=0.01,
-    show_default=True,
-    help="L2 norm cap for one-step output-layer parameter update.",
-)
-@click.option(
-    "--max-first-layer-update-norm",
-    type=click.FloatRange(min=1e-8),
-    default=0.002,
-    show_default=True,
-    help="L2 norm cap for one-step hidden-layer parameter update.",
-)
-@click.option(
-    "--anchor-decay-last",
-    type=click.FloatRange(min=0.0, max=1.0),
-    default=1e-4,
-    show_default=True,
-    help="Per-step pullback strength of output layer toward checkpoint weights.",
-)
-@click.option(
-    "--anchor-decay-first",
-    type=click.FloatRange(min=0.0, max=1.0),
-    default=5e-4,
-    show_default=True,
-    help="Per-step pullback strength of hidden layer toward checkpoint weights.",
-)
-@click.option(
-    "--reset-covariance-per-day/--no-reset-covariance-per-day",
-    default=True,
-    show_default=True,
-    help="Reset RLS covariance matrices at day boundaries while keeping adapted weights.",
-)
-@click.option(
-    "--num-days",
-    type=int,
-    default=-1,
-    show_default=True,
-    help="Number of days to evaluate. -1 = all available days.",
-)
-@click.option(
-    "--start-day",
-    type=str,
-    default="0101",
-    show_default=True,
-    help="Starting day in MMDD format (e.g. 0101).",
-)
-@click.option(
-    "--device",
-    type=str,
-    default="cuda",
-    show_default=True,
-    help="Device to run on ('cuda' or 'cpu').",
-)
-@click.option(
-    "--save-results",
-    is_flag=True,
-    default=False,
-    help="Save per-day metrics report and predictions CSV to disk.",
-)
+@click.option("--horizon-steps", type=click.IntRange(min=1), default=15, show_default=True)
+@click.option("--update-scope", type=click.Choice(["last_layer", "full_head"]), default="last_layer", show_default=True)
+@click.option("--lambda-init", type=float, default=1.0, show_default=True)
+@click.option("--forgetting-factor", type=click.FloatRange(min=1e-6, max=1.0), default=1.0, show_default=True)
+@click.option("--error-clip", type=click.FloatRange(min=1e-6), default=0.2, show_default=True)
+@click.option("--max-last-layer-update-norm", type=click.FloatRange(min=1e-8), default=0.01, show_default=True)
+@click.option("--max-first-layer-update-norm", type=click.FloatRange(min=1e-8), default=0.002, show_default=True)
+@click.option("--anchor-decay-last", type=click.FloatRange(min=0.0, max=1.0), default=1e-4, show_default=True)
+@click.option("--anchor-decay-first", type=click.FloatRange(min=0.0, max=1.0), default=5e-4, show_default=True)
+@click.option("--full-head-regularization-mult", type=click.FloatRange(min=1.0), default=100.0, show_default=True)
+@click.option("--reset-covariance-per-day/--keep-covariance", default=False, show_default=True)
+@click.option("--num-days", type=int, default=-1, show_default=True, help="-1 means all available days.")
+@click.option("--start-day", type=str, default="0101", show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--device", type=str, default="cuda", show_default=True)
 def main(
     checkpoint: Path,
     dataset_path: Path,
+    out_dir: Path | None,
+    min_ghi_clear: float,
     horizon_steps: int,
     update_scope: str,
     lambda_init: float,
     forgetting_factor: float,
-    full_head_regularization_mult: float,
     error_clip: float,
     max_last_layer_update_norm: float,
     max_first_layer_update_norm: float,
     anchor_decay_last: float,
     anchor_decay_first: float,
+    full_head_regularization_mult: float,
     reset_covariance_per_day: bool,
     num_days: int,
     start_day: str,
+    seed: int,
     device: str,
-    save_results: bool,
 ) -> None:
-    """Evaluate forecasting with closed-form Sherman-Morrison RLS head adaptation."""
-
+    """Evaluate final-layer Sherman-Morrison recursive least-squares adaptation."""
+    set_determinism(seed)
     device = resolve_device(device)
-    dataset_name = dataset_path.name.split("_")[0]
-    method_tag = "zhang_sm_rls"
+    checkpoint = Path(checkpoint)
 
-    print(f"Loading model from {checkpoint}...")
+    data = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
+    print(
+        f"{data.site}: {len(data.days)} days, {data.n_samples} lit samples "
+        f"({data.dropped_total} dark samples dropped at min_ghi_clear={min_ghi_clear})"
+    )
+
     model = load_eval_model(checkpoint, device)
-
     updater = ShermanMorrisonHeadUpdater(
         model=model,
         lambda_init=lambda_init,
         forgetting_factor=forgetting_factor,
-        full_head_regularization_mult=full_head_regularization_mult,
         error_clip=error_clip,
         max_last_layer_update_norm=max_last_layer_update_norm,
         max_first_layer_update_norm=max_first_layer_update_norm,
         anchor_decay_last=anchor_decay_last,
         anchor_decay_first=anchor_decay_first,
+        full_head_regularization_mult=full_head_regularization_mult,
         device=device,
     )
+    print(f"SM-RLS:  scope={update_scope}  lambda={lambda_init}  ff={forgetting_factor}  seed={seed}\n")
 
-    print(
-        f"SM-RLS:  update_scope={update_scope}"
-        f"  lambda_init={lambda_init}  forgetting={forgetting_factor}"
-        f"  full_head_reg_mult={full_head_regularization_mult}"
-        f"  error_clip={error_clip}"
-        f"  max_last_delta={max_last_layer_update_norm}"
-        f"  max_first_delta={max_first_layer_update_norm}"
-        f"  anchor_last={anchor_decay_last}"
-        f"  anchor_first={anchor_decay_first}"
-        f"  reset_cov_per_day={reset_covariance_per_day}"
-        f"  horizon_steps={horizon_steps}"
-    )
-
-    # ------------------------------------------------------------------
-    # Load dataset and determine days to evaluate
-    # ------------------------------------------------------------------
-    test_dataset, day_index_map, days_to_eval, _ = load_eval_days(dataset_path, start_day, num_days)
-    print_eval_plan(dataset_path, test_dataset, day_index_map, days_to_eval, start_day)
-
-    # ------------------------------------------------------------------
-    # Run evaluation
-    # ------------------------------------------------------------------
-    print("Running SM-RLS evaluation...\n")
-    overall_metrics, per_day_metrics, predictions_data, per_day_adaptation, update_stats = evaluate(
+    started = time.perf_counter()
+    result = evaluate(
         model=model,
         updater=updater,
         update_scope=update_scope,  # type: ignore[arg-type]
         reset_covariance_per_day=reset_covariance_per_day,
-        dataset=test_dataset,
-        day_index_map=day_index_map,
-        days_to_eval=days_to_eval,
+        data=data,
         device=device,
         horizon_steps=horizon_steps,
     )
+    wall_time_s = time.perf_counter() - started
 
-    print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
+    print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [sm_rls]")
 
-    if save_results:
-        extra = [
-            "Method: Sherman-Morrison RLS",
-            f"horizon_steps={horizon_steps}",
-            f"update_scope={update_scope}",
-            f"lambda_init={lambda_init}",
-            f"forgetting_factor={forgetting_factor}",
-            f"full_head_regularization_mult={full_head_regularization_mult}",
-            f"error_clip={error_clip}",
-            f"max_last_layer_update_norm={max_last_layer_update_norm}",
-            f"max_first_layer_update_norm={max_first_layer_update_norm}",
-            f"anchor_decay_last={anchor_decay_last}",
-            f"anchor_decay_first={anchor_decay_first}",
-            f"reset_covariance_per_day={reset_covariance_per_day}",
-            "Adaptation summary:",
-            f"considered={update_stats['considered']}",
-            f"updated={update_stats['updated']}",
-            f"scope={update_scope}",
-            "Per-day adaptation:",
-        ]
-        for day_key in sorted(per_day_adaptation.keys()):
-            s = per_day_adaptation[day_key]
-            extra.append(f"{day_key}: considered={s['considered']} updated={s['updated']} scope={update_scope}")
-        save_online_eval_results(
-            method_tag=method_tag,
-            dataset_name=dataset_name,
-            checkpoint=checkpoint,
-            dataset_path=dataset_path,
-            overall_metrics=overall_metrics,
-            per_day_metrics=per_day_metrics,
-            predictions_data=predictions_data,
-            extra_lines=extra,
-        )
+    out_dir = Path(out_dir) if out_dir else Path("results/ch4") / data.site / "sm_rls" / f"seed{seed}"
+    write_campaign(
+        out_dir,
+        result=result,
+        data=data,
+        config={
+            "method": "sm_rls",
+            "update_scope": update_scope,
+            "lambda_init": lambda_init,
+            "forgetting_factor": forgetting_factor,
+            "error_clip": error_clip,
+            "reset_covariance_per_day": reset_covariance_per_day,
+            "seed": seed,
+            "start_day": start_day,
+            "num_days": num_days,
+            "dataset_path": str(dataset_path),
+        },
+        checkpoint=checkpoint,
+        horizon_steps=horizon_steps,
+        min_ghi_clear=min_ghi_clear,
+        wall_time_s=wall_time_s,
+        device=device,
+    )
+    print(f"\nRun written to {out_dir}")
 
 
 if __name__ == "__main__":

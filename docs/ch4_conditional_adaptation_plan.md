@@ -1,0 +1,311 @@
+# Chapter 4 §4.3 benchmark plan for Claude Code
+
+**Scope.** Section `sec:ch4-conditional-adaptation`, "Update justification under lagged
+supervision". The sibling sections (`sec:ch4-admissibility`, `sec:ch4-accelerator-execution`)
+are out of scope except where they share the evaluation population.
+
+**How to use.** Open Claude Code in VS Code at the repository root and send:
+
+```text
+Read docs/ch4_conditional_adaptation_plan.md and execute Phase 0. Stop at Checkpoint A.
+```
+
+---
+
+# Instructions for Claude Code
+
+## 1. Role and ground rules
+
+You are re-establishing the empirical basis of Chapter 4's conditional-adaptation section of
+a doctoral dissertation. The section currently reports numbers whose scoring population,
+source checkpoint and update accounting the chapter itself flags as unverified. Your job is
+to make each reported quantity reproducible from the repository, then run the controls that
+decide whether the error trigger is doing any work.
+
+1. **Use `/ponytail` for all code work.** Invoke `/ponytail full` before you write, modify or
+   refactor code in Phases 1 to 4, and again after any context compaction. Reading code and
+   running existing commands do not need it. The reports this plan requests are explicitly
+   asked for, so write them in full.
+2. **Stop at every checkpoint.** At Checkpoints A, B, C and D, summarize and wait for approval.
+3. **Do not invent values.** If the code does not answer a question, mark it **OPEN**.
+4. **Protect existing results.** Work on branch `ch4-benchmarks`. Never overwrite or delete an
+   existing folder under `results/`. New output goes to `results/ch4/`. Commit at the end of
+   each phase with a message naming the phase.
+5. **Reuse Chapter 5's machinery.** The federated campaign already solved the population,
+   pooling and statistics problems this section has. Import, do not reimplement:
+   `filter_lit_days` (`scripts/fl_benchmark.py:128`), `cirr/evaluation/smart_persistence.py`,
+   `cirr/physics/clear_sky.py`, and the estimator stack in `cirr/fl/analysis.py`.
+6. **No new dependencies without asking.**
+7. **Long runs write to a log file with `tee`**, one log per run, and are filtered afterwards.
+   Read `${PIPESTATUS[0]}` for the job's exit status.
+
+## 2. Scientific context
+
+### 2.1 What the section currently claims
+
+| ID | Claim in the chapter | Evidence status today |
+|---|---|---|
+| C4.1 | Conditional adaptation reduces error under deployment shift (`tab:ch4-solar-benchmark`) | Single run, unfiltered population, 8 of 27 table cells backed by an artifact in `results/` |
+| C4.2 | The policy trails sliding-window adaptation by ~1.4 % mean MAE | Same table, no interval, no common population |
+| C4.3 | The policy adapts 2.5× faster and sustains 1.8× throughput (`tab:ch4-solar-edge-benchmark`) | Separate 640-sample stream, action mix unreported |
+| C4.4 | Site-averaged MAE falls 29 / 50 / 61 % at H = 5 / 15 / 30 (`tab:ch4-solar-metrics`) | Week-scale streams not present in this repository |
+| C4.5 | Updates concentrate on high-error intervals | Asserted from `fig:ch4-irradiance-plots`, never counted |
+
+### 2.2 Hypotheses the re-run must test
+
+| ID | Hypothesis | Pre-registered success criterion |
+|---|---|---|
+| H4.1 | The conditional policy is not worse than the strongest published comparator on a common daylight-filtered population | The 90 % CI of the relative MAE difference to sliding-window adaptation lies inside ±5 % at every site |
+| H4.2 | The error trigger is active, not inert | The policy differs from a rate-matched random trigger with a Holm-adjusted *p* below 0.05 at at least one site, and differs from always-update |
+| H4.3 | The update-rate advantage is real once the action mix is counted | Measured per-site action proportions give a campaign update cost below that of every gradient comparator at equal or better MAE |
+| H4.4 | Local specialization does not erase source competence | After the campaign, MAE on the held-out Folsom source stream degrades by at most 10 % relative to the frozen model |
+
+## 3. Phase 0. Discovery and plan validation (read-only)
+
+Do not modify any file in this phase.
+
+### 3.1 Already resolved by the audit of 2026-09-22
+
+These are settled. Re-verify each one cheaply, record the evidence, and do **not** re-open them.
+
+| ID | Question the chapter marks unresolved | Answer | Evidence |
+|---|---|---|---|
+| R1 | Per-site proportions of no-update / head-update / full-update | Logged all along. Karpicko: considered 221 631, none 40.27 %, head 44.26 %, whole 15.47 % | `scripts/related_works/evaluate_lagged_ogd.py:55-90`; `results/karpicko/karpicko_paper_alg1_ogd_results.txt:13-17`; per-sample `adaptation_scope` column in the predictions CSV |
+| R2 | Whether the head update recomputes features or reuses a cached embedding | Recomputes. The causal queue retains the **image tensor**, and `ogd_step` runs the full forward pass from the image | `cirr/evaluation/online.py:145-154`, `cirr/training/ogd.py:95-112` |
+| R3 | Buffer memory | Deterministic: `horizon_steps` × (3 × 128 × 128 float32 image + 4-element history + scalars) ≈ 2.9 MB at H = 15. Compute and state it | `cirr/data/loading.py:8` (`DEFAULT_IMAGE_SIZE = [128, 128]`), `cirr/evaluation/online.py:36-41` |
+| R4 | Feasibility of the full-model action from retained state | Feasible, because the image is retained — but the implemented "full" action is **not** `S = R^P`. It unfreezes the head plus the **last two encoder children only** (`encoder_unfreeze="last_blocks"`) | `cirr/training/ogd.py:40-60,98` |
+| R5 | Why MAE and WAPE rankings conflict | Different denominators. MAE/RMSE use every scored sample; WAPE/SMAPE use only targets ≥ 5 W/m². At Karpicko that is 190 943 of 226 114 samples | `cirr/utils/metrics.py:77-101` |
+| R6 | Aggregation order behind the table | Pooled over all samples, not day-weighted. Karpicko conditional `Overall MAE 0.05481910` kW/m² reproduces the table's 54.819 exactly | `cirr/evaluation/online.py:176`; `results/karpicko/karpicko_paper_alg1_ogd_results.txt:322-327` |
+| R7 | Whether night samples are scored | Yes, and the share differs sharply by site: Folsom 0 %, Karpicko 20.5 % (46 256 / 226 114), Poznań 32.5 % (59 521 / 183 044). No daylight filter exists anywhere in the Chapter 4 evaluation path | `cirr/evaluation/runner.py:34-49`; confirmed independently by the `filter_lit_days` docstring, `scripts/fl_benchmark.py:134-148` |
+| R8 | Size of the night effect on the headline numbers | Restricting the existing Karpicko conditional run to lit samples moves MAE from **54.819 to 65.997 W/m²** (+20.4 %) and RMSE from 113.632 to 127.158. The near-parity with Smart Persistence (54.875) in `tab:ch4-solar-benchmark` is an artifact of the unfiltered population | Recomputed from `results/karpicko/karpicko_paper_alg1_ogd_predictions.csv` joined to the clear-sky lookup |
+| R9 | Whether the policy spends updates on night frames | Yes. 26.19 % of dark frames trigger a head update and 8.38 % of all updates fire on dark frames. The trigger compares a ~13 W/m² night prediction against a ~0 W/m² target and exceeds T1 = 10 W/m² | Same recomputation; see the first rows of the Karpicko predictions CSV |
+| R10 | The Chapter 4 / Chapter 5 Folsom Static discrepancy | Different source checkpoints. Every Chapter 4 result uses `checkpoints/epoch_010.ckpt` (md5 `991e1451…`); Chapter 5 uses `checkpoints/resnet50_epoch_015.ckpt` (md5 `21d5b347…`). Different files, not a rename | `grep '^Checkpoint:' results/*/*_results.txt`; `md5sum` of both |
+| R11 | The MEMO scalar objective | Documented: prediction-variance minimisation across augmented views, not entropy. The chapter's description is wrong, not missing | `cirr/tta/memo_reg.py:1-31` |
+| R12 | The NOTE memory adaptation | Documented: the class-balanced reservoir is replaced by a plain FIFO deque, with the same prediction-variance objective and two BN modes. Note that this objective has a constant-output minimiser, which is a testable explanation for the observed divergence | `cirr/tta/note_reg.py:1-42` |
+
+### 3.2 Questions that remain OPEN
+
+| ID | Question |
+|---|---|
+| Q1 | The trigger uses the **unclamped** prediction (`raw_pred`) while the reported metric uses the clamped one (`cirr/evaluation/online.py:133,152`, `evaluate_lagged_ogd.py:58`). How many actions change if the trigger uses the clamped prediction? |
+| Q2 | The causal queue is cleared at every day boundary (`cirr/evaluation/online.py:174`), so the last `horizon_steps` samples of each day never produce an update. What fraction of the stream is that, and is this the intended semantics? |
+| Q3 | `ogd_step` calls `model.eval()` before the backward pass (`cirr/training/ogd.py:101`), so BatchNorm uses running statistics and does not update them during adaptation. Is that deliberate? It determines whether the "full" action can shift the encoder's normalization at all. |
+| Q4 | Which checkpoint should the chapter deploy? `scripts/compare_checkpoints.py` exists precisely to answer this and has apparently never been run for the record. |
+| Q5 | Are the 19 missing cells of `tab:ch4-solar-benchmark` recoverable from a machine that still holds them, or must they be re-run? |
+| Q6 | Where are the Modena and week-scale streams behind `tab:ch4-solar-metrics`? No dataset in `data/` matches them: the prepared sites run 512-851 samples/day, the table implies 1400-1600. |
+| Q7 | Poznań `periods.pickle` holds 215 days, the chapter states 204. Which is the scored set? |
+| Q8 | Do the sliding-window and RLS comparators share the trainable scope of the conditional policy's head action, or is the comparison confounded by scope? |
+| Q9 | Is a Raspberry Pi 5 available for this phase, and is the inline energy meter of `sec:ch4-heterogeneous-evaluation` still instrumented? |
+| Q10 | What is the wall-clock cost of one full-year single-site adaptation run on the RTX 4090? Estimate from existing logs. |
+
+### 3.3 Gap table format
+
+One row per planned item.
+
+| Plan item | Status | Evidence (file:line) | Proposed change | Effort (S under 2 h, M under 1 day, L more) | Risk or dependency |
+|---|---|---|---|---|---|
+
+Status values: **exists**, **modify**, **new**, **blocked** (needs a user decision), **out of scope**.
+
+### 3.4 Phase 0 output
+
+Write `docs/CH4_PLAN_VALIDATION.md` with: the traced call chain for one conditional run,
+re-verification of R1 to R12, answers or OPEN marks for Q1 to Q10, the gap table, and the
+decisions the user must make.
+
+### Checkpoint A
+
+Stop. Present the open questions, the blocked items and your proposed adjustments. Wait for approval.
+
+## 4. Phase 1. Minimal fixes before any new run
+
+Invoke `/ponytail full` first. Add a switch only where a control, an ablation or a
+regression check needs one.
+
+| ID | Fix | Acceptance criterion |
+|---|---|---|
+| F1 | Apply `filter_lit_days` in the Chapter 4 evaluation path, once, where `load_eval_days` builds the day index map | No scored sample has clear-sky GHI below `--min-ghi-clear`; default 0.001 kW/m²; `0` reproduces the old population |
+| F2 | Load one source checkpoint shared with Chapter 5, decided by Q4; log its path and SHA-256 in every run | Every `config.yaml` under `results/ch4/` carries the same checkpoint hash as the Chapter 5 campaign, or the deviation is recorded with a reason |
+| F3 | Replace the free-text `*_results.txt` with the structured schema of §5.4 | Every file and column in §5.4 is written by every method |
+| F4 | State the pooling once. Report pooled metrics, and emit day-weighted alongside so the gap is visible | `summary.json` carries both, and their difference |
+| F5 | Make the trigger and the metric use the same prediction, per the Q1 decision | A test asserts the trigger input equals the scored prediction, or the divergence is documented in the schema |
+| F6 | Expose `--encoder-unfreeze last_blocks\|full` so the chapter's `S = R^P` claim is either measured or corrected | Trainable parameter count per action printed at run start for both settings |
+| F7 | Add trigger controls `--trigger conditional\|always\|never\|random` | `never` performs zero updates and reproduces the static model exactly; `random` fires at the rate measured for `conditional` on the same stream, drawn from a seeded generator |
+| F8 | Log the action mix per day and per sample in the new schema, split by lit and dark | `events.csv` reproduces the R1 and R9 numbers for the legacy population |
+| F9 | Add a retention pass: after the campaign, score the adapted model on the held-out Folsom source stream and on the first 30 days of the deployment stream | `retention.json` per run with frozen-model and adapted-model metrics on both |
+| F10 | Log retained buffer bytes and peak process memory in the campaign runs, not only in the edge benchmark | `summary.json` carries `buffer_bytes` and `peak_rss_mb` |
+| F11 | Make runs deterministic per seed, and seed MEMO, NOTE and few-shot explicitly | Same seed twice gives identical `metrics_daily.csv`; different seeds differ for the stochastic methods |
+| F12 | Single-source the comparators' trainable scope with the policy's head action, per Q8 | A test prints the trainable parameter count per method and the head-scope counts are equal |
+
+### Checkpoint B
+
+Stop. Show the diff summary per fix, the trainable parameter counts per method and per action,
+and any fix you skipped with the reason. Wait for approval.
+
+## 5. Phase 2. Smoke benchmark on a 7-day subset
+
+Purpose: prove every configuration runs, the logs are complete and the controls behave, before
+spending GPU-hours.
+
+### 5.1 Window selection
+
+Choose the first 7 consecutive days, preferring March to May, on which every site has at least
+80 % of its expected lit samples. Record the dates in `configs/ch4_smoke_window.yaml`. Keep the
+manifest; the device measurements replay the same window.
+
+### 5.2 Configurations to smoke-test
+
+| Group | Configurations |
+|---|---|
+| References | Static (frozen), Smart Persistence |
+| Comparators | MEMO, NOTE, RLS, sliding window, few-shot 1d, few-shot 7d |
+| Proposed | conditional at T1 = 10, T2 = 100 W/m² |
+| Controls | `--trigger` always, never, random |
+| Scope | conditional with `--encoder-unfreeze full` |
+| Regression | conditional with `--min-ghi-clear 0` and the legacy checkpoint |
+
+### 5.3 Logging schema
+
+```text
+results/ch4/<tier>/<site>/<method>/seed<k>/
+  config.yaml        resolved config, git commit, checkpoint path and SHA-256
+  metrics_daily.csv  date, n_samples, n_dropped_dark, mae, rmse, wape, smape, sp_rmse
+  events.csv         date, considered, none, head, whole, lit_none, lit_head, lit_whole,
+                     dark_none, dark_head, dark_whole, queue_flushed
+  predictions.csv    timestamp, prediction, target, absolute_error, delayed_abs_error,
+                     adaptation_scope, ghi_clear
+  retention.json     source-stream and early-segment metrics, frozen vs adapted
+  summary.json       pooled and day-weighted MAE/RMSE/WAPE/SMAPE/FS, action totals,
+                     buffer_bytes, peak_rss_mb, wall_time_s, gpu_name
+```
+
+### 5.4 Smoke acceptance checks
+
+| ID | Check | Pass rule |
+|---|---|---|
+| S1 | Completion | Every configuration in §5.2 finishes without error |
+| S2 | Sanity | No NaN or infinite values; daily MAE below 300 W/m² |
+| S3 | Determinism | Seed 0 twice gives identical `metrics_daily.csv`; seed 1 differs for MEMO, NOTE and few-shot |
+| S4 | Daylight filter | Zero scored samples with clear-sky GHI below the threshold; `n_dropped_dark` matches R7 shares on the full stream |
+| S5 | Controls | `never` reproduces Static to 1e-9; `always` shows `none = 0`; `random` matches the conditional update rate within 1 % |
+| S6 | Action accounting | `events.csv` totals equal the per-sample `adaptation_scope` counts in `predictions.csv` |
+| S7 | Scope | `--encoder-unfreeze full` changes the trainable parameter count and the resulting metrics |
+| S8 | Smart Persistence | Scored on exactly the model population, cross-checked against `compute_sp_metrics.py` conventions |
+| S9 | Regression | `--min-ghi-clear 0` with the legacy checkpoint reproduces `results/karpicko/karpicko_paper_alg1_ogd_results.txt` to 1e-4 W/m², or the difference is explained |
+| S10 | Logs | Every file and column of §5.3 exists for every configuration |
+| S11 | Runtime | Wall time recorded and extrapolated to a full campaign; warn above 2 h per run |
+
+### 5.5 Phase 2 output
+
+`docs/CH4_SMOKE_REPORT.md` with the window, a pass/fail table for S1 to S11, extrapolated
+GPU-hours per tier, and any configuration needing attention.
+
+### Checkpoint C
+
+Stop. Launch no full campaign until the user approves the smoke report.
+
+## 6. Phase 3. Full campaigns
+
+Sites: Folsom 2016 (363 days), Karpicko (301), Poznań (215 or 204, per Q7). Expect 1 to 2
+GPU-hours per site-method run.
+
+### Tier 1 (must, 3 sites)
+
+| Experiment | Configurations | Seeds | Runs |
+|---|---|---|---|
+| Main comparison | Static, Smart Persistence, MEMO, NOTE, RLS, sliding window, few-shot 1d, few-shot 7d, conditional | 3 for the stochastic methods, 1 for the deterministic ones | 45 |
+| Trigger controls | conditional with `--trigger` always, never, random | 3 | 27 |
+
+### Checkpoint D
+
+Stop after Tier 1. Run the Phase 4 analysis on Tier 1 only, report the H4.1 and H4.2 verdicts,
+and wait for approval before Tier 2.
+
+### Tier 2 (sensitivity)
+
+| Experiment | Configurations | Seeds | Runs |
+|---|---|---|---|
+| Threshold sensitivity | T1 ∈ {0, 5, 10, 20, 40}, T2 ∈ {50, 100, 200} W/m² | 1 | 45 |
+| Update scope | `--encoder-unfreeze full` against `last_blocks` | 3 | 18 |
+| Horizon | H ∈ {5, 15, 30} for conditional and Static, on the campaign streams rather than the missing week-scale ones | 1 | 18 |
+| Retention | frozen and adapted models scored on the Folsom source stream after each campaign | — | folded into F9 |
+
+### Tier 3 (device, gated on Q9)
+
+Re-run `scripts/edge_adaptation_benchmark.py` on the Raspberry Pi 5 over the §5.1 window with
+the measured action mix, not an unspecified 640-sample slice, and record energy per day
+alongside latency. This is the only measurement that can settle C4.3.
+
+## 7. Phase 4. Analysis
+
+Invoke `/ponytail full`. Put all analysis in one module that reads only `results/ch4/`, and
+import the estimators from `cirr/fl/analysis.py` rather than restating them.
+
+### 7.1 Pre-registered settings (do not change without asking)
+
+| Setting | Value |
+|---|---|
+| Scored population | Clear-sky GHI ≥ 0.001 kW/m², applied once at the day index map |
+| Primary metric | MAE on the lit population |
+| Secondary | Forecast skill against Smart Persistence, RMSE, WAPE, SMAPE |
+| Pooling | Pooled over samples; day-weighted reported alongside with the gap |
+| Confidence intervals | Moving-block bootstrap over days, block length 7, 2 000 resamples, paired by date |
+| Seed handling | Average daily errors across seeds before bootstrapping; report seed standard deviation separately |
+| Equivalence (H4.1) | Two one-sided tests at α = 0.05 against sliding-window adaptation, margin ±5 % relative MAE, reported as a 90 % CI |
+| Pairwise comparisons | Diebold-Mariano on daily loss differentials, Newey-West variance at lag 6, Holm correction across sites and methods |
+| Update cost | Per-site action proportions × measured per-action latency and energy, reported per deployed day |
+| Retention (H4.4) | Adapted-model MAE on the source stream relative to the frozen model, per site |
+
+### 7.2 Outputs
+
+| Output | Content |
+|---|---|
+| `tables/ch4_main.csv` and `.tex` | Replacement for `tab:ch4-solar-benchmark` on the lit population, with CIs, Smart Persistence and Static rows |
+| `tables/ch4_equivalence.csv` | Relative MAE difference to sliding window with 90 % CI and TOST verdict per site |
+| `tables/ch4_dm.csv` | Diebold-Mariano statistics with Holm-adjusted p-values |
+| `tables/ch4_controls.csv` | Conditional against always / never / random triggers |
+| `tables/ch4_actions.csv` | Per-site action proportions, split lit and dark, with the implied campaign update cost |
+| `tables/ch4_thresholds.csv` | Tier 2 threshold sweep |
+| `tables/ch4_retention.csv` | Source-stream and early-segment retention per site |
+| `tables/ch4_population_delta.csv` | Every Tier 1 cell under the legacy and filtered populations, so the chapter can state what the filter changed |
+| `figures/` | Daily error relative to Static, monthly, NOTE in its own panel (closes REVISION NOTE TW-08); action-mix over the calendar; threshold dose-response |
+| `docs/CH4_ANALYSIS_REPORT.md` | Verdicts for H4.1 to H4.4 with the supporting numbers and every deviation from this plan |
+
+### 7.3 Verdict rules
+
+1. **H4.1 supported** if every site's 90 % CI lies inside ±5 %; **not supported** if any interval crosses the margin.
+2. **H4.2 supported** if the conditional policy differs from the rate-matched random trigger at Holm-adjusted *p* < 0.05 at at least one site. If it does not, the section's mechanism claim reduces to "updating at this rate helps", and the chapter must say so.
+3. **H4.3 supported** only if the measured action mix, not a 640-sample slice, gives the lower campaign cost at equal or better MAE.
+4. **H4.4 supported** if source-stream degradation is at most 10 % at every site; otherwise report the forgetting cost as a finding, not a limitation.
+
+## 8. Chapter edits this campaign licenses
+
+Independent of the runs, Phase 0 alone already licenses these corrections. Make them at
+Checkpoint A, not at the end.
+
+1. Delete the claim that action proportions are unavailable (`sec:ch4-adaptation-protocol`, `sec:ch4-system-factorization`, `sec:ch4-conditional-adaptation-evaluation`) and report R1.
+2. Correct the description of the full-model action: it unfreezes the head and the last two encoder blocks, not `S = R^P` (R4). `eq:ch4-update-trigger`, `eq:ch4-head-only-update` and `alg:ch4-conditional-adaptation` all need the change.
+3. Replace "the buffered tensors and timed update path remain unresolved" with R2 and R3: the image is retained, features are recomputed, and the buffer is ~2.9 MB.
+4. Replace the MEMO and NOTE "not documented" hedges with R11 and R12, and state the constant-output minimiser as the candidate explanation for NOTE's divergence.
+5. Replace the WAPE/MAE reconciliation note with R5 and R6, which are definitions rather than open questions.
+6. State the night-sample defect (R7 to R9) explicitly as the reason the tables are provisional, with the Karpicko +20.4 % figure as its measured size, rather than as a suspicion about sample counts.
+7. Record that Chapters 4 and 5 use different source checkpoints (R10).
+
+## 9. Blocked items
+
+| Item | Why blocked | Needed decision |
+|---|---|---|
+| `tab:ch4-solar-metrics` (Modena, week-scale, H ∈ {5,15,30}) | No matching dataset in `data/` (Q6) | Supply the streams, or re-scope the horizon study onto the campaign streams as in Tier 2 |
+| The Modena sample-count reconciliation | Same | Same |
+| Energy per deployed day (C4.3) | Needs the Pi 5 and the inline meter (Q9) | Confirm hardware availability |
+| 19 missing cells of `tab:ch4-solar-benchmark` | Artifacts not in the repository (Q5) | Recover them, or accept the Tier 1 re-run as the record |
+
+## 10. Final deliverables checklist
+
+- [ ] `docs/CH4_PLAN_VALIDATION.md` (Phase 0)
+- [ ] Chapter edits of §8 applied at Checkpoint A
+- [ ] F1 to F12 committed on `ch4-benchmarks`, with skipped items listed
+- [ ] `configs/ch4_smoke_window.yaml` and `docs/CH4_SMOKE_REPORT.md` (Phase 2)
+- [ ] Tier 1 and 2 results under `results/ch4/` with an empty `failures.log`
+- [ ] Tables, figures and `docs/CH4_ANALYSIS_REPORT.md` (Phase 4)
+- [ ] `docs/CH4_REPRODUCE.md` with the exact commands for the smoke test and each tier
