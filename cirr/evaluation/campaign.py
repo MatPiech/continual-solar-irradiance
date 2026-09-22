@@ -205,8 +205,11 @@ def _events_from_predictions(preds: pd.DataFrame, flushed: dict[str, int]) -> pd
             row[action] = int(sel.sum())
             row[f"lit_{action}"] = int((sel & c["lit"]).sum())
             row[f"dark_{action}"] = int((sel & ~c["lit"]).sum())
-        if "scope_if_clamped" in g.columns and has_scope:
-            row["scope_changed_if_clamped"] = int((c["scope_if_clamped"] != c["adaptation_scope"]).sum())
+        if "scope_if_raw" in g.columns and has_scope:
+            # Stays at zero while the non-negativity clamp never binds.  A nonzero
+            # count means the model predicted negative irradiance and the clamped
+            # trigger saw a smaller error than the model actually made.
+            row["scope_changed_if_raw"] = int((c["scope_if_raw"] != c["adaptation_scope"]).sum())
         rows.append(row)
     return pd.DataFrame(rows)
 

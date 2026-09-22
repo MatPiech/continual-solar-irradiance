@@ -108,7 +108,7 @@ def test_f3_run_folder_carries_every_file_and_column():
     assert daily["sp_rmse"].notna().all(), "Smart Persistence must be scored on the model population"
 
     events = pd.read_csv(run / "events.csv")
-    assert set(events.columns) >= {"date", "considered", "queue_flushed", *ACTIONS}
+    assert set(events.columns) >= {"date", "considered", "queue_flushed", "scope_changed_if_raw", *ACTIONS}
     assert set(events.columns) >= {f"{p}_{a}" for p in ("lit", "dark") for a in ACTIONS}
 
 
@@ -121,21 +121,40 @@ def test_f4_summary_reports_pooled_and_day_weighted():
     assert np.isclose(summary["pooling_delta"]["mae"], summary["pooled"]["mae"] - summary["day_weighted"]["mae"])
 
 
-# --- F5: the trigger sees a different prediction than the metric -----------------
+# --- F5: the trigger and the metric use the same prediction ----------------------
 
 
-def test_f5_clamped_scope_is_recorded_for_every_considered_sample():
-    preds = pd.read_csv(_run("cond_seed0") / "predictions.csv")
+def test_f5_trigger_uses_the_reported_forecast():
+    """L is the error of the clamped forecast, as eq:ch4-abs-error defines it."""
+    run = _run("cond_seed0")
+    preds = pd.read_csv(run / "predictions.csv")
     considered = preds[preds["update_considered"]]
     assert len(considered) > 0
-    assert (considered["scope_if_clamped"] != "not_available").all()
 
-    cfg = (_run("cond_seed0") / "config.yaml").read_text()
+    cfg = (run / "config.yaml").read_text()
     t1 = float(next(ln for ln in cfg.splitlines() if ln.startswith("t1:")).split(": ")[1])
     t2 = float(next(ln for ln in cfg.splitlines() if ln.startswith("t2:")).split(": ")[1])
     mapping = {"none": "none", "head_only": "head", "head_and_encoder": "whole"}
-    expected = [mapping[algorithm1_scope(e, t1, t2)] for e in considered["absolute_error"]]
-    assert list(considered["scope_if_clamped"]) == expected
+
+    # the trigger input is the same quantity the metric scores
+    assert np.allclose(considered["delayed_abs_error"], considered["absolute_error"], atol=1e-6)
+    expected = [mapping[algorithm1_scope(e, t1, t2)] for e in considered["delayed_abs_error"]]
+    assert list(considered["adaptation_scope"]) == expected
+
+
+def test_f5_raw_trigger_sentinel_is_recorded_and_quiet():
+    """Disagreement here means the model started predicting negative irradiance."""
+    run = _run("cond_seed0")
+    preds = pd.read_csv(run / "predictions.csv")
+    considered = preds[preds["update_considered"]]
+    assert (considered["scope_if_raw"] != "not_available").all()
+    assert (preds["prediction"] >= 0).all()
+
+    events = pd.read_csv(run / "events.csv")
+    assert "scope_changed_if_raw" in events.columns
+    assert events["scope_changed_if_raw"].sum() == 0, (
+        "the clamp bound on some sample: the trigger saw a smaller error than the model made"
+    )
 
 
 # --- F6 / F12: what each action and each method actually trains -------------------

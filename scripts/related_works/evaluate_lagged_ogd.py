@@ -8,6 +8,14 @@ between the two update actions of the section:
     T1 <= error < T2  -> head-only update,   S = {0}^|theta_b| x R^|theta_h|
     error >= T2       -> full-model update,  S = R^P
 
+The error is computed on the *reported* forecast, that is after the
+non-negativity clamp, matching ``eq:ch4-abs-error``: irradiance is non-negative
+everywhere in the data, so a negative model output is not a forecast the device
+would emit.  Each run also records the action a trigger on the raw output would
+have selected; as long as that count stays zero the two definitions agree, and a
+nonzero count means the model has started predicting negative irradiance and the
+clamp is hiding that error from the policy.
+
 The full-model action is the whole network, as the chapter describes it.  Results
 published before Phase 1 came from a code path that unfroze two parameter-free
 encoder children, so their high-error action trained only the head; see
@@ -62,17 +70,18 @@ def run_policy(
         ctx.update_stats["considered"] += 1
         ctx.day_update_stats["considered"] += 1
         delayed_gt = float(oldest.gt.view(-1)[0].item())
-        delayed_abs_error = abs(oldest.raw_pred - delayed_gt)
+        # L is the error of the forecast the device reported, so the clamp applies
+        # here too; ``raw_pred`` is kept for the divergence monitor below.
+        delayed_abs_error = abs(max(oldest.raw_pred, 0.0) - delayed_gt)
         scope = algorithm1_scope(delayed_abs_error, t1, t2)
 
         row = ctx.predictions_data[oldest.pred_row_idx]
         row["update_considered"] = True
         row["delayed_abs_error"] = delayed_abs_error
-        # The trigger sees the *raw* prediction; the scored metric uses the clamped
-        # one (cirr/evaluation/online.py).  row["absolute_error"] is the clamped
-        # error, so recording the scope it would have selected answers "how many
-        # actions change if the trigger is clamped too?" without a second run.
-        row["scope_if_clamped"] = SCOPE_TO_ACTION[algorithm1_scope(row["absolute_error"], t1, t2)]
+        row["delayed_abs_error_raw"] = abs(oldest.raw_pred - delayed_gt)
+        # Sentinel: the action an unclamped trigger would have taken.  Any
+        # disagreement means the model emitted a negative prediction.
+        row["scope_if_raw"] = SCOPE_TO_ACTION[algorithm1_scope(row["delayed_abs_error_raw"], t1, t2)]
         row["adaptation_scope"] = SCOPE_TO_ACTION[scope]
 
         if scope == "none":
@@ -108,8 +117,9 @@ def run_policy(
             "update_considered": False,
             "adapted": False,
             "adaptation_scope": "not_available",
-            "scope_if_clamped": "not_available",
+            "scope_if_raw": "not_available",
             "delayed_abs_error": np.nan,
+            "delayed_abs_error_raw": np.nan,
         },
     )
 

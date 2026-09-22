@@ -81,6 +81,7 @@ These are settled. Re-verify each one cheaply, record the evidence, and do **not
 | R9 | Whether the policy spends updates on night frames | Yes. 26.19 % of dark frames trigger a head update and 8.38 % of all updates fire on dark frames. The trigger compares a ~13 W/m² night prediction against a ~0 W/m² target and exceeds T1 = 10 W/m² | Same recomputation; see the first rows of the Karpicko predictions CSV |
 | R10 | The Chapter 4 / Chapter 5 Folsom Static discrepancy | Different source checkpoints. Every Chapter 4 result uses `checkpoints/epoch_010.ckpt` (md5 `991e1451…`); Chapter 5 uses `checkpoints/resnet50_epoch_015.ckpt` (md5 `21d5b347…`). Different files, not a rename | `grep '^Checkpoint:' results/*/*_results.txt`; `md5sum` of both |
 | R11 | The MEMO scalar objective | Documented: prediction-variance minimisation across augmented views, not entropy. The chapter's description is wrong, not missing | `cirr/tta/memo_reg.py:1-31` |
+| R14 | Whether the raw/clamped trigger divergence mattered | **No, and it is now closed.** Over the full published Karpicko year (221,631 considered samples) not one action differed: the minimum prediction is 0.41 W/m^2, the clamp never bound, and the raw/clamped gap is float32 rounding at most 4.5e-8 kW/m^2. Author decision 2026-09-22: trigger on the clamped forecast, because irradiance is non-negative throughout the data, so a negative output is not a forecast the device would emit. A per-run sentinel records what an unclamped trigger would have chosen | `scripts/related_works/evaluate_lagged_ogd.py` `run_policy`; `events.csv` column `scope_changed_if_raw` |
 | R13 | Whether the full-model action was ever exercised | **No.** `set_trainable` unfroze `encoder_children[-2:]`, which on a timm backbone built with `num_classes=0` are `SelectAdaptivePool2d` and `Identity` — zero parameters. The high-error action trained the head and nothing else, so the published campaign ran a two-action policy (no-update, head-update) while the chapter describes three. Fixed in Phase 1; pre-Phase-1 results are not reproducible from the current code | `cirr/training/ogd.py` `set_trainable`; `tests/test_ch4_phase1.py::test_f6_the_published_high_error_action_trained_only_the_head` |
 | R12 | The NOTE memory adaptation | Documented: the class-balanced reservoir is replaced by a plain FIFO deque, with the same prediction-variance objective and two BN modes. Note that this objective has a constant-output minimiser, which is a testable explanation for the observed divergence | `cirr/tta/note_reg.py:1-42` |
 
@@ -88,7 +89,6 @@ These are settled. Re-verify each one cheaply, record the evidence, and do **not
 
 | ID | Question |
 |---|---|
-| Q1 | The trigger uses the **unclamped** prediction (`raw_pred`) while the reported metric uses the clamped one (`cirr/evaluation/online.py:133,152`, `evaluate_lagged_ogd.py:58`). How many actions change if the trigger uses the clamped prediction? |
 | Q2 | The causal queue is cleared at every day boundary (`cirr/evaluation/online.py:174`), so the last `horizon_steps` samples of each day never produce an update. What fraction of the stream is that, and is this the intended semantics? |
 | Q3 | `ogd_step` calls `model.eval()` before the backward pass (`cirr/training/ogd.py:101`), so BatchNorm uses running statistics and does not update them during adaptation. Is that deliberate? It determines whether the "full" action can shift the encoder's normalization at all. |
 | Q4 | Which checkpoint should the chapter deploy? `scripts/compare_checkpoints.py` exists precisely to answer this and has apparently never been run for the record. |
@@ -129,7 +129,7 @@ regression check needs one.
 | F2 | Load one source checkpoint shared with Chapter 5, decided by Q4; log its path and SHA-256 in every run | Every `config.yaml` under `results/ch4/` carries the same checkpoint hash as the Chapter 5 campaign, or the deviation is recorded with a reason |
 | F3 | Replace the free-text `*_results.txt` with the structured schema of §5.4 | Every file and column in §5.4 is written by every method |
 | F4 | State the pooling once. Report pooled metrics, and emit day-weighted alongside so the gap is visible | `summary.json` carries both, and their difference |
-| F5 | Make the trigger and the metric use the same prediction, per the Q1 decision | A test asserts the trigger input equals the scored prediction, or the divergence is documented in the schema |
+| F5 | Trigger on the clamped forecast, matching `eq:ch4-abs-error`, and keep a sentinel for the unclamped alternative | A test asserts `delayed_abs_error` equals `absolute_error`, and `scope_changed_if_raw` totals zero |
 | F6 | Make the two actions of Section 4.3 real: `head_only` is the head, `head_and_encoder` is the whole network | A test asserts `head_and_encoder` trains every parameter and `head_only` trains only the head |
 | F7 | *Deferred by author decision (2026-09-22).* Trigger controls are not implemented. The frozen reference comes from `scripts/evaluate.py --method none`, which runs through the same campaign contract | — |
 | F8 | Log the action mix per day and per sample in the new schema, split by lit and dark | `events.csv` reproduces the R1 and R9 numbers for the legacy population |
@@ -150,9 +150,23 @@ spending GPU-hours.
 
 ### 5.1 Window selection
 
-Choose the first 7 consecutive days, preferring March to May, on which every site has at least
-80 % of its expected lit samples. Record the dates in `configs/ch4_smoke_window.yaml`. Keep the
-manifest; the device measurements replay the same window.
+**15 to 21 June**, recorded in `configs/ch4_smoke_window.yaml`. Keep the manifest; the device
+measurements replay the same window.
+
+Selected by measurement rather than by the Chapter 5 rule, which has no solution here. Coverage
+is lit samples present over lit minutes available in the clear-sky table. No 7-day window in
+March to May clears 80 % at all three sites — the best, 9 to 15 May, reaches 61 % because of
+Karpicko, which additionally has no data at all for 1 to 20 April. Fourteen strictly consecutive
+windows clear 80 %; 15 to 21 June is the one that does so with the largest population (0.829
+worst single day, at Karpicko; 18,399 samples across the three sites), giving every site its
+longest days and enough
+mixed-regime error to exercise the full-model action. The March-to-May preference was inherited
+from the federated plan and does not survive contact with these sites. Folsom caps near 0.98
+because its camera records 06-20 h rather than full daylight, so 1.0 is unreachable anywhere.
+
+Cheaper alternative if runtime matters more than regime variety: 21 to 27 January, 0.918 worst
+day but 10,593 samples. Measured throughput is 13.5 ms/sample frozen, 16.1 NOTE, 23.6 for the
+conditional policy, putting the June smoke near 1.5 h and the January one near 45 min.
 
 ### 5.2 Configurations to smoke-test
 
@@ -171,9 +185,9 @@ results/ch4/<tier>/<site>/<method>/seed<k>/
   config.yaml        resolved config, git commit, checkpoint path and SHA-256
   metrics_daily.csv  date, n_samples, n_dropped_dark, mae, rmse, wape, smape, sp_rmse
   events.csv         date, considered, none, head, whole, lit_none, lit_head, lit_whole,
-                     dark_none, dark_head, dark_whole, queue_flushed
+                     dark_none, dark_head, dark_whole, queue_flushed, scope_changed_if_raw
   predictions.csv    timestamp, prediction, target, absolute_error, delayed_abs_error,
-                     adaptation_scope, ghi_clear
+                     delayed_abs_error_raw, adaptation_scope, scope_if_raw, ghi_clear
   retention.json     source-stream and early-segment metrics, frozen vs adapted
   summary.json       pooled and day-weighted MAE/RMSE/WAPE/SMAPE/FS, action totals,
                      buffer_bytes, peak_rss_mb, wall_time_s, gpu_name
@@ -188,7 +202,7 @@ results/ch4/<tier>/<site>/<method>/seed<k>/
 | S3 | Determinism | Seed 0 twice gives identical `metrics_daily.csv`; seed 1 differs for MEMO, NOTE and few-shot |
 | S4 | Daylight filter | Zero scored samples with clear-sky GHI below the threshold; `n_dropped_dark` matches R7 shares on the full stream |
 | S5 | Action accounting across methods | The conditional policy's `whole` count equals its full-model updates; MEMO and NOTE report one `whole` event per adaptation, matching `adapt_events` in `config.yaml` |
-| S6 | Action accounting | `events.csv` totals equal the per-sample `adaptation_scope` counts in `predictions.csv` |
+| S6 | Action accounting | `events.csv` totals equal the per-sample `adaptation_scope` counts in `predictions.csv`, and `scope_changed_if_raw` is zero at every site (a nonzero value means the model predicted negative irradiance) |
 | S7 | Static agreement | `scripts/evaluate.py --method none` and any zero-update path agree to 1e-8 on the same window |
 | S8 | Smart Persistence | Scored on exactly the model population, cross-checked against `compute_sp_metrics.py` conventions |
 | S9 | Regression | `--min-ghi-clear 0` with the legacy checkpoint reproduces the published population size (226,114 at Karpicko). Metrics will **not** match, because the published high-error action was a head update (R13); record the gap rather than chasing it |

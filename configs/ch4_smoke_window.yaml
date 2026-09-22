@@ -1,0 +1,28 @@
+# Chapter 4 smoke window (docs/ch4_conditional_adaptation_plan.md, Phase 2).
+#
+# Selected by measurement: coverage is lit samples present over lit minutes
+# available in the clear-sky table, at min_ghi_clear = 0.001 kW/m^2.  This is
+# the 7 consecutive days with the largest population among those clearing 80 %
+# coverage at all three sites.  The plan's original March-to-May preference has
+# no solution here; see the plan's Section 5.1.
+#
+# The device measurements replay this same window, so it is a manifest, not a
+# default: change it only with a recorded reason.
+window:
+  start_day: "0615"
+  end_day: "0621"
+  num_days: 7
+min_ghi_clear: 0.001
+samples_total: 18399
+coverage:            # min_coverage is the worst single day in the window
+  folsom: {samples: 5756, min_coverage: 0.835, mean_coverage: 0.947}
+  karpicko: {samples: 5939, min_coverage: 0.829, mean_coverage: 0.875}
+  poznan: {samples: 6704, min_coverage: 0.965, mean_coverage: 0.985}
+rejected:
+  - window: "0509-0515"
+    reason: "best window in March-May, but Karpicko coverage falls to 0.61"
+  - window: "0121-0127"
+    reason: >-
+      0.918 worst-site coverage but only 10593 samples (folsom 3885,
+      karpicko 3359, poznan 3349); kept as the fast alternative if smoke
+      runtime matters more than regime variety
