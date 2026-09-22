@@ -12,7 +12,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import click
 import numpy as np
 import pandas as pd
 import pytest
@@ -142,36 +141,35 @@ def test_f5_clamped_scope_is_recorded_for_every_considered_sample():
 # --- F6 / F12: what each action and each method actually trains -------------------
 
 
-def _trainable(model: Forecaster, scope: str, encoder_unfreeze: str = "none") -> int:
-    set_trainable(model, scope, encoder_unfreeze=encoder_unfreeze)  # type: ignore[arg-type]
+def _trainable(model: Forecaster, scope: str) -> int:
+    set_trainable(model, scope)  # type: ignore[arg-type]
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def test_f6_the_three_encoder_scopes_are_actually_distinct():
-    """Each setting must reach further into the encoder than the last."""
+def test_f6_the_policy_has_exactly_two_update_subspaces():
+    """Section 4.3 defines head-only and full-model; the code must offer those."""
     model = _model()
     total = sum(p.numel() for p in model.parameters())
     head = _trainable(model, "head_only")
-    none = _trainable(model, "head_and_encoder", "none")
-    last_blocks = _trainable(model, "head_and_encoder", "last_blocks")
-    full = _trainable(model, "head_and_encoder", "full")
+    full = _trainable(model, "head_and_encoder")
 
-    print(f"  head_only={head:,}  none={none:,}  last_blocks={last_blocks:,}  full={full:,}  total={total:,}")
-    assert head == none, "encoder_unfreeze='none' must train exactly the head"
-    assert none < last_blocks < full == total, (none, last_blocks, full, total)
+    print(f"  head_only={head:,}  head_and_encoder={full:,}  total={total:,}")
+    assert head < full, (head, full)
+    assert full == total, "the high-error action must be S = R^P"
+    assert head == sum(p.numel() for p in model.network_head.parameters())
 
 
 def test_f6_the_published_high_error_action_trained_only_the_head():
-    """The defect F6 corrects: the 'full-model' action never touched the encoder.
+    """The defect F6 corrects, guarded so it cannot quietly come back.
 
-    ``encoder_children[-2:]`` on a timm backbone built with ``num_classes=0`` is
-    ``[SelectAdaptivePool2d, Identity]``, which hold no parameters.  Guarding it
-    here so the finding cannot quietly regress once the chapter is rewritten.
+    The old code unfroze ``encoder_children[-2:]``.  On a timm backbone built
+    with ``num_classes=0`` those are ``SelectAdaptivePool2d`` and ``Identity``,
+    which hold no parameters, so the full-model action trained only the head.
     """
     model = _model()
     children = list(model.image_encoder.children())
     assert sum(p.numel() for c in children[-2:] for p in c.parameters()) == 0
-    assert _trainable(model, "head_and_encoder", "none") == _trainable(model, "head_only")
+    assert _trainable(model, "head_and_encoder") > _trainable(model, "head_only")
 
 
 def test_f12_head_scope_is_the_same_parameter_set_for_every_gradient_method():
@@ -181,49 +179,6 @@ def test_f12_head_scope_is_the_same_parameter_set_for_every_gradient_method():
     policy_head = {n for n, p in model.named_parameters() if p.requires_grad}
     assert policy_head == {n for n, _ in model.network_head.named_parameters(prefix="network_head")}
     print(f"  head-scope parameters: {len(policy_head)} tensors")
-
-
-# --- F7: the trigger controls --------------------------------------------------
-
-
-def test_f7_controls_select_the_intended_actions():
-    mod = _load_script("scripts/related_works/evaluate_lagged_ogd.py")
-    errs = [0.0, 0.005, 0.05, 0.5]
-
-    assert [mod.make_scope_fn("never", 0.01, 0.1, 0, None, None)(e) for e in errs] == ["none"] * 4
-    assert "none" not in [mod.make_scope_fn("always", 0.01, 0.1, 0, None, None)(e) for e in errs]
-    assert [mod.make_scope_fn("conditional", 0.01, 0.1, 0, None, None)(e) for e in errs] == [
-        "none",
-        "none",
-        "head_only",
-        "head_and_encoder",
-    ]
-    with pytest.raises(click.UsageError):
-        mod.make_scope_fn("random", 0.01, 0.1, 0, None, None)
-
-
-def test_f7_random_trigger_matches_its_target_rate_and_is_seeded():
-    mod = _load_script("scripts/related_works/evaluate_lagged_ogd.py")
-    # one closure, many calls: the generator is per-run, not per-sample
-    choose = mod.make_scope_fn("random", 0.01, 0.1, 7, 0.4, 0.25)
-    draws = [choose(0.02) for _ in range(20000)]
-    fired = [d for d in draws if d != "none"]
-    assert abs(len(fired) / len(draws) - 0.4) < 0.02
-    assert abs(sum(d == "head_and_encoder" for d in fired) / len(fired) - 0.25) < 0.02
-
-    repeat = mod.make_scope_fn("random", 0.01, 0.1, 7, 0.4, 0.25)
-    assert [repeat(0.02) for _ in range(1000)] == draws[:1000], "the random trigger is not seed-reproducible"
-    other = mod.make_scope_fn("random", 0.01, 0.1, 8, 0.4, 0.25)
-    assert [other(0.02) for _ in range(1000)] != draws[:1000], "a different seed gave the same stream"
-
-
-def test_f7_never_performs_no_update():
-    run = VERIFY / "never_resnet50_epoch_015"
-    if not (run / "summary.json").exists():
-        pytest.skip("no frozen control run")
-    summary = json.loads((run / "summary.json").read_text())
-    assert summary["actions"]["head"] == summary["actions"]["whole"] == 0
-    assert summary["update_stats"]["head"] == summary["update_stats"]["whole"] == 0
 
 
 # --- F8: the action mix, split by daylight --------------------------------------

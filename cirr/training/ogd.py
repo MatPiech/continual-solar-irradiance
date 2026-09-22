@@ -12,10 +12,6 @@ from cirr.models.forecaster import Forecaster
 
 TrainScope = Literal["head_only", "head_and_encoder"]
 Algorithm1Scope = Literal["none", "head_only", "head_and_encoder"]
-# "none" keeps the encoder frozen, so head_and_encoder trains exactly the head.
-# It is the default because it is what the published Chapter 4 campaign actually
-# did — see the note on set_trainable.
-EncoderUnfreeze = Literal["none", "last_blocks", "full"]
 
 
 def pred_mean(output: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -40,46 +36,32 @@ def algorithm1_scope(delayed_abs_error: float, t1: float, t2: float) -> Algorith
     return "head_and_encoder"
 
 
-def set_trainable(
-    model: Forecaster,
-    scope: TrainScope,
-    *,
-    encoder_unfreeze: EncoderUnfreeze = "none",
-) -> None:
+def set_trainable(model: Forecaster, scope: TrainScope) -> None:
     """Select the trainable parameter subspace.
 
-    On the encoder branch, ``encoder_unfreeze`` decides how much of the backbone
-    the high-error action reaches:
+    The policy of thesis Section 4.3 has exactly two update actions, so there are
+    exactly two subspaces:
 
-    ``none``
-        Encoder stays frozen, so ``head_and_encoder`` trains exactly the head.
-    ``last_blocks``
-        The last two *parameterised* children of the encoder — for ResNet50, the
-        layer3 and layer4 stages.
-    ``full``
-        The whole encoder, the S = R^P action the thesis text describes.
+    ``head_only``
+        S = {0}^|theta_b| x R^|theta_h|, the frozen-encoder action.
+    ``head_and_encoder``
+        S = R^P, the full-model action.
 
-    Note on the default.  Until this fix, ``last_blocks`` took the last two
-    children of the encoder unconditionally.  For a timm backbone built with
-    ``num_classes=0`` those are ``SelectAdaptivePool2d`` and ``Identity``, which
-    hold no parameters, so the high-error action trained the head and nothing
-    else — identical to the low-error action.  Every published Chapter 4 number
-    was produced under that behaviour, which is why ``none`` is the default:
-    it names what those runs did instead of silently changing the method.
+    Historical note.  Until this fix the encoder branch unfroze
+    ``encoder_children[-2:]`` instead of the whole encoder.  For a timm backbone
+    built with ``num_classes=0`` those two children are ``SelectAdaptivePool2d``
+    and ``Identity``, which hold no parameters, so the high-error action trained
+    the head and nothing else — it was indistinguishable from the low-error
+    action.  Every Chapter 4 result published before this commit was produced
+    that way, and none of them exercised a full-model update.
     """
     for param in model.parameters():
         param.requires_grad_(False)
     for param in model.network_head.parameters():
         param.requires_grad_(True)
     if scope == "head_and_encoder":
-        if encoder_unfreeze == "full":
-            for param in model.image_encoder.parameters():
-                param.requires_grad_(True)
-        elif encoder_unfreeze == "last_blocks":
-            parameterised = [c for c in model.image_encoder.children() if any(p.numel() for p in c.parameters())]
-            for child in parameterised[-2:]:
-                for param in child.parameters():
-                    param.requires_grad_(True)
+        for param in model.image_encoder.parameters():
+            param.requires_grad_(True)
 
 
 def freeze_all(model: Forecaster) -> None:
@@ -118,9 +100,8 @@ def ogd_step(
     slope_penalty: bool = False,
     volatility_multiplier: float = 0.01,
     max_grad_norm: float = 1.0,
-    encoder_unfreeze: EncoderUnfreeze = "none",
 ) -> None:
-    set_trainable(model, scope, encoder_unfreeze=encoder_unfreeze)
+    set_trainable(model, scope)
     model.eval()
     imgs = image.unsqueeze(0).to(device) if image.dim() == 3 else image.to(device)
     hist = history.unsqueeze(0).to(device) if history.dim() == 1 else history.to(device)

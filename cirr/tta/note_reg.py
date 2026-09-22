@@ -123,6 +123,8 @@ class NOTEReg(nn.Module):
         self._buffer_images: deque[torch.Tensor] = deque(maxlen=update_every_x)
         self._buffer_histories: deque[torch.Tensor] = deque(maxlen=update_every_x)
         self._sample_count: int = 0
+        # Update events, so a campaign run can report what adaptation cost.
+        self.adapt_events: int = 0
 
         # Validate and configure
         self.check_model()
@@ -176,6 +178,7 @@ class NOTEReg(nn.Module):
             # ---- 2. Adapt (triggered every update_every_x samples) ----
             if self._sample_count % self.update_every_x == 0:
                 self._adapt_from_buffer(device)
+                self.adapt_events += 1
 
             # ---- 3. Predict ----
             mean_i, var_i = self._predict_single(img_i, hist_i, device)
@@ -233,8 +236,7 @@ class NOTEReg(nn.Module):
             has_bn = any(isinstance(m, nn.BatchNorm2d | nn.BatchNorm1d) for m in self.model.modules())
             if not has_bn:
                 raise AssertionError(
-                    "NOTEReg with adapt_mode='bn_only' requires BatchNorm layers. "
-                    "Use adapt_mode='all' for models without BN."
+                    "NOTEReg with adapt_mode='bn_only' requires BatchNorm layers. Use adapt_mode='all' for models without BN."
                 )
 
     # ------------------------------------------------------------------

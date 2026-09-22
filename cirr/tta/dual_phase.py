@@ -143,7 +143,6 @@ class DualPhaseAdapter(nn.Module):
             device,
             slope_penalty=True,
             max_grad_norm=10.0,
-            encoder_unfreeze="full",
         )
 
     def predict(

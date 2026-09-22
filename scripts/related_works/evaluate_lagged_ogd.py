@@ -1,25 +1,18 @@
 """Conditional on-device adaptation under lagged supervision (thesis Section 4.3).
 
 Algorithm 1: predict at *t*, buffer, and when the label arrives ``horizon_steps``
-later compare the realized absolute error against two thresholds:
+later compare the realized absolute error against two thresholds, which select
+between the two update actions of the section:
 
     error < T1        -> no update
-    T1 <= error < T2  -> head-only update
-    error >= T2       -> "full" update
+    T1 <= error < T2  -> head-only update,   S = {0}^|theta_b| x R^|theta_h|
+    error >= T2       -> full-model update,  S = R^P
 
-``--trigger`` replaces that rule with a control, which is what decides whether the
-error threshold does any work at all (plan hypothesis H4.2):
-
-    conditional  the policy above
-    always       update every revealed sample (equivalent to T1 = 0)
-    never        update nothing; reproduces the frozen model exactly
-    random       fire at a rate matched to a measured conditional run, seeded
-
-Note on the "full" action: ``--encoder-unfreeze last_blocks`` (the default, and
-what the published results used) unfreezes the head plus the last two encoder
-children, not the whole network.  ``full`` gives the S = R^P action the thesis
-text describes.  The two are reported separately because they are not the same
-policy.
+The full-model action is the whole network, as the chapter describes it.  Results
+published before Phase 1 came from a code path that unfroze two parameter-free
+encoder children, so their high-error action trained only the head; see
+``cirr.training.ogd.set_trainable``.  Those runs are not reproducible from this
+script and should not be compared against its output.
 
 Reference:
     Piechocki, M., Kraft, M., Capotondi, A. On-device continual adaptation for
@@ -27,7 +20,6 @@ Reference:
     Vision Systems. 2026. doi: 10.1007/978-3-032-07343-3_28
 """
 
-from collections.abc import Callable
 from pathlib import Path
 import time
 from typing import Any
@@ -54,34 +46,6 @@ from cirr.training.ogd import algorithm1_scope, make_regression_loss, ogd_step
 from cirr.utils.provenance import set_determinism
 
 SCOPE_TO_ACTION = {"none": "none", "head_only": "head", "head_and_encoder": "whole"}
-TRIGGERS = ("conditional", "always", "never", "random")
-
-
-def make_scope_fn(
-    trigger: str,
-    t1: float,
-    t2: float,
-    seed: int,
-    random_rate: float | None,
-    random_whole_share: float | None,
-) -> Callable[[float], str]:
-    """Map a realized absolute error to an update scope under the chosen trigger."""
-    if trigger == "conditional":
-        return lambda err: algorithm1_scope(err, t1, t2)
-    if trigger == "always":
-        return lambda err: algorithm1_scope(err, 0.0, t2)
-    if trigger == "never":
-        return lambda _err: "none"
-    if random_rate is None or random_whole_share is None:
-        raise click.UsageError("--trigger random needs --random-rate and --random-whole-share, taken from a conditional run")
-    rng = np.random.default_rng(seed)
-
-    def choose(_err: float) -> str:
-        if rng.random() >= random_rate:
-            return "none"
-        return "head_and_encoder" if rng.random() < random_whole_share else "head_only"
-
-    return choose
 
 
 def run_policy(
@@ -91,17 +55,15 @@ def run_policy(
     data: CampaignData,
     device: str,
     horizon_steps: int,
-    scope_fn: Callable[[float], str],
     t1: float,
     t2: float,
-    encoder_unfreeze: str,
 ) -> Any:
     def on_revealed(oldest: DelayedQueueItem, ctx: OnlineEvalContext) -> None:
         ctx.update_stats["considered"] += 1
         ctx.day_update_stats["considered"] += 1
         delayed_gt = float(oldest.gt.view(-1)[0].item())
         delayed_abs_error = abs(oldest.raw_pred - delayed_gt)
-        scope = scope_fn(delayed_abs_error)
+        scope = algorithm1_scope(delayed_abs_error, t1, t2)
 
         row = ctx.predictions_data[oldest.pred_row_idx]
         row["update_considered"] = True
@@ -127,7 +89,6 @@ def run_policy(
             history=oldest.history,
             gt=oldest.gt,
             device=device,
-            encoder_unfreeze=encoder_unfreeze,
         )
         action = SCOPE_TO_ACTION[scope]
         ctx.update_stats[action] += 1
@@ -218,7 +179,7 @@ def retention_report(
     "--out-dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Run folder. Defaults to results/ch4/<site>/<trigger>/seed<k>.",
+    help="Run folder. Defaults to results/ch4/<site>/conditional/seed<k>.",
 )
 @click.option(
     "--min-ghi-clear",
@@ -228,29 +189,8 @@ def retention_report(
     help="Daylight filter (kW/m^2), shared with the federated benchmark. 0 disables it.",
 )
 @click.option("--horizon-steps", type=click.IntRange(min=1), default=15, show_default=True)
-@click.option("--trigger", type=click.Choice(TRIGGERS), default="conditional", show_default=True)
-@click.option(
-    "--random-rate",
-    type=click.FloatRange(0.0, 1.0),
-    default=None,
-    help="(--trigger random) Update rate to match, from a conditional run's events.csv.",
-)
-@click.option(
-    "--random-whole-share",
-    type=click.FloatRange(0.0, 1.0),
-    default=None,
-    help="(--trigger random) Share of updates that take the full action.",
-)
 @click.option("--t1", type=float, default=0.01, show_default=True, help="Lower threshold (kW/m^2).")
 @click.option("--t2", type=float, default=0.1, show_default=True, help="Upper threshold (kW/m^2).")
-@click.option(
-    "--encoder-unfreeze",
-    type=click.Choice(["none", "last_blocks", "full"]),
-    default="none",
-    show_default=True,
-    help="How far the high-error action reaches into the encoder. The default reproduces "
-    "the published campaign, in which it reached no further than the head.",
-)
 @click.option("--ogd-lr", type=float, default=1e-5, show_default=True)
 @click.option("--ogd-beta1", type=float, default=0.5, show_default=True)
 @click.option("--ogd-beta2", type=float, default=0.975, show_default=True)
@@ -281,12 +221,8 @@ def main(
     out_dir: Path | None,
     min_ghi_clear: float,
     horizon_steps: int,
-    trigger: str,
-    random_rate: float | None,
-    random_whole_share: float | None,
     t1: float,
     t2: float,
-    encoder_unfreeze: str,
     ogd_lr: float,
     ogd_beta1: float,
     ogd_beta2: float,
@@ -318,14 +254,13 @@ def main(
     model = load_eval_model(checkpoint, device)
     loss_fn = make_regression_loss(ogd_loss).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=ogd_lr, betas=(ogd_beta1, ogd_beta2), weight_decay=ogd_weight_decay)
-    scope_fn = make_scope_fn(trigger, t1, t2, seed, random_rate, random_whole_share)
-    print(f"trigger={trigger}  T1={t1}  T2={t2}  encoder_unfreeze={encoder_unfreeze}  seed={seed}\n")
+    print(f"T1={t1}  T2={t2}  seed={seed}\n")
 
     started = time.perf_counter()
-    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, scope_fn, t1, t2, encoder_unfreeze)
+    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2)
     wall_time_s = time.perf_counter() - started
 
-    print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [conditional/{trigger}]")
+    print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [conditional]")
     print(f"\nAction mix: {dict(result.update_stats)}")
 
     retention = None
@@ -342,23 +277,19 @@ def main(
             min_ghi_clear,
         )
 
-    out_dir = Path(out_dir) if out_dir else Path("results/ch4") / data.site / trigger / f"seed{seed}"
+    out_dir = Path(out_dir) if out_dir else Path("results/ch4") / data.site / "conditional" / f"seed{seed}"
     write_campaign(
         out_dir,
         result=result,
         data=data,
         config={
             "method": "conditional",
-            "trigger": trigger,
             "t1": t1,
             "t2": t2,
-            "encoder_unfreeze": encoder_unfreeze,
             "ogd_lr": ogd_lr,
             "ogd_betas": [ogd_beta1, ogd_beta2],
             "ogd_weight_decay": ogd_weight_decay,
             "ogd_loss": ogd_loss,
-            "random_rate": random_rate,
-            "random_whole_share": random_whole_share,
             "seed": seed,
             "start_day": start_day,
             "num_days": num_days,
