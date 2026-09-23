@@ -32,29 +32,12 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-import torch
-from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
 
 from cirr.data.loading import load_dataset
+from cirr.evaluation.admissibility import anomaly_score, embed, nominal_split, stamp
 from cirr.evaluation.campaign import SOURCE_CHECKPOINT, load_campaign_days
 from cirr.evaluation.runner import load_eval_model
 from cirr.utils.provenance import git_commit, set_determinism, sha256_file
-
-
-def stamp(period: dict) -> str:
-    return period["history"][-1]["image_name"][:15]
-
-
-@torch.no_grad()
-def embed(model, dataset, indices: list[int], device: str, workers: int, batch: int = 256) -> np.ndarray:
-    """Embeddings as the forecasting head sees them, for ``dataset[indices]``."""
-    loader = DataLoader(Subset(dataset, indices), batch_size=batch, num_workers=workers, pin_memory=True)
-    out = []
-    for image, history, *_ in tqdm(loader, desc="embed", unit="batch"):
-        feats = model.encode_fusion_features(image.to(device, non_blocking=True), history.to(device, non_blocking=True))
-        out.append(feats.float().cpu().numpy())
-    return np.concatenate(out)
 
 
 @click.command()
@@ -119,37 +102,28 @@ def main(
 
     # --- nominal frames: the fit years only, thinned, split by day ----------------
     train = load_dataset(source, split="training")
-    by_day: dict[str, list[int]] = {}
-    for i, p in enumerate(train.periods):
-        s = stamp(p)
-        if s[:4] in years:
-            by_day.setdefault(s[:8], []).append(i)
-    days = sorted(by_day)
-    rng = np.random.default_rng(seed)
-    calib_days = set(rng.choice(days, size=max(1, round(len(days) * calib_frac)), replace=False))
-    fit_idx = [i for d in days if d not in calib_days for i in by_day[d][::stride]]
-    cal_idx = [i for d in days if d in calib_days for i in by_day[d][::stride]]
+    fit_idx, cal_idx = nominal_split(train.periods, years, stride, calib_frac, seed)
+    n_days = len({stamp(train.periods[i])[:8] for i in fit_idx + cal_idx})
 
     stream_data = load_campaign_days(stream, min_ghi_clear=0.001)
     stream_years = {stamp(stream_data.dataset.periods[i])[:4] for d in stream_data.days for i in stream_data.day_map[d]}
     leak = years & stream_years if source.resolve() == stream.resolve() else set()
     assert not leak, f"fit years {sorted(leak)} overlap the evaluation stream; refusing to fit on test frames"
     print(
-        f"fit: {len(fit_idx)} frames from {len(days) - len(calib_days)} days | calibration: {len(cal_idx)} frames "
-        f"from {len(calib_days)} days | years {sorted(years)} | stride {stride}"
+        f"fit: {len(fit_idx)} frames | calibration: {len(cal_idx)} frames | {n_days} days | years {sorted(years)} | stride {stride}"
     )
 
     x_fit = embed(model, train, fit_idx, device, workers)
     x_cal = embed(model, train, cal_idx, device, workers)
 
     forest = IsolationForest(n_estimators=100, random_state=seed, n_jobs=-1).fit(x_fit)
-    cal_scores = -forest.score_samples(x_cal)
+    cal_scores = anomaly_score(forest, x_cal)
     threshold = float(np.percentile(cal_scores, percentile))
 
     # --- the evaluation stream -----------------------------------------------------
     s_idx = [i for d in stream_data.days for i in stream_data.day_map[d]]
     x_stream = embed(model, stream_data.dataset, s_idx, device, workers)
-    scores = -forest.score_samples(x_stream)
+    scores = anomaly_score(forest, x_stream)
     frame = pd.DataFrame(
         {
             "timestamp": [stamp(stream_data.dataset.periods[i]) for i in s_idx],

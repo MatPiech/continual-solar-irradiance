@@ -40,6 +40,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
+from cirr.evaluation.admissibility import CorruptedStream
 from cirr.evaluation.campaign import (
     SOURCE_CHECKPOINT,
     CampaignData,
@@ -278,6 +279,12 @@ def retention_report(
 @click.option("--t1", type=float, default=0.01, show_default=True, help="Lower threshold (kW/m^2).")
 @click.option("--t2", type=float, default=0.1, show_default=True, help="Upper threshold (kW/m^2).")
 @click.option(
+    "--corruption-schedule",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="CSV from scripts/admissibility_study.py schedule: frames listed there carry synthetic sensor faults.",
+)
+@click.option(
     "--anomaly-gate",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     default=None,
@@ -350,6 +357,7 @@ def main(
     encoder_blocks: int | None,
     encoder_lr: float | None,
     anomaly_gate: Path | None,
+    corruption_schedule: Path | None,
     anchor_pull: float,
     replay_size: int,
     replay_k: int,
@@ -376,6 +384,10 @@ def main(
     checkpoint = Path(checkpoint)
 
     data = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
+    if corruption_schedule is not None:
+        schedule = pd.read_csv(corruption_schedule, dtype={"timestamp": str})
+        data.dataset = CorruptedStream(data.dataset, schedule)
+        print(f"corrupted stream: {len(schedule)} frames carry synthetic faults ({corruption_schedule})")
     print(
         f"{data.site}: {len(data.days)} days, {data.n_samples} lit samples "
         f"({data.dropped_total} dark samples dropped at min_ghi_clear={min_ghi_clear})"
@@ -446,6 +458,7 @@ def main(
             "replay_size": replay_size,
             "replay_k": stab.replay_k,
             "anomaly_gate": str(anomaly_gate) if anomaly_gate else None,
+            "corruption_schedule": str(corruption_schedule) if corruption_schedule else None,
             "anomaly_threshold": gate_meta.get("threshold"),
             "anomaly_percentile": gate_meta.get("percentile"),
             "ogd_lr": ogd_lr,

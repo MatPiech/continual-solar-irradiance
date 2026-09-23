@@ -1,0 +1,19 @@
+site,signal,spearman
+folsom,anomaly score,0.5476340312764774
+folsom,irradiance-history std,0.42006410371975783
+folsom,|1 - clear-sky index|,0.3778401912832271
+folsom,score + history std,0.5539548625392746
+folsom,rank R^2: history + clear-sky index,0.2535636254448096
+folsom,rank R^2: + anomaly score,0.3473981140041339
+karpicko,anomaly score,0.4928272100062013
+karpicko,irradiance-history std,0.6712052717674856
+karpicko,|1 - clear-sky index|,-0.46380529507266843
+karpicko,score + history std,0.6597163343502652
+karpicko,rank R^2: history + clear-sky index,0.46518453990099085
+karpicko,rank R^2: + anomaly score,0.4816076689165938
+poznan,anomaly score,0.4377867597617819
+poznan,irradiance-history std,0.6907702178397033
+poznan,|1 - clear-sky index|,-0.4422486675438283
+poznan,score + history std,0.6360125375331002
+poznan,rank R^2: history + clear-sky index,0.47999669610017726
+poznan,rank R^2: + anomaly score,0.48513758703268395
