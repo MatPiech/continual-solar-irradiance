@@ -249,14 +249,14 @@ the gain up.
 - *Anchor* at the pre-registered strength protects Folsom but pulls too hard to adapt: at Karpicko
   it is the worst adaptive configuration (FS 8.24, below head-only).
 - *Low encoder LR* is the best compromise. Against head-only it is significantly better on squared
-  loss at all three sites (Holm-adjusted *p* = 0.0009, 0.0001, < 0.0001) and better on MAE at both
+  loss at all three sites (Holm-adjusted *p* = 0.001, 0.0002, < 0.0001) and better on MAE at both
   shifted sites, at a cost of 0.13 W/m² MAE at Folsom. Against Window it has lower MAE at every
   site (−1.1, −1.3, −0.6 %), ties on squared loss at Folsom and Karpicko (*p* = 1.0) and trails at
-  Poznań (*p* = 0.024). It passes H4.1 at all three sites.
+  Poznań (*p* = 0.030). It passes H4.1 at all three sites.
 
 **Best conditional policy on this evidence:** high-error action on head + layer3 + layer4 with an
-encoder learning rate of 1e-6. It has the lowest MAE of any method at every site and is safe on the
-source domain, but it ties rather than beats sliding-window adaptation on large errors.
+encoder learning rate of 1e-6. It has the lowest MAE of any method at Karpicko and Poznań, is within 0.13 W/m² of head-only at
+Folsom, and is safe on the source domain, but it ties rather than beats sliding-window adaptation on large errors.
 
 
 ## 8. What this does and does not establish
