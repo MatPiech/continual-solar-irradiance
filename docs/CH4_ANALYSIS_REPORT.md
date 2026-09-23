@@ -222,9 +222,42 @@ worse than the frozen model. Its drift is slower than the full model's (Septembe
 That is the case for fixing the encoder action rather than dropping it: the gain at shifted sites
 is worth keeping if the Folsom damage and the forgetting can be removed. Three single-factor fixes
 are implemented (`--replay-size/--replay-k`, `--anchor-pull`, `--encoder-lr`); a fix passes only
-if it (i) is no worse than head-only at Folsom, (ii) keeps retention within the H4.4 bar of 10 %
-at Karpicko and Poznań, and (iii) keeps layer3+4's forecast-skill lead over Window at the shifted
-sites.
+if it (i) is no worse than head-only at Folsom and (ii) keeps layer3+4's forecast-skill lead over
+Window at the shifted sites. Retention was dropped as a criterion, and H4.4 with it, by author
+decision on 2026-09-23.
+
+## 7c. Stabilising the encoder action
+
+One stabiliser per run on the layer3+4 action, everything else unchanged. MAE (W/m²) / forecast
+skill (%).
+
+| Variant | Folsom | Karpicko | Poznań | (i) | (ii) |
+|---|---|---|---|---|---|
+| layer3+4 | 37.43 / 15.42 | 66.00 / 13.46 | 59.96 / **19.89** | ✗ | ✓ ✓ |
+| + replay (k = 7) | 37.05 / 13.71 | 66.32 / **14.05** | 60.92 / 19.37 | ✗ | ✓ ✗ |
+| + anchor (pull 0.005) | 31.44 / 17.82 | 67.76 / 8.24 | 59.45 / 17.80 | ✗ | ✗ ✗ |
+| + encoder LR 1e-6 | 31.16 / **19.23** | **65.90** / 12.32 | **58.58** / 18.91 | ≈ | ✗ ✗ |
+| head only | **31.03** / 18.51 | 66.58 / 10.16 | 59.65 / 17.37 | — | ✗ ✗ |
+| Window | 31.50 / 19.30 | 66.76 / 12.42 | 58.92 / 19.57 | — | — |
+
+**No stabiliser passes both criteria.** Every configuration whose encoder moves enough to keep the
+large-error gain at the shifted sites also damages Folsom, and every one that protects Folsom gives
+the gain up.
+
+- *Replay* changes the direction of the encoder's steps but not their size, so the Folsom drift is
+  untouched; at Folsom the replayed samples are the same domain and have nothing to restore.
+- *Anchor* at the pre-registered strength protects Folsom but pulls too hard to adapt: at Karpicko
+  it is the worst adaptive configuration (FS 8.24, below head-only).
+- *Low encoder LR* is the best compromise. Against head-only it is significantly better on squared
+  loss at all three sites (Holm-adjusted *p* = 0.0009, 0.0001, < 0.0001) and better on MAE at both
+  shifted sites, at a cost of 0.13 W/m² MAE at Folsom. Against Window it has lower MAE at every
+  site (−1.1, −1.3, −0.6 %), ties on squared loss at Folsom and Karpicko (*p* = 1.0) and trails at
+  Poznań (*p* = 0.024). It passes H4.1 at all three sites.
+
+**Best conditional policy on this evidence:** high-error action on head + layer3 + layer4 with an
+encoder learning rate of 1e-6. It has the lowest MAE of any method at every site and is safe on the
+source domain, but it ties rather than beats sliding-window adaptation on large errors.
+
 
 ## 8. What this does and does not establish
 

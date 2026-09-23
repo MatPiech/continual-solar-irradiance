@@ -58,7 +58,7 @@ decide whether the error trigger is doing any work.
 | H4.1 | The conditional policy is not worse than the strongest published comparator on a common daylight-filtered population | The 90 % CI of the relative MAE difference to sliding-window adaptation lies inside ±5 % at every site |
 | H4.2 | *Deferred by author decision (2026-09-22).* The trigger controls are not implemented, so no evidence bears on whether the error threshold is active rather than inert. The chapter cannot claim the trigger does work until this is run |
 | H4.3 | The update-rate advantage is real once the action mix is counted | Measured per-site action proportions give a campaign update cost below that of every gradient comparator at equal or better MAE |
-| H4.4 | Local specialization does not erase source competence | After the campaign, MAE on the held-out Folsom source stream degrades by at most 10 % relative to the frozen model |
+| H4.4 | *Dropped by author decision (2026-09-23).* Retention is not needed for the chapter; runs use `--no-retention` |
 
 ## 3. Phase 0. Discovery and plan validation (read-only)
 
