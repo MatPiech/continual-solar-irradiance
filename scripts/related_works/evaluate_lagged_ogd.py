@@ -29,12 +29,14 @@ Reference:
 """
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import time
 from typing import Any
 
 import click
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
@@ -82,6 +84,10 @@ class Stabilisers:
 def load_source_replay(size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Folsom *training* samples (2014-2015), disjoint from every scored stream."""
     pairs, _stats = build_folsom_replay_buffer(Path("data/folsom_prepared"), size)
+    # The partition file also holds 2016, the Folsom evaluation year.  The buffer is
+    # all 2014 today only because of the file's ordering; make that a guarantee.
+    years = {ds.periods[i]["history"][-1]["image_name"][:4] for ds, i in pairs}
+    assert "2016" not in years, f"replay buffer contains evaluation-year frames: {sorted(years)}"
     items = [ds[i] for ds, i in pairs]
     return (
         torch.stack([x[0] for x in items]),
@@ -101,8 +107,16 @@ def run_policy(
     t2: float,
     encoder_blocks: int | None = None,
     stabilisers: Stabilisers | None = None,
+    gate: tuple[dict[str, float], float] | None = None,
 ) -> Any:
+    """Algorithm 1 of the chapter, with the optional input-admissibility gate of line 1.
+
+    ``gate`` is ``(scores, s_anom)`` from ``scripts/fit_anomaly_gate.py``: a sample
+    whose anomaly score exceeds ``s_anom`` is discarded before the error is looked
+    at, so it never updates the model.  It is still predicted and scored.
+    """
     stab = stabilisers or Stabilisers()
+    scores, s_anom = gate if gate is not None else ({}, float("inf"))
 
     def on_revealed(oldest: DelayedQueueItem, ctx: OnlineEvalContext) -> None:
         ctx.update_stats["considered"] += 1
@@ -121,6 +135,24 @@ def run_policy(
         # disagreement means the model emitted a negative prediction.
         row["scope_if_raw"] = SCOPE_TO_ACTION[algorithm1_scope(row["delayed_abs_error_raw"], t1, t2)]
         row["adaptation_scope"] = SCOPE_TO_ACTION[scope]
+
+        if gate is not None:
+            score = scores.get(str(row["timestamp"])[:15], float("nan"))
+            row["anomaly_score"] = score
+            row["scope_if_ungated"] = SCOPE_TO_ACTION[scope]
+            if score > s_anom:  # NaN (unscored frame) compares False: admitted, and counted below
+                row["gated"] = True
+                row["adaptation_scope"] = "none"
+                for key in ("none", "rejected"):
+                    ctx.update_stats[key] += 1
+                    ctx.day_update_stats[key] += 1
+                if scope != "none":
+                    ctx.update_stats["rejected_would_update"] += 1
+                    ctx.day_update_stats["rejected_would_update"] += 1
+                return
+            if score != score:
+                ctx.update_stats["unscored"] += 1
+                ctx.day_update_stats["unscored"] += 1
 
         if scope == "none":
             ctx.update_stats["none"] += 1
@@ -154,12 +186,14 @@ def run_policy(
         device,
         horizon_steps,
         on_revealed,
-        update_stats_init={"considered": 0, "none": 0, "head": 0, "whole": 0},
+        update_stats_init={"considered": 0, "none": 0, "head": 0, "whole": 0}
+        | ({"rejected": 0, "rejected_would_update": 0, "unscored": 0} if gate is not None else {}),
         extra_pred_fields={
             "update_considered": False,
             "adapted": False,
             "adaptation_scope": "not_available",
             "scope_if_raw": "not_available",
+            "gated": False,
             "delayed_abs_error": np.nan,
             "delayed_abs_error_raw": np.nan,
         },
@@ -244,6 +278,12 @@ def retention_report(
 @click.option("--t1", type=float, default=0.01, show_default=True, help="Lower threshold (kW/m^2).")
 @click.option("--t2", type=float, default=0.1, show_default=True, help="Upper threshold (kW/m^2).")
 @click.option(
+    "--anomaly-gate",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Directory written by scripts/fit_anomaly_gate.py; enables the admissibility gate.",
+)
+@click.option(
     "--encoder-lr", type=float, default=None, help="Learning rate for encoder parameters. Default: same as --ogd-lr."
 )
 @click.option(
@@ -309,6 +349,7 @@ def main(
     t2: float,
     encoder_blocks: int | None,
     encoder_lr: float | None,
+    anomaly_gate: Path | None,
     anchor_pull: float,
     replay_size: int,
     replay_k: int,
@@ -363,7 +404,14 @@ def main(
     print(f"encoder_lr={encoder_lr}  anchor_pull={anchor_pull}  replay={replay_size} samples, k={stab.replay_k}\n")
 
     started = time.perf_counter()
-    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2, encoder_blocks, stab)
+    gate, gate_meta = None, {}
+    if anomaly_gate is not None:
+        gate_meta = json.loads((anomaly_gate / "gate.json").read_text())
+        frame = pd.read_csv(anomaly_gate / "scores.csv", dtype={"timestamp": str})
+        gate = (dict(zip(frame.timestamp, frame.score, strict=True)), float(gate_meta["threshold"]))
+        print(f"admissibility gate: s_anom={gate[1]:.4f} (p{gate_meta['percentile']:g}), {len(frame)} scored frames\n")
+
+    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2, encoder_blocks, stab, gate)
     wall_time_s = time.perf_counter() - started
 
     print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [conditional]")
@@ -397,6 +445,9 @@ def main(
             "anchor_pull": anchor_pull,
             "replay_size": replay_size,
             "replay_k": stab.replay_k,
+            "anomaly_gate": str(anomaly_gate) if anomaly_gate else None,
+            "anomaly_threshold": gate_meta.get("threshold"),
+            "anomaly_percentile": gate_meta.get("percentile"),
             "ogd_lr": ogd_lr,
             "ogd_betas": [ogd_beta1, ogd_beta2],
             "ogd_weight_decay": ogd_weight_decay,
