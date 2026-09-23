@@ -192,3 +192,120 @@ def nominal_split(
     fit = [i for d in days if d not in calib for i in by_day[d][::stride]]
     cal = [i for d in days if d in calib for i in by_day[d][::stride]]
     return fit, cal
+
+
+# --------------------------------------------------------------------------- #
+# Local-feature maintenance alert (pre-registered in docs/CH4_ADMISSIBILITY.md §5)
+# --------------------------------------------------------------------------- #
+LOCAL_DIM = 128
+CELL = 8  # layer2 stride at 128 x 128 input: one cell per 8 x 8 pixel block
+
+
+def local_projection(channels: int = 512, dim: int = LOCAL_DIM, seed: int = 0) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(channels, dim, generator=g) / dim**0.5
+
+
+def valid_cells(image: torch.Tensor) -> torch.Tensor:
+    """Cells whose whole 8 x 8 pixel block lies inside the circular field of view."""
+    fov = (image.abs().sum(0) > 0).float()
+    return torch.nn.functional.avg_pool2d(fov[None, None], CELL)[0, 0] >= 1.0
+
+
+@torch.no_grad()
+def local_features(
+    model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
+) -> torch.Tensor:
+    """Per-cell features ``[N, cells, 128]`` from the forecaster's layer2, taken in the forecasting pass."""
+    grabbed: dict[str, torch.Tensor] = {}
+    hook = model.image_encoder.layer2.register_forward_hook(lambda _m, _i, o: grabbed.__setitem__("f", o))
+    proj = local_projection().to(device)
+    flat = cells.flatten().to(device)
+    loader = DataLoader(Subset(dataset, indices), batch_size=batch, num_workers=workers, pin_memory=True)
+    out = []
+    try:
+        for image, history, *_ in tqdm(loader, desc="local", unit="batch"):
+            model.encode_fusion_features(image.to(device, non_blocking=True), history.to(device, non_blocking=True))
+            f = torch.nn.functional.avg_pool2d(grabbed["f"].float(), 3, 1, 1)  # neighbourhood context
+            f = f.flatten(2).transpose(1, 2)[:, flat]  # [B, cells, 512]
+            out.append((f @ proj).half().cpu())
+    finally:
+        hook.remove()
+    return torch.cat(out) if out else torch.zeros(0, int(flat.sum()), LOCAL_DIM, dtype=torch.half)
+
+
+class LocalGate:
+    """Per-position nearest-neighbour novelty on local features: the maintenance detector.
+
+    The camera never moves, so each cell keeps its own bank of nominal features. A
+    cell's score is its nearest-neighbour distance normalised by that cell's own
+    nominal 95th percentile; a frame's score is its worst cell, so one soiled patch
+    is enough.
+    """
+
+    def __init__(
+        self,
+        bank: torch.Tensor,
+        cells: torch.Tensor,
+        scale: torch.Tensor | None = None,
+        threshold: float = float("inf"),
+        alert_threshold: float = float("inf"),
+    ):
+        self.bank = bank  # [cells, n_bank, 128]
+        self.cells = cells  # [16, 16] bool
+        self.scale = scale  # [cells] or None before calibration
+        self.threshold, self.alert_threshold = threshold, alert_threshold
+
+    @torch.no_grad()
+    def distances(self, feats: torch.Tensor, device: str, chunk: int = 256) -> torch.Tensor:
+        """Nearest-neighbour distance of every cell of every frame to that cell's bank: ``[N, cells]``."""
+        bank = self.bank.to(device).float()
+        out = []
+        for part in feats.split(chunk):
+            x = part.to(device).float().transpose(0, 1)  # [cells, n, 128]
+            out.append(torch.cdist(x, bank).amin(-1).transpose(0, 1).cpu())  # [n, cells]
+        return torch.cat(out) if out else torch.zeros(0, bank.shape[0])
+
+    def score(self, feats: torch.Tensor, device: str) -> tuple[np.ndarray, np.ndarray]:
+        """Frame score (worst normalised cell) and the index of that cell."""
+        z = self.distances(feats, device) / self.scale
+        worst, where = z.max(1)
+        return worst.numpy(), where.numpy()
+
+    def save(self, path: Path, **meta: Any) -> None:
+        np.savez_compressed(
+            path,
+            bank=self.bank.half().numpy(),
+            cells=self.cells.numpy(),
+            scale=self.scale.numpy(),
+            threshold=self.threshold,
+            alert_threshold=self.alert_threshold,
+            meta=json.dumps(meta),
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> LocalGate:
+        z = np.load(path)
+        return cls(
+            torch.from_numpy(z["bank"]),
+            torch.from_numpy(z["cells"]),
+            torch.from_numpy(z["scale"]),
+            float(z["threshold"]),
+            float(z["alert_threshold"]),
+        )
+
+
+def alert_statistic(timestamps: pd.Series, scores: np.ndarray, minutes: int = 30) -> np.ndarray:
+    """Causal rolling median of the frame score over the preceding ``minutes`` of the same day.
+
+    Returned in the input order.  The window is ``(t - minutes, t]``, so a frame's
+    statistic uses only that frame and the ones strictly within the preceding window.
+    """
+    t = pd.to_datetime(pd.Series(timestamps).reset_index(drop=True), format="%Y%m%d_%H%M%S")
+    s = pd.Series(np.asarray(scores, float))
+    out = np.empty(len(s))
+    for _, pos in t.groupby(t.dt.date).groups.items():
+        pos = np.asarray(sorted(pos, key=lambda k: (t[k], k)))
+        rolled = pd.Series(s[pos].to_numpy(), index=t[pos].to_numpy()).rolling(f"{minutes}min").median()
+        out[pos] = rolled.to_numpy()
+    return out

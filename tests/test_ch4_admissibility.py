@@ -84,3 +84,34 @@ def test_nominal_split_keeps_to_the_fit_years_and_splits_whole_days():
     day = lambda i: periods[i]["history"][0]["image_name"][:8]  # noqa: E731
     assert not {day(i) for i in fit} & {day(i) for i in cal}, "a day appears in both halves"
     assert np.isclose(len({day(i) for i in cal}) / 40, 0.2)
+
+
+def test_alert_statistic_is_causal_per_day_and_keeps_input_order():
+    from cirr.evaluation.admissibility import alert_statistic
+
+    ts = pd.Series([f"20160101_10{m:02d}00" for m in range(0, 60, 5)] + ["20160102_100000"])
+    scores = np.arange(len(ts), dtype=float)
+    base = alert_statistic(ts, scores)
+    # a late spike must not change any earlier frame's statistic
+    spiked = scores.copy()
+    spiked[-2] = 1e6
+    assert np.array_equal(alert_statistic(ts, spiked)[:-2], base[:-2])
+    # window (t - 30 min, t]: the 10:35 frame sees 10:10..10:35 -> median of 2..7 = 4.5
+    assert base[7] == 4.5
+    # a new day starts a new window
+    assert base[-1] == scores[-1]
+    # shuffling the input only shuffles the output
+    order = np.random.default_rng(0).permutation(len(ts))
+    assert np.array_equal(alert_statistic(ts[order].reset_index(drop=True), scores[order]), base[order])
+
+
+def test_local_gate_blames_the_single_abnormal_cell():
+    from cirr.evaluation.admissibility import LocalGate
+
+    torch.manual_seed(0)
+    bank = torch.randn(5, 50, 128) * 0.1                      # 5 cells, 50 nominal frames each
+    gate = LocalGate(bank, torch.ones(5, dtype=torch.bool), scale=torch.ones(5))
+    frames = torch.randn(3, 5, 128) * 0.1
+    frames[1, 3] += 5.0                                       # one soiled patch in frame 1
+    score, where = gate.score(frames, "cpu")
+    assert score.argmax() == 1 and where[1] == 3
