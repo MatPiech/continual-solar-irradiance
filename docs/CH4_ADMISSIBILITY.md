@@ -98,3 +98,41 @@ Every detector threshold is the 99th percentile of that detector's scores on the
 same held-out 2014–2015 frames, so all are compared at the same nominal
 false-alarm rate. Contrasts use the estimators of `cirr/fl/analysis.py`
 (7-day moving-block bootstrap, 2,000 resamples; Diebold–Mariano with Newey–West lag 6).
+
+## 5. Local-feature maintenance alert — pre-registered design (fixed 2026-09-24, before any evaluation)
+
+The embedding gate above is blind to sensor faults (Section 4 outputs): it scores the globally
+pooled embedding of an encoder trained to ignore anything that does not change irradiance. The
+aim of the PP-RAI paper is a working **maintenance alert** — telling the operator the dome needs
+attention — so the detector below is designed for local faults. Everything in this section was
+fixed and committed before it was scored on any synthetic fault.
+
+**Features.** The forecaster's own `layer2` activations (512 × 16 × 16 at 128 × 128 input, one
+cell per 8 × 8-pixel block), taken from the forecasting pass itself; 3 × 3 average pooling for
+neighbourhood context; a fixed Gaussian random projection to 128 dimensions (seed 0). Only cells
+whose 8 × 8 block lies entirely inside the circular field of view are scored.
+
+**Per-position model.** The camera is fixed, so every cell has its own notion of normal. For each
+cell, a memory bank of that cell's features from 2,000 nominal frames drawn from the Isolation
+Forest's fit days (Folsom 2014–2015, same day split). A cell's score is its nearest-neighbour
+distance to its bank divided by the 95th percentile of the same distance on 1,000 other fit-day
+frames. The frame score is the maximum over cells.
+
+**Frame threshold.** The 99th percentile of frame scores on 3,000 frames of the held-out
+calibration days: a 1 % nominal false-alarm rate, as for every other detector.
+
+**Maintenance alert.** Causal rolling median of the frame score over the preceding 30 minutes of
+the same day. The alert threshold is the 99th percentile of that statistic on 30 whole
+calibration days (every frame, so the 30-minute window is real time).
+
+**Pass criteria.**
+
+1. *Frame level*, synthetic probe of Section 4: at the 1 % threshold, at least 50 % of soiling
+   frames and at least 50 % of occlusion frames flagged, and more than the dark-pixel baseline
+   for each.
+2. *Maintenance level*, corrupted 2016 stream: every one of the 4 soiling episodes raises an
+   alert within its first 2 hours, and alerts fire on at most 1 % of fault-free frames.
+
+Droplets are reported without a criterion: at 128 × 128 a droplet covers a few pixels, and they
+may be below the input resolution. The real 2016 stream is checked qualitatively: the frames it
+scores highest are rendered for inspection, and are reported as they come.
