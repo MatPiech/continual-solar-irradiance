@@ -65,6 +65,7 @@ def run_policy(
     horizon_steps: int,
     t1: float,
     t2: float,
+    encoder_blocks: int | None = None,
 ) -> Any:
     def on_revealed(oldest: DelayedQueueItem, ctx: OnlineEvalContext) -> None:
         ctx.update_stats["considered"] += 1
@@ -98,6 +99,7 @@ def run_policy(
             history=oldest.history,
             gt=oldest.gt,
             device=device,
+            encoder_blocks=encoder_blocks,
         )
         action = SCOPE_TO_ACTION[scope]
         ctx.update_stats[action] += 1
@@ -201,6 +203,13 @@ def retention_report(
 @click.option("--horizon-steps", type=click.IntRange(min=1), default=15, show_default=True)
 @click.option("--t1", type=float, default=0.01, show_default=True, help="Lower threshold (kW/m^2).")
 @click.option("--t2", type=float, default=0.1, show_default=True, help="Upper threshold (kW/m^2).")
+@click.option(
+    "--encoder-blocks",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Ablation: the high-error action unfreezes only the last N parameterised encoder "
+    "groups instead of the whole encoder. 2 = ResNet50 layer3+layer4. Default: whole encoder.",
+)
 @click.option("--ogd-lr", type=float, default=1e-5, show_default=True)
 @click.option("--ogd-beta1", type=float, default=0.5, show_default=True)
 @click.option("--ogd-beta2", type=float, default=0.975, show_default=True)
@@ -233,6 +242,7 @@ def main(
     horizon_steps: int,
     t1: float,
     t2: float,
+    encoder_blocks: int | None,
     ogd_lr: float,
     ogd_beta1: float,
     ogd_beta2: float,
@@ -264,10 +274,11 @@ def main(
     model = load_eval_model(checkpoint, device)
     loss_fn = make_regression_loss(ogd_loss).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=ogd_lr, betas=(ogd_beta1, ogd_beta2), weight_decay=ogd_weight_decay)
-    print(f"T1={t1}  T2={t2}  seed={seed}\n")
+    scope = "whole encoder" if encoder_blocks is None else f"last {encoder_blocks} encoder groups"
+    print(f"T1={t1}  T2={t2}  high-error action: head + {scope}  seed={seed}\n")
 
     started = time.perf_counter()
-    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2)
+    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2, encoder_blocks)
     wall_time_s = time.perf_counter() - started
 
     print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [conditional]")
@@ -296,6 +307,7 @@ def main(
             "method": "conditional",
             "t1": t1,
             "t2": t2,
+            "encoder_blocks": encoder_blocks,
             "ogd_lr": ogd_lr,
             "ogd_betas": [ogd_beta1, ogd_beta2],
             "ogd_weight_decay": ogd_weight_decay,

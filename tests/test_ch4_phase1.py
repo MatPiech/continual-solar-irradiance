@@ -259,3 +259,13 @@ def test_published_karpicko_run_scored_the_unfiltered_population():
     text = legacy.read_text()
     assert "Samples: 226114" in text, "the published run scored every sample, night included"
     assert "checkpoints/epoch_010.ckpt" in text, "the published run used the pre-Phase-1 checkpoint"
+
+
+def test_f6_partial_encoder_ablation_is_layer3_and_layer4():
+    """--encoder-blocks 2 is what the original code meant: the last two parameterised groups."""
+    model = _model()
+    set_trainable(model, "head_and_encoder", encoder_blocks=2)
+    trained = {n.split(".")[1] for n, p in model.image_encoder.named_parameters(prefix="e") if p.requires_grad}
+    assert trained == {"layer3", "layer4"}, trained
+    partial = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    assert _trainable(model, "head_only") < partial < _trainable(model, "head_and_encoder")

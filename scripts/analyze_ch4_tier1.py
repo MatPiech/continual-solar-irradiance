@@ -41,6 +41,7 @@ METHODS = [
     "fewshot_d1",
     "fewshot_d7",
     "conditional",
+    "conditional_last2",
     "conditional_headonly",
 ]
 LABEL = {
@@ -52,10 +53,11 @@ LABEL = {
     "fewshot_d1": "Few-shot 1d",
     "fewshot_d7": "Few-shot 7d",
     "conditional": "Conditional (full model)",
+    "conditional_last2": "Conditional (layer3+4)",
     "conditional_headonly": "Conditional (head only)",
 }
-ROOT_OF = {"conditional_headonly": ABLATION}
-VARIANTS = ["conditional", "conditional_headonly"]
+ROOT_OF = {"conditional_headonly": ABLATION, "conditional_last2": ABLATION}
+VARIANTS = ["conditional", "conditional_last2", "conditional_headonly"]
 REFERENCE = "sliding_window"  # the strongest published comparator (plan H4.1)
 TOST_MARGIN = 5.0  # per cent relative MAE
 
@@ -231,22 +233,24 @@ def main() -> None:
     # --- H4.4 retention -----------------------------------------------------
     ret_rows = []
     for site in SITES:
-        f = T1 / site / "conditional" / "seed0" / "retention.json"
-        if not f.exists():
-            continue
-        r = json.loads(f.read_text())
-        s = r.get("source_stream")
-        if s:
-            ret_rows.append(
-                dict(
-                    site=site,
-                    reference="source (Folsom)",
-                    frozen_mae=s["frozen"]["mae"] * W,
-                    adapted_mae=s["adapted"]["mae"] * W,
-                    change_pct=100 * (s["adapted"]["mae"] / s["frozen"]["mae"] - 1),
-                    n_days=s.get("n_days"),
+        for v in VARIANTS:
+            f = ROOT_OF.get(v, T1) / site / v / "seed0" / "retention.json"
+            if not f.exists():
+                continue
+            r = json.loads(f.read_text())
+            s = r.get("source_stream")
+            if s:
+                ret_rows.append(
+                    dict(
+                        site=site,
+                        variant=LABEL[v],
+                        reference="source (Folsom)",
+                        frozen_mae=s["frozen"]["mae"] * W,
+                        adapted_mae=s["adapted"]["mae"] * W,
+                        change_pct=100 * (s["adapted"]["mae"] / s["frozen"]["mae"] - 1),
+                        n_days=s.get("n_days"),
+                    )
                 )
-            )
     pd.DataFrame(ret_rows).to_csv(OUT / "ch4_retention.csv", index=False)
 
     # --- seed spread, for the arms that have more than one ------------------

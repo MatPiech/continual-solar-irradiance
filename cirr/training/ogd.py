@@ -36,7 +36,7 @@ def algorithm1_scope(delayed_abs_error: float, t1: float, t2: float) -> Algorith
     return "head_and_encoder"
 
 
-def set_trainable(model: Forecaster, scope: TrainScope) -> None:
+def set_trainable(model: Forecaster, scope: TrainScope, *, encoder_blocks: int | None = None) -> None:
     """Select the trainable parameter subspace.
 
     The policy of thesis Section 4.3 has exactly two update actions, so there are
@@ -54,14 +54,21 @@ def set_trainable(model: Forecaster, scope: TrainScope) -> None:
     the head and nothing else — it was indistinguishable from the low-error
     action.  Every Chapter 4 result published before this commit was produced
     that way, and none of them exercised a full-model update.
+
+    ``encoder_blocks`` is an ablation of the second action, not a third policy
+    action: ``None`` (the default) is the full encoder; ``k`` unfreezes only the
+    last ``k`` encoder children that hold parameters.  ``k = 2`` is what the
+    original code meant by its last two blocks — ResNet50's layer3 and layer4.
     """
     for param in model.parameters():
         param.requires_grad_(False)
     for param in model.network_head.parameters():
         param.requires_grad_(True)
     if scope == "head_and_encoder":
-        for param in model.image_encoder.parameters():
-            param.requires_grad_(True)
+        children = [c for c in model.image_encoder.children() if any(p.numel() for p in c.parameters())]
+        for child in children if encoder_blocks is None else children[-encoder_blocks:]:
+            for param in child.parameters():
+                param.requires_grad_(True)
 
 
 def freeze_all(model: Forecaster) -> None:
@@ -100,8 +107,9 @@ def ogd_step(
     slope_penalty: bool = False,
     volatility_multiplier: float = 0.01,
     max_grad_norm: float = 1.0,
+    encoder_blocks: int | None = None,
 ) -> None:
-    set_trainable(model, scope)
+    set_trainable(model, scope, encoder_blocks=encoder_blocks)
     model.eval()
     imgs = image.unsqueeze(0).to(device) if image.dim() == 3 else image.to(device)
     hist = history.unsqueeze(0).to(device) if history.dim() == 1 else history.to(device)
