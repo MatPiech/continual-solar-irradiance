@@ -25,10 +25,24 @@ from cirr.utils.metrics import compute_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
 T1 = ROOT / "results" / "ch4" / "tier1"
+# The head-only ablation (plan section 6.2 of CH4_ANALYSIS_REPORT) runs the same
+# policy with --t2 1e9, so every triggered update stays in the head.  It lives
+# outside tier1/ because it is not part of the pre-registered main comparison.
+ABLATION = ROOT / "results" / "ch4" / "ablation"
 OUT = ROOT / "tables"
 
 SITES = ["folsom", "karpicko", "poznan"]
-METHODS = ["baseline", "memo_reg_all", "note_reg_all", "sm_rls", "sliding_window", "fewshot_d1", "fewshot_d7", "conditional"]
+METHODS = [
+    "baseline",
+    "memo_reg_all",
+    "note_reg_all",
+    "sm_rls",
+    "sliding_window",
+    "fewshot_d1",
+    "fewshot_d7",
+    "conditional",
+    "conditional_headonly",
+]
 LABEL = {
     "baseline": "Static model",
     "memo_reg_all": "MEMO",
@@ -37,14 +51,17 @@ LABEL = {
     "sliding_window": "Window",
     "fewshot_d1": "Few-shot 1d",
     "fewshot_d7": "Few-shot 7d",
-    "conditional": "Conditional",
+    "conditional": "Conditional (full model)",
+    "conditional_headonly": "Conditional (head only)",
 }
+ROOT_OF = {"conditional_headonly": ABLATION}
+VARIANTS = ["conditional", "conditional_headonly"]
 REFERENCE = "sliding_window"  # the strongest published comparator (plan H4.1)
 TOST_MARGIN = 5.0  # per cent relative MAE
 
 
 def seeds(site: str, method: str) -> list[str]:
-    d = T1 / site / method
+    d = ROOT_OF.get(method, T1) / site / method
     return sorted(p.name for p in d.iterdir() if (p / "summary.json").exists()) if d.exists() else []
 
 
@@ -52,7 +69,7 @@ def daily(site: str, method: str) -> tuple[pd.DataFrame, int]:
     """Seed-averaged per-day metrics, in the shape cirr.fl.analysis expects."""
     frames = []
     for s in seeds(site, method):
-        d = pd.read_csv(T1 / site / method / s / "metrics_daily.csv", dtype={"date": str})
+        d = pd.read_csv(ROOT_OF.get(method, T1) / site / method / s / "metrics_daily.csv", dtype={"date": str})
         d = d.dropna(subset=["mae"])
         d = d[d.n_samples > 0].copy()
         d["mse"] = d.rmse**2
@@ -136,64 +153,79 @@ def main() -> None:
     # --- H4.1 equivalence against the strongest comparator ------------------
     eq_rows = []
     for site in SITES:
-        c = contrast(arms[(site, "conditional")], arms[(site, REFERENCE)], tag=f"{site}-h41")
-        inside = c["rel_lo"] > -TOST_MARGIN and c["rel_hi"] < TOST_MARGIN
-        eq_rows.append(
-            dict(
-                site=site,
-                rel_mae_pct=c["rel"],
-                ci90_lo=c["rel_lo"],
-                ci90_hi=c["rel_hi"],
-                margin=TOST_MARGIN,
-                equivalent=inside,
-                dfs=c["dfs"],
-                dfs_lo=c["dfs_lo"],
-                dfs_hi=c["dfs_hi"],
-                n_days=c["n_days"],
+        for v in VARIANTS:
+            if (site, v) not in arms:
+                continue
+            c = contrast(arms[(site, v)], arms[(site, REFERENCE)], tag=f"{site}-h41-{v}")
+            inside = c["rel_lo"] > -TOST_MARGIN and c["rel_hi"] < TOST_MARGIN
+            eq_rows.append(
+                dict(
+                    site=site,
+                    variant=LABEL[v],
+                    rel_mae_pct=c["rel"],
+                    ci90_lo=c["rel_lo"],
+                    ci90_hi=c["rel_hi"],
+                    margin=TOST_MARGIN,
+                    equivalent=inside,
+                    dfs=c["dfs"],
+                    dfs_lo=c["dfs_lo"],
+                    dfs_hi=c["dfs_hi"],
+                    n_days=c["n_days"],
+                )
             )
-        )
     eq = pd.DataFrame(eq_rows)
     eq.to_csv(OUT / "ch4_equivalence.csv", index=False)
 
     # --- pairwise contrasts, Holm across the whole family -------------------
+    # One Holm family over both variants: every contrast reported is corrected
+    # against every other one, including full model against head only.
     dm_rows = []
     for site in SITES:
-        for m in METHODS:
-            if m == "conditional" or (site, m) not in arms:
+        for v in VARIANTS:
+            if (site, v) not in arms:
                 continue
-            c = contrast(arms[(site, "conditional")], arms[(site, m)], tag=f"{site}-{m}")
-            dm_rows.append(
-                dict(
-                    site=site,
-                    against=LABEL[m],
-                    rel_mae_pct=c["rel"],
-                    ci90_lo=c["rel_lo"],
-                    ci90_hi=c["rel_hi"],
-                    dfs=c["dfs"],
-                    p=c["p"],
+            for m in METHODS:
+                if m == v or (site, m) not in arms or (m in VARIANTS and VARIANTS.index(m) < VARIANTS.index(v)):
+                    continue
+                c = contrast(arms[(site, v)], arms[(site, m)], tag=f"{site}-{v}-{m}")
+                dm_rows.append(
+                    dict(
+                        site=site,
+                        variant=LABEL[v],
+                        against=LABEL[m],
+                        rel_mae_pct=c["rel"],
+                        ci90_lo=c["rel_lo"],
+                        ci90_hi=c["rel_hi"],
+                        dfs=c["dfs"],
+                        p=c["p"],
+                    )
                 )
-            )
     dm = pd.DataFrame(holm(dm_rows))
     dm.to_csv(OUT / "ch4_dm.csv", index=False)
 
     # --- action mix and update cost ----------------------------------------
     act_rows = []
     for site in SITES:
-        e = pd.read_csv(T1 / site / "conditional" / "seed0" / "events.csv")
-        tot = {a: int(e[a].sum()) for a in ("none", "head", "whole")}
-        considered = int(e["considered"].sum())
-        act_rows.append(
-            dict(
-                site=site,
-                considered=considered,
-                **tot,
-                head_pct=100 * tot["head"] / considered,
-                whole_pct=100 * tot["whole"] / considered,
-                update_rate_pct=100 * (tot["head"] + tot["whole"]) / considered,
-                clamp_sentinel=int(e.get("scope_changed_if_raw", pd.Series([0])).sum()),
-                updates_per_day=(tot["head"] + tot["whole"]) / len(e),
+        for v in VARIANTS:
+            f = ROOT_OF.get(v, T1) / site / v / "seed0" / "events.csv"
+            if not f.exists():
+                continue
+            e = pd.read_csv(f)
+            tot = {a: int(e[a].sum()) for a in ("none", "head", "whole")}
+            considered = int(e["considered"].sum())
+            act_rows.append(
+                dict(
+                    site=site,
+                    variant=LABEL[v],
+                    considered=considered,
+                    **tot,
+                    head_pct=100 * tot["head"] / considered,
+                    whole_pct=100 * tot["whole"] / considered,
+                    update_rate_pct=100 * (tot["head"] + tot["whole"]) / considered,
+                    clamp_sentinel=int(e.get("scope_changed_if_raw", pd.Series([0])).sum()),
+                    updates_per_day=(tot["head"] + tot["whole"]) / len(e),
+                )
             )
-        )
     pd.DataFrame(act_rows).to_csv(OUT / "ch4_actions.csv", index=False)
 
     # --- H4.4 retention -----------------------------------------------------
@@ -241,15 +273,17 @@ def main() -> None:
         print(f"\n=== {site} ===")
         t = main[main.site == site][["method", "mae", "rmse", "wape", "smape", "fs", "seeds"]]
         print(t.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
-    print("\n=== H4.1: Conditional vs Window, 90 % CI on relative MAE, margin +/-5 % ===")
+    print("\n=== H4.1: Conditional variants vs Window, 90 % CI on relative MAE, margin +/-5 % ===")
     print(
-        eq[["site", "rel_mae_pct", "ci90_lo", "ci90_hi", "equivalent"]].to_string(
+        eq[["site", "variant", "rel_mae_pct", "ci90_lo", "ci90_hi", "equivalent"]].to_string(
             index=False, float_format=lambda x: f"{x:.2f}"
         )
     )
     print("\n=== Pairwise (Holm-adjusted) ===")
     print(
-        dm[["site", "against", "rel_mae_pct", "dfs", "p", "p_holm"]].to_string(index=False, float_format=lambda x: f"{x:.4f}")
+        dm[["site", "variant", "against", "rel_mae_pct", "dfs", "p", "p_holm"]].to_string(
+            index=False, float_format=lambda x: f"{x:.4f}"
+        )
     )
     print("\nwrote", ", ".join(sorted(p.name for p in OUT.glob("ch4_*.csv"))))
 

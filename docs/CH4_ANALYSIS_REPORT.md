@@ -4,16 +4,18 @@ Branch: `feature/adaptation` · Repository: `continual-solar-irradiance` · Date
 Scope: `docs/ch4_conditional_adaptation_plan.md` §7, Tier 1 only.
 Campaign: 36 runs, 30.6 GPU-hours, one source checkpoint (`cdbb71ff…`), four RTX 4090 servers.
 
-**Verdict: H4.1 is not supported, and H4.4 fails by a wide margin.** The conditional policy, once
-its full-model action is implemented as the chapter describes it, is worse than sliding-window
-adaptation at all three sites and worse than doing nothing at Folsom. Adapting for a year destroys
-the model on the source distribution. Both findings contradict the published section, and both
-trace to the same cause: the published results came from a code path whose high-error action
-trained only the head.
+**Verdict: the policy as the chapter specifies it fails H4.1 and H4.4; the same policy with its
+full-model action disabled passes H4.1 at every site.** With the high-error branch updating the
+whole network, the conditional policy is worse than sliding-window adaptation at all three sites
+and 32 % worse than doing nothing at Folsom, and a year of adaptation triples its error on the
+source distribution. The head-only ablation (§7) — identical except that every triggered update
+stays in the head — is equivalent to sliding-window adaptation on MAE within ±5 % at all three
+sites, and has the lowest MAE of any method at Folsom and Karpicko. Sliding-window adaptation keeps
+a small but significant lead on RMSE and forecast skill everywhere.
 
-This report states what the campaign measured. It does not recommend a rewrite of the section
-before the ablation in §6 has been run, because that ablation is what separates "the policy is
-wrong" from "the full-model action is wrong".
+The published results came from a code path whose high-error action silently trained only the
+head, so the method that was actually validated is the head-only one. The three-action policy of
+`eq:ch4-update-trigger` was never exercised before this campaign, and it does not survive a year.
 
 ## 1. Main comparison (plan §7.2, `tables/ch4_main.csv`, `.tex`)
 
@@ -58,7 +60,7 @@ consistent with a prediction-variance objective whose minimiser is a constant ou
 
 What does not survive is the position of the proposed policy.
 
-## 2. H4.1 — not supported (`tables/ch4_equivalence.csv`)
+## 2. H4.1 for the policy as specified — not supported (`tables/ch4_equivalence.csv`)
 
 Relative MAE of the conditional policy against sliding-window adaptation, 90 % moving-block
 bootstrap interval (7-day blocks, 2,000 resamples, paired by date), equivalence margin ±5 %.
@@ -86,7 +88,7 @@ all 21 comparisons. Every comparison is significant at Holm-adjusted *p* < 0.05.
 The policy beats only NOTE at all three sites. At Karpicko and Poznań it beats the frozen model,
 MEMO, RLS and few-shot on MAE, and loses to Window. At Folsom it loses to everything except NOTE.
 
-## 4. H4.4 — not supported (`tables/ch4_retention.csv`)
+## 4. H4.4 for the policy as specified — not supported (`tables/ch4_retention.csv`)
 
 The adapted model, re-scored on the held-out Folsom source stream against the frozen reference on
 the same 30 days:
@@ -114,46 +116,114 @@ trajectory leads.
 
 Two things follow. The full-model action is not rare — between a tenth and a fifth of decisions —
 so the chapter's cost discussion, which assumes it is exceptional, does not describe this policy.
-And the update rate is far higher than the published Karpicko run's 59.7 %, which is what a
-damaged model does: larger errors cross the thresholds more often, which triggers more updates,
-which damages the model further. The dead zone does not arrest that loop.
+And the update rate, 71–73 %, is far higher than the published Karpicko run's 59.7 %, so the
+policy sits much closer to always-update than the chapter's framing suggests.
+
+The monthly action mix does **not** show a runaway feedback loop, and an earlier draft of this
+report claimed one without checking. At Folsom the full-model share *falls* to 1.7 % in July,
+exactly when the policy is at its worst relative to the frozen model (§6.1). The share tracks the
+seasonal scale of absolute error — a fixed 100 W/m² threshold is a high bar on clear summer days —
+rather than the state of the model. Whatever is degrading the model is not visibly re-triggering
+itself through the threshold.
 
 The clamp sentinel (`scope_changed_if_raw`) is zero in all three campaigns, so the clamped trigger
 of `eq:ch4-abs-error` and an unclamped one would have selected identical actions throughout.
 
-## 6. What this does and does not establish
+## 6. How the degradation develops
 
-**It does not establish that error-triggered adaptation is a bad idea.** Every measurement here is
-of one policy with the full-model action live. The single decisive experiment has not been run:
-the same policy with the high-error action disabled, which `--t2` makes a one-line change
-(`--t2 1e9` sends every triggered update to the head). That is about 4 GPU-hours for three sites,
-and it separates two very different conclusions:
+### 6.1 It is progressive, not immediate
 
-- if head-only adaptation recovers the published behaviour, the finding is that **the full-model
-  action is harmful** and the section should either drop it or report it as a negative result;
-- if head-only adaptation is also poor, the finding is about the **trigger**, and the published
-  numbers were a favourable accident of an under-powered update path.
+Folsom, monthly mean daily MAE in W/m², against the frozen model on the same days:
 
-I recommend running that ablation before any part of the section is rewritten.
+| Month | Conditional | Frozen | Ratio |
+|---|---|---|---|
+| Jan | 49.41 | 46.60 | 1.06 |
+| Feb | 46.29 | 43.82 | 1.17 |
+| Mar | 52.10 | 47.51 | 1.27 |
+| Apr | 54.26 | 48.89 | 1.57 |
+| May | 60.69 | 51.33 | 2.00 |
+| Jun | 40.29 | 24.93 | 2.94 |
+| Jul | 18.54 | 7.70 | 3.72 |
+| Aug | 20.14 | 8.90 | 3.59 |
+| Sep | 23.97 | 10.02 | **4.38** |
+| Oct | 49.13 | 35.13 | 2.33 |
+| Nov | 48.88 | 34.21 | 2.02 |
+| Dec | 43.57 | 28.69 | 2.19 |
 
-**H4.2 remains untested.** The trigger controls were deferred, so nothing here separates "this
-policy works" from "updating at this rate works". Given that the update rate is 71–73 %, the
-policy is close to always-update, and that comparison now matters more than it did.
+The policy starts at parity — the first ten days are within ±10 % of the frozen model, sometimes
+better — and separates monotonically from it through the first nine months. This is the residual
+risk `sec:ch4-adaptation-protocol` explicitly retains: "a trajectory limited at each step
+nonetheless drifts over a longer horizon than those evaluated." The campaign has now realised it.
+A week-scale evaluation, which is what `tab:ch4-solar-metrics` reports, cannot see this at all.
 
-**H4.3 cannot be settled favourably.** The accuracy-per-cost argument needs the policy to be
-cheaper at comparable accuracy. It is neither: it updates on ~72 % of samples, a fifth of those
-through the whole network, and is less accurate than a comparator that updates a four-sample
-mini-batch head-only.
+### 6.2 The cause is the full-model action
+
+Established by the ablation in §7: removing that one branch removes the degradation.
+
+## 7. Head-only ablation
+
+The same policy, same seed, same checkpoint and thresholds, run with `--t2 1e9` so that every
+triggered update is a head update. Results under `results/ch4/ablation/`, folded into every table
+in `tables/` as the arm *Conditional (head only)*.
+
+| Site | Full model MAE | Head only MAE | Window MAE | Head only FS | Window FS |
+|---|---|---|---|---|---|
+| Folsom | 41.68 | **31.03** | 31.50 | 18.51 | **19.30** |
+| Karpicko | 68.54 | **66.58** | 66.76 | 10.16 | **12.42** |
+| Poznań | 62.68 | 59.65 | **58.92** | 17.37 | **19.57** |
+
+**H4.1 for the head-only variant** — relative MAE against Window, 90 % CI, margin ±5 %:
+
+| Site | Relative MAE | 90 % CI | Inside ±5 % |
+|---|---|---|---|
+| Folsom | −1.48 % | [−1.95, −1.03] | yes |
+| Karpicko | −0.27 % | [−0.89, +0.43] | yes |
+| Poznań | +1.23 % | [+0.73, +1.84] | yes |
+
+All three intervals sit well inside the margin, so **H4.1 is supported for the head-only policy**.
+At Folsom it is significantly *better* than Window on MAE. On squared loss the ordering reverses:
+the Diebold-Mariano contrasts favour Window at every site (Holm-adjusted *p* = 0.007, 0.0001,
+< 0.0001), with forecast-skill leads of 0.8, 2.3 and 2.2 points. The head-only policy matches
+Window on typical errors and trails it on the large ones.
+
+**Where the full-model action does its damage.** Full model against head only is significant at
+Folsom (+34 % MAE, Holm *p* < 0.0001) but not at Karpicko (*p* = 0.84) or Poznań (*p* = 0.84),
+where RMSE is within 0.4 points. At the shifted sites, updating the encoder roughly breaks even
+in-site while destroying source competence (§4); at the source site, where there is no shift to
+absorb, moving the encoder is pure damage. The ablation does not include a retention pass, so the
+head-only policy's forgetting is not yet measured; with the encoder frozen it is confined to the
+head.
+
+**Update rate.** The head-only policy updates on 42.7 % of Folsom decisions against 70.8 % for the
+full-model variant, and on 69.0 / 65.2 % against 73.1 / 72.3 % at Karpicko and Poznań. The damaged
+model makes larger errors, so it triggers more often. This is a consequence of the damage rather
+than a runaway loop — the full-model share itself does not rise as the model degrades (§5) — but
+it means the full-model variant also costs more, on top of the cost of each full update.
+
+## 8. What this does and does not establish
+
+**H4.2 remains untested.** The trigger controls were deferred. With the head-only policy updating
+on 43–69 % of decisions, the comparison with always-update and with a rate-matched random trigger
+is what would show whether the error threshold does work.
+
+**H4.3 is now arguable but not settled.** The head-only policy matches Window on MAE while updating
+single samples rather than four-sample mini-batches, which is the cheaper operation. The device
+cost comparison in `tab:ch4-solar-edge-benchmark` timed this head-only behaviour, since that was
+the only behaviour the code had, so those numbers describe the head-only policy and remain usable
+for it — but daily energy is still unmeasured.
+
+**H4.4 is measured for the full-model variant only**, and fails badly. The head-only variant needs
+its own retention pass.
 
 **Single seed, single checkpoint.** The six deterministic methods are bit-identical on a repeat,
 so between-run variance is zero by construction; few-shot's three seeds spread by 0.02–0.75 W/m²
-(`tables/ch4_seed_spread.csv`), which is negligible against the effects above. What is
-uncharacterised is sensitivity to the source checkpoint, not run-to-run noise.
+(`tables/ch4_seed_spread.csv`), negligible against the effects above. What is uncharacterised is
+sensitivity to the source checkpoint, not run-to-run noise.
 
-## 7. Reproducing this analysis
+## 9. Reproducing this analysis
 
 ```bash
-python scripts/analyze_ch4_tier1.py     # reads results/ch4/tier1 only, writes tables/ch4_*.csv
+python scripts/analyze_ch4_tier1.py     # reads results/ch4/tier1 and results/ch4/ablation, writes tables/ch4_*.csv
 ```
 
 Every estimator is imported from `cirr/fl/analysis.py`, so Chapter 4 and Chapter 5 share one
