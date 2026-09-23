@@ -28,6 +28,7 @@ Reference:
     Vision Systems. 2026. doi: 10.1007/978-3-032-07343-3_28
 """
 
+from dataclasses import dataclass, field
 from pathlib import Path
 import time
 from typing import Any
@@ -51,9 +52,42 @@ from cirr.evaluation.runner import load_eval_model, resolve_device
 from cirr.models.forecaster import Forecaster
 from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.ogd import algorithm1_scope, make_regression_loss, ogd_step
+from cirr.training.replay import build_folsom_replay_buffer
 from cirr.utils.provenance import set_determinism
 
 SCOPE_TO_ACTION = {"none": "none", "head_only": "head", "head_and_encoder": "whole"}
+
+
+@dataclass
+class Stabilisers:
+    """Optional guards on the encoder action (Chapter 4 fix experiments).
+
+    ``replay`` holds source-domain tensors preloaded once, so a replay step costs
+    compute but no disk reads; ``anchor`` is the encoder's source weights.
+    """
+
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    replay_k: int = 0
+    anchor: dict[str, torch.Tensor] | None = None
+    anchor_pull: float = 0.0
+    rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(0))
+
+    def draw(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if self.replay is None or self.replay_k <= 0:
+            return None
+        pick = torch.from_numpy(self.rng.choice(len(self.replay[0]), size=self.replay_k, replace=False))
+        return tuple(t[pick] for t in self.replay)
+
+
+def load_source_replay(size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Folsom *training* samples (2014-2015), disjoint from every scored stream."""
+    pairs, _stats = build_folsom_replay_buffer(Path("data/folsom_prepared"), size)
+    items = [ds[i] for ds, i in pairs]
+    return (
+        torch.stack([x[0] for x in items]),
+        torch.stack([x[1] for x in items]),
+        torch.stack([x[3] for x in items]).view(-1, 1),
+    )
 
 
 def run_policy(
@@ -66,7 +100,10 @@ def run_policy(
     t1: float,
     t2: float,
     encoder_blocks: int | None = None,
+    stabilisers: Stabilisers | None = None,
 ) -> Any:
+    stab = stabilisers or Stabilisers()
+
     def on_revealed(oldest: DelayedQueueItem, ctx: OnlineEvalContext) -> None:
         ctx.update_stats["considered"] += 1
         ctx.day_update_stats["considered"] += 1
@@ -100,6 +137,9 @@ def run_policy(
             gt=oldest.gt,
             device=device,
             encoder_blocks=encoder_blocks,
+            replay=stab.draw() if scope == "head_and_encoder" else None,
+            anchor=stab.anchor,
+            anchor_pull=stab.anchor_pull,
         )
         action = SCOPE_TO_ACTION[scope]
         ctx.update_stats[action] += 1
@@ -204,6 +244,31 @@ def retention_report(
 @click.option("--t1", type=float, default=0.01, show_default=True, help="Lower threshold (kW/m^2).")
 @click.option("--t2", type=float, default=0.1, show_default=True, help="Upper threshold (kW/m^2).")
 @click.option(
+    "--encoder-lr", type=float, default=None, help="Learning rate for encoder parameters. Default: same as --ogd-lr."
+)
+@click.option(
+    "--anchor-pull",
+    type=click.FloatRange(0.0, 1.0),
+    default=0.0,
+    show_default=True,
+    help="Decoupled L2-SP: fraction of each encoder weight's displacement from the "
+    "source removed after every encoder step. 0 disables it.",
+)
+@click.option(
+    "--replay-size",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Folsom training samples preloaded for source replay. 0 disables it.",
+)
+@click.option(
+    "--replay-k",
+    type=click.IntRange(min=0),
+    default=7,
+    show_default=True,
+    help="Replay samples appended to each encoder step.",
+)
+@click.option(
     "--encoder-blocks",
     type=click.IntRange(min=1),
     default=None,
@@ -243,6 +308,10 @@ def main(
     t1: float,
     t2: float,
     encoder_blocks: int | None,
+    encoder_lr: float | None,
+    anchor_pull: float,
+    replay_size: int,
+    replay_k: int,
     ogd_lr: float,
     ogd_beta1: float,
     ogd_beta2: float,
@@ -273,12 +342,28 @@ def main(
 
     model = load_eval_model(checkpoint, device)
     loss_fn = make_regression_loss(ogd_loss).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=ogd_lr, betas=(ogd_beta1, ogd_beta2), weight_decay=ogd_weight_decay)
+    encoder_lr = ogd_lr if encoder_lr is None else encoder_lr
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.network_head.parameters(), "lr": ogd_lr},
+            {"params": model.image_encoder.parameters(), "lr": encoder_lr},
+        ],
+        betas=(ogd_beta1, ogd_beta2),
+        weight_decay=ogd_weight_decay,
+    )
+    stab = Stabilisers(
+        replay=load_source_replay(replay_size) if replay_size > 0 else None,
+        replay_k=replay_k if replay_size > 0 else 0,
+        anchor={n: p.detach().clone() for n, p in model.image_encoder.named_parameters()} if anchor_pull > 0 else None,
+        anchor_pull=anchor_pull,
+        rng=np.random.default_rng(seed),
+    )
     scope = "whole encoder" if encoder_blocks is None else f"last {encoder_blocks} encoder groups"
-    print(f"T1={t1}  T2={t2}  high-error action: head + {scope}  seed={seed}\n")
+    print(f"T1={t1}  T2={t2}  high-error action: head + {scope}  seed={seed}")
+    print(f"encoder_lr={encoder_lr}  anchor_pull={anchor_pull}  replay={replay_size} samples, k={stab.replay_k}\n")
 
     started = time.perf_counter()
-    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2, encoder_blocks)
+    result = run_policy(model, optimizer, loss_fn, data, device, horizon_steps, t1, t2, encoder_blocks, stab)
     wall_time_s = time.perf_counter() - started
 
     print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [conditional]")
@@ -308,6 +393,10 @@ def main(
             "t1": t1,
             "t2": t2,
             "encoder_blocks": encoder_blocks,
+            "encoder_lr": encoder_lr,
+            "anchor_pull": anchor_pull,
+            "replay_size": replay_size,
+            "replay_k": stab.replay_k,
             "ogd_lr": ogd_lr,
             "ogd_betas": [ogd_beta1, ogd_beta2],
             "ogd_weight_decay": ogd_weight_decay,

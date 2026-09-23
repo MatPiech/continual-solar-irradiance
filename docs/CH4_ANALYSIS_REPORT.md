@@ -200,6 +200,32 @@ model makes larger errors, so it triggers more often. This is a consequence of t
 than a runaway loop — the full-model share itself does not rise as the model degrades (§5) — but
 it means the full-model variant also costs more, on top of the cost of each full update.
 
+## 7b. Partial-encoder ablation (layer3 + layer4)
+
+The high-error action trains head + layer3 + layer4 (`--encoder-blocks 2`, 22.6M of 24.0M
+parameters), which is what the original code meant by its last two blocks. Thresholds, seed and
+checkpoint are unchanged. Retention measured as for the full-model runs.
+
+| Site | Full model | **Layer3+4** | Head only | Window | Layer3+4 retention |
+|---|---|---|---|---|---|
+| Folsom | 41.68 / 10.32 | 37.43 / 15.42 | **31.03** / 18.51 | 31.50 / **19.30** | — |
+| Karpicko | 68.54 / 10.11 | **66.00 / 13.46** | 66.58 / 10.16 | 66.76 / 12.42 | **+194 %** |
+| Poznań | 62.68 / 16.99 | 59.96 / **19.89** | 59.65 / 17.37 | **58.92** / 19.57 | **+209 %** |
+
+MAE (W/m²) / forecast skill (%). At both shifted sites layer3+4 is the best conditional variant
+and at Karpicko the best method on every metric, including RMSE, where head-only trails Window
+by 3 W/m². Updating the deep layers buys a real in-site gain on large errors. It passes H4.1 at
+Karpicko and Poznań and fails at Folsom (+18.8 %, CI [+15.0, +23.8]), where it is still 19 %
+worse than the frozen model. Its drift is slower than the full model's (September ratio to frozen
+2.0 against 4.4) but not arrested, and it forgets almost as badly (+194 %, +209 %).
+
+That is the case for fixing the encoder action rather than dropping it: the gain at shifted sites
+is worth keeping if the Folsom damage and the forgetting can be removed. Three single-factor fixes
+are implemented (`--replay-size/--replay-k`, `--anchor-pull`, `--encoder-lr`); a fix passes only
+if it (i) is no worse than head-only at Folsom, (ii) keeps retention within the H4.4 bar of 10 %
+at Karpicko and Poznań, and (iii) keeps layer3+4's forecast-skill lead over Window at the shifted
+sites.
+
 ## 8. What this does and does not establish
 
 **H4.2 remains untested.** The trigger controls were deferred. With the head-only policy updating

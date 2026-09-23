@@ -269,3 +269,100 @@ def test_f6_partial_encoder_ablation_is_layer3_and_layer4():
     assert trained == {"layer3", "layer4"}, trained
     partial = sum(p.numel() for p in model.parameters() if p.requires_grad)
     assert _trainable(model, "head_only") < partial < _trainable(model, "head_and_encoder")
+
+
+# --- lag H and the encoder-action stabilisers ------------------------------------
+
+
+class _Constant(torch.nn.Module):
+    """Stands in for the forecaster: the online loop only needs a forward pass."""
+
+    def forward(self, images, history):
+        return torch.zeros(images.shape[0], 1)
+
+
+class _Stream:
+    """One day of minute samples, with 10:03 recorded twice like the real data."""
+
+    def __init__(self):
+        minutes = [0, 1, 2, 3, 3] + list(range(4, 40))
+        self.periods = [f"20250101_10{m:02d}00" for m in minutes]
+
+    def __len__(self):
+        return len(self.periods)
+
+    def __getitem__(self, i):
+        return torch.zeros(3, 8, 8), torch.zeros(4), torch.zeros(1), torch.tensor(0.5), self.periods[i]
+
+
+def test_lag_every_label_is_used_at_least_H_minutes_after_its_prediction():
+    """The loop counts samples; a duplicate minute must not release a label early."""
+    from datetime import datetime
+
+    from cirr.evaluation.online import run_delayed_online_eval
+
+    stream = _Stream()
+    lags = []
+
+    def on_revealed(item, ctx):
+        now = datetime.strptime(ctx.predictions_data[-1]["timestamp"], "%Y%m%d_%H%M%S")
+        lags.append((now - item.timestamp).total_seconds() / 60)
+
+    run_delayed_online_eval(_Constant(), stream, {"0101": list(range(len(stream)))}, ["0101"], "cpu", 15, on_revealed)
+    assert lags, "nothing was revealed"
+    assert min(lags) >= 15, f"a label was used {min(lags)} min after its prediction"
+
+
+def _step(model, scope, **kw):
+    from cirr.training.ogd import make_regression_loss, ogd_step
+
+    groups = [
+        {"params": model.network_head.parameters(), "lr": 1e-5},
+        {"params": model.image_encoder.parameters(), "lr": kw.pop("encoder_lr", 1e-5)},
+    ]
+    opt = torch.optim.AdamW(groups, betas=(0.5, 0.975), weight_decay=1e-4)
+    before = model.image_encoder.conv1.weight.detach().clone()
+    torch.manual_seed(0)
+    ogd_step(
+        model,
+        opt,
+        scope,
+        make_regression_loss("mse"),
+        torch.rand(3, 128, 128),
+        torch.rand(4),
+        torch.tensor([[0.5]]),
+        "cpu",
+        **kw,
+    )
+    return (model.image_encoder.conv1.weight.detach() - before).abs().max().item()
+
+
+def test_encoder_lr_sets_the_encoder_step_size():
+    """AdamW moves each weight by about its lr, so the encoder rate is the walk's step."""
+    assert abs(_step(_model(), "head_and_encoder") - 1e-5) < 2e-7
+    assert abs(_step(_model(), "head_and_encoder", encoder_lr=1e-6) - 1e-6) < 2e-8
+
+
+def test_anchor_pull_removes_that_fraction_of_the_displacement():
+    torch.manual_seed(0)
+    model = _model()
+    source = {n: p.detach().clone() for n, p in model.image_encoder.named_parameters()}
+    free = _step(model, "head_and_encoder")
+    torch.manual_seed(0)
+    model = _model()
+    pulled = _step(model, "head_and_encoder", anchor=source, anchor_pull=0.5)
+    assert abs(pulled - 0.5 * free) < 1e-7, (free, pulled)
+
+
+def test_stabilisers_never_touch_the_head_action():
+    """Replay and anchor guard the encoder; a head step must be byte-identical without them."""
+    torch.manual_seed(0)
+    a = _model()
+    replay = (torch.rand(7, 3, 128, 128), torch.rand(7, 4), torch.rand(7, 1))
+    anchor = {n: p.detach().clone() * 0 for n, p in a.image_encoder.named_parameters()}
+    torch.manual_seed(0)
+    b = _model()
+    _step(a, "head_only")
+    _step(b, "head_only", replay=replay, anchor=anchor, anchor_pull=0.9)
+    for pa, pb in zip(a.parameters(), b.parameters(), strict=True):
+        assert torch.equal(pa, pb)

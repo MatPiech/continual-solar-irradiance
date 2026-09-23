@@ -42,6 +42,9 @@ METHODS = [
     "fewshot_d7",
     "conditional",
     "conditional_last2",
+    "conditional_last2_replay",
+    "conditional_last2_anchor",
+    "conditional_last2_lowlr",
     "conditional_headonly",
 ]
 LABEL = {
@@ -54,10 +57,29 @@ LABEL = {
     "fewshot_d7": "Few-shot 7d",
     "conditional": "Conditional (full model)",
     "conditional_last2": "Conditional (layer3+4)",
+    "conditional_last2_replay": "Layer3+4 + replay",
+    "conditional_last2_anchor": "Layer3+4 + anchor",
+    "conditional_last2_lowlr": "Layer3+4 + low enc. LR",
     "conditional_headonly": "Conditional (head only)",
 }
-ROOT_OF = {"conditional_headonly": ABLATION, "conditional_last2": ABLATION}
-VARIANTS = ["conditional", "conditional_last2", "conditional_headonly"]
+ROOT_OF = {
+    m: ABLATION
+    for m in (
+        "conditional_headonly",
+        "conditional_last2",
+        "conditional_last2_replay",
+        "conditional_last2_anchor",
+        "conditional_last2_lowlr",
+    )
+}
+VARIANTS = [
+    "conditional",
+    "conditional_last2",
+    "conditional_last2_replay",
+    "conditional_last2_anchor",
+    "conditional_last2_lowlr",
+    "conditional_headonly",
+]
 REFERENCE = "sliding_window"  # the strongest published comparator (plan H4.1)
 TOST_MARGIN = 5.0  # per cent relative MAE
 

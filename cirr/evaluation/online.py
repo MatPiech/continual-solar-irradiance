@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 import sys
 from typing import Any
 
@@ -39,6 +40,30 @@ class DelayedQueueItem:
     gt: torch.Tensor
     raw_pred: float
     pred_row_idx: int
+    timestamp: datetime | None = None
+
+
+def _parse_stamp(name: str | None) -> datetime | None:
+    try:
+        return datetime.strptime(str(name)[:15], "%Y%m%d_%H%M%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def _label_available(oldest: DelayedQueueItem, now: datetime | None, horizon_minutes: int) -> bool:
+    """True once the oldest item's label exists: ``horizon_minutes`` after its prediction.
+
+    The queue releases a label after ``horizon_steps`` further *samples*.  At one
+    sample per minute that is the horizon, but the datasets hold occasional
+    duplicate samples within one minute, and a duplicate let a label through one
+    minute before it was measured (8 updates at Karpicko, 17 at Poznan in Tier 1).
+    Requiring the elapsed time as well keeps every update causal and leaves every
+    other update exactly where it was.  Without parseable timestamps it falls
+    back to the sample count alone.
+    """
+    if now is None or oldest.timestamp is None:
+        return True
+    return now - oldest.timestamp >= timedelta(minutes=horizon_minutes)
 
 
 @dataclass
@@ -110,7 +135,7 @@ def run_delayed_online_eval(
 
         day_preds: list[float] = []
         day_targets: list[float] = []
-        day_update_stats = {k: 0 for k in update_stats}
+        day_update_stats = dict.fromkeys(update_stats, 0)
 
         ctx = OnlineEvalContext(
             model=model,
@@ -144,6 +169,7 @@ def run_delayed_online_eval(
             row_extra = dict(extra_pred_fields or {})
             predictions_data.append(default_pred_row(day_key, image_name, pred_val, target_val, **row_extra))
 
+            now = _parse_stamp(image_name)
             causal_queue.append(
                 DelayedQueueItem(
                     image=image_input,
@@ -151,10 +177,12 @@ def run_delayed_online_eval(
                     gt=target_irradiance.unsqueeze(0),
                     raw_pred=float(mean_raw.detach().cpu().view(-1)[0].item()),
                     pred_row_idx=pred_row_idx,
+                    timestamp=now,
                 )
             )
 
-            if len(causal_queue) > horizon_steps:
+            # horizon_steps samples AND horizon_steps minutes (one sample per minute)
+            while len(causal_queue) > horizon_steps and _label_available(causal_queue[0], now, horizon_steps):
                 oldest = causal_queue.popleft()
                 on_revealed(oldest, ctx)
 

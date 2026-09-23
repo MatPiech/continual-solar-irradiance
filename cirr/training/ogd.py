@@ -108,12 +108,37 @@ def ogd_step(
     volatility_multiplier: float = 0.01,
     max_grad_norm: float = 1.0,
     encoder_blocks: int | None = None,
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    anchor: dict[str, torch.Tensor] | None = None,
+    anchor_pull: float = 0.0,
 ) -> None:
+    """One lagged update on the buffered sample, with the parameters in force now.
+
+    The encoder-reaching action takes two optional stabilisers; the head action
+    never uses them, because freezing the encoder already bounds its trajectory.
+
+    ``replay``
+        ``(images, histories, targets)`` from the source domain, appended to the
+        batch so the step also fits data the model was trained on.
+    ``anchor`` / ``anchor_pull``
+        Decoupled L2-SP: after the optimiser step, every trainable encoder weight
+        is pulled a fraction ``anchor_pull`` of the way back to its source value.
+        Decoupled for the same reason AdamW decouples weight decay: a penalty
+        added to the loss would be rescaled away by Adam's normalisation, which
+        is exactly why each step moves every weight by about ``lr`` regardless of
+        its gradient.  Against a walk of step ``lr`` the pull bounds the
+        stationary displacement near ``lr / sqrt(2 * anchor_pull)``.
+    """
     set_trainable(model, scope, encoder_blocks=encoder_blocks)
     model.eval()
     imgs = image.unsqueeze(0).to(device) if image.dim() == 3 else image.to(device)
     hist = history.unsqueeze(0).to(device) if history.dim() == 1 else history.to(device)
-    target = gt.to(device)
+    target = gt.to(device).view(-1, 1)
+    if replay is not None and scope == "head_and_encoder":
+        r_img, r_hist, r_gt = replay
+        imgs = torch.cat([imgs, r_img.to(device)])
+        hist = torch.cat([hist, r_hist.to(device)])
+        target = torch.cat([target, r_gt.to(device).view(-1, 1)])
     optimizer.zero_grad()
     pred = pred_mean(model(imgs, hist))
     loss = loss_fn(pred, target.view_as(pred))
@@ -122,6 +147,11 @@ def ogd_step(
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
+    if anchor is not None and anchor_pull > 0.0 and scope == "head_and_encoder":
+        with torch.no_grad():
+            for name, param in model.image_encoder.named_parameters():
+                if param.requires_grad:
+                    param.sub_(anchor_pull * (param - anchor[name]))
     freeze_all(model)
 
 
