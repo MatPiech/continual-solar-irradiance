@@ -214,9 +214,11 @@ def adaptation() -> None:
         panel.set_xticks(range(len(policies)), policies)
         panel.set_ylabel(ylabel)
         panel.grid(axis="y", lw=0.4, color="#e6e6e6")
-    lo = t.mae_clean_frames.min()
-    axes[0].set_ylim(lo * 0.97, t.mae_clean_frames.max() * 1.02)
-    axes[1].legend(fontsize=7)
+    # bars start at zero: the three arms differ by hundredths of a W/m^2, and the figure should say so
+    axes[0].set_ylim(0, t.mae_clean_frames.max() * 1.15)
+    axes[1].set_ylabel("updates on frames that carry a fault\n(in the corrupted stream)")
+    fig.subplots_adjust(wspace=0.35)
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper center", ncol=3, fontsize=7, bbox_to_anchor=(0.5, 1.06))
     save(fig, "ch4_admissibility_adaptation")
 
 

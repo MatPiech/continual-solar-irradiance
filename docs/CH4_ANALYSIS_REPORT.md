@@ -259,6 +259,41 @@ encoder learning rate of 1e-6. It has the lowest MAE of any method at Karpicko a
 Folsom, and is safe on the source domain, but it ties rather than beats sliding-window adaptation on large errors.
 
 
+## 7d. Input admissibility in series with the policy
+
+Isolation Forest (100 trees) on the forecaster's 2048-d embedding, fitted on Folsom 2014–2015,
+threshold at the 99th percentile of held-out 2014–2015 scores. Reproduction:
+`docs/CH4_ADMISSIBILITY.md`; tables `tables/ch4_admissibility_*.csv`; figures
+`figures/ch4/ch4_admissibility_*`.
+
+**Gate in series, clean Folsom stream.** It rejects 1.17 % of frames, 96 % of which would have
+triggered an update. MAE effect: head-only +0.07 % [+0.02, +0.12], layer3+4 low-LR +0.01 %
+[−0.06, +0.08], full model −1.85 % [−3.17, −0.63]. Neutral for the stable policies; for the
+unstable full-model policy it removes 11 % of full-model updates and recovers under 2 % of a
+30 % degradation.
+
+**Synthetic faults** (soiling, droplets, occlusion on 3.35 % of the 2016 stream). At the 1 %
+threshold every embedding detector (Isolation Forest, Mahalanobis, kNN) flags 0.6–1.3 % of
+faulty frames, the false-alarm level (AUROC 0.59–0.71). A model-free dark-pixel fraction catches
+22.9 % of occlusions. The faults are visible in the frame; the forecaster's embedding does not
+represent them.
+
+**Learning from faulty frames.** On the corrupted stream, forecasts on fault-free frames are
+unchanged: +0.03 % (head-only) and +0.02 % (low-LR) relative MAE against the clean stream, both
+intervals including zero. The gate prevents only ~200 of ~3,600 updates on faulty frames and
+leaves fault-free accuracy unchanged (+0.03 %, −0.03 %). At this fault prevalence the damage the
+gate is meant to prevent does not occur, and the gate would not catch the faults if it did.
+
+**What the score does track: forecast difficulty.** Flagged frames carry 3–7× the error of
+admitted ones at every site (Folsom 197 vs 29, Karpicko 167 vs 64, Poznań 227 vs 56 W/m²), and
+the daily flag rate correlates with the frozen model's daily MAE (Spearman 0.59–0.69). As a
+reliability signal it is the best single label-free signal only at the source site (Spearman
+0.55 vs 0.42 for irradiance-history variability); at Karpicko and Poznań history variability is
+clearly better (0.67–0.69 vs 0.49 and 0.44) and the score adds little to it. As a shift
+indicator it is weak: the flag rate only doubles at the deployment sites (2.75 %, 2.34 %).
+Falling back to Smart Persistence on flagged frames does not help (Smart Persistence is worse
+there at every site).
+
 ## 8. What this does and does not establish
 
 **H4.2 remains untested.** The trigger controls were deferred. With the head-only policy updating
