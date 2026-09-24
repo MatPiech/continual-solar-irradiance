@@ -107,7 +107,7 @@ from cirr.fl.prototypes import accumulate_prototypes, aggregate_prototypes, extr
 from cirr.fl.server import AGGREGATION_FNS, _compute_weight_change, is_bn_key, is_head_key, payload_nbytes
 from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
-from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.models.loading import checkpoint_physics, load_forecaster_from_checkpoint
 from cirr.physics.clear_sky import filter_lit_days, load_clear_sky_lookup, resolve_clear_sky_value
 from cirr.training.day_loop import ALIGN_LOSSES, predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
@@ -726,6 +726,7 @@ def run_fl_benchmark(
 
     # --- Load datasets ---
     print("Loading datasets...")
+    physics = checkpoint_physics(checkpoint_path)
     datasets = []
     day_maps = []
     # Smart-Persistence squared-error sums and counts per day.  Kept as (sse, n)
@@ -734,7 +735,7 @@ def run_fl_benchmark(
     sp_day_stats: list[dict[str, tuple[float, int]]] = []
     clear_sky_lookups: list[dict[str, float]] = []
     for name, path in clients:
-        ds = load_dataset(path, split="test")
+        ds = load_dataset(path, split="test", physics=physics)
         dm = group_indices_by_day(ds.periods)
         lookup = load_clear_sky_lookup(path)
         dm, _dropped = filter_lit_days(dm, ds.periods, lookup, min_ghi_clear)

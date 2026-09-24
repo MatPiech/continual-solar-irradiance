@@ -27,6 +27,7 @@ def train_forecaster(data_root: Path):
     pl.seed_everything(seed=cfg.seed)
 
     optical_flow = normalize_optical_flow(cfg.datamodule.optical_flow)
+    physics = bool(cfg.datamodule.get("physics", False))
 
     datamodule = ForecastingDataModule(
         root_data_path=data_root,
@@ -39,6 +40,7 @@ def train_forecaster(data_root: Path):
         workers=cfg.datamodule.workers,
         seed=cfg.seed,
         optical_flow=optical_flow,
+        physics=physics,
     )
 
     encoder_ckpt = cfg.model.get("encoder_checkpoint")
@@ -47,10 +49,11 @@ def train_forecaster(data_root: Path):
     model = Forecaster(
         model_name=cfg.model.model_name,
         pretrained=use_pretrained,
-        input_channels=input_channels(optical_flow=optical_flow),
+        input_channels=input_channels(optical_flow=optical_flow, physics=physics),
         loss_function=cfg.model.loss_function,
         lr=cfg.model.lr,
         lr_patience=cfg.model.lr_patience,
+        physics=physics,
     )
 
     if encoder_ckpt:

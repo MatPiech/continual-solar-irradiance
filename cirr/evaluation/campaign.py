@@ -80,13 +80,14 @@ def load_campaign_days(
     start_day: str = "0101",
     num_days: int = -1,
     min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
+    physics: bool = False,
 ) -> CampaignData:
     """Load a site and restrict it to the lit population, once.
 
     ``min_ghi_clear=0`` disables the filter and reproduces the pre-Phase-1
     population, which is what the regression check in the smoke plan needs.
     """
-    dataset = load_dataset(dataset_path, split="test")
+    dataset = load_dataset(dataset_path, split="test", physics=physics)
     raw_map = group_indices_by_day(dataset.periods)
     lookup = load_clear_sky_lookup(dataset_path)
     if min_ghi_clear > 0.0 and not lookup:

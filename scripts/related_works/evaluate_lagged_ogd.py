@@ -52,6 +52,7 @@ from cirr.evaluation.campaign import (
 from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, run_delayed_online_eval
 from cirr.evaluation.printing import print_overall_metrics
 from cirr.evaluation.runner import load_eval_model, resolve_device
+from cirr.models.loading import checkpoint_physics
 from cirr.models.forecaster import Forecaster
 from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.ogd import algorithm1_scope, make_regression_loss, ogd_step
@@ -383,7 +384,7 @@ def main(
     device = resolve_device(device)
     checkpoint = Path(checkpoint)
 
-    data = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
+    data = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear, physics=checkpoint_physics(checkpoint))
     if corruption_schedule is not None:
         schedule = pd.read_csv(corruption_schedule, dtype={"timestamp": str})
         data.dataset = CorruptedStream(data.dataset, schedule)

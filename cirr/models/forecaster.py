@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
 
-from cirr.data.transforms import FLOW_CHANNELS, RGB_CHANNELS
+from cirr.data.transforms import RGB_CHANNELS
 from cirr.losses import MeanAdaptiveBerHuLoss
 from cirr.models.lora import LoRAConv2d, LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
 
@@ -39,6 +39,7 @@ class Forecaster(pl.LightningModule):
         loss_function: str,
         lr: float,
         lr_patience: int,
+        physics: bool = False,
     ):
         super().__init__()
 
@@ -53,14 +54,14 @@ class Forecaster(pl.LightningModule):
 
         # 2. Image Encoder — num_classes=0 returns the pooled feature vector
         if input_channels > RGB_CHANNELS and pretrained:
-            # Load 3-ch pretrained weights, inflate conv1 for flow channels.
+            # Load 3-ch pretrained weights, inflate conv1 for the extra (flow / IEP) channels.
             pretrained_encoder = timm.create_model(
                 backbone_name,
                 pretrained=True,
                 num_classes=0,
                 in_chans=RGB_CHANNELS,
             )
-            state = _apply_conv1_inflation(pretrained_encoder.state_dict(), extra_channels=FLOW_CHANNELS)
+            state = _apply_conv1_inflation(pretrained_encoder.state_dict(), extra_channels=input_channels - RGB_CHANNELS)
             self.image_encoder = timm.create_model(
                 backbone_name,
                 pretrained=False,

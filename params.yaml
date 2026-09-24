@@ -41,7 +41,7 @@ train_forecaster:
   model:
     model_name: timm-resnet50
     pretrained: True
-    encoder_checkpoint: checkpoints/supcon_encoder.pt  # e.g. checkpoints/supcon_encoder.pt (skips ImageNet when set)
+    encoder_checkpoint:   # e.g. checkpoints/supcon_encoder.pt (skips ImageNet when set); IEP run: ImageNet
     compile: False
     loss_function: Berhu
     lr: 3e-4
@@ -56,7 +56,7 @@ train_forecaster:
       save_last: False # additionally, always save model from last epoch
       verbose: True
       dirpath: "checkpoints/"
-      filename: "epoch_{epoch:03d}"
+      filename: "resnet50_iep_epoch_{epoch:03d}"
       auto_insert_metric_name: False
     early_stopping:
       monitor: "val_loss" # name of the logged metric which determines when model is improving
@@ -66,10 +66,11 @@ train_forecaster:
 
   #### DATA ####
   datamodule:
-    optical_flow: none  # none | farneback
+    optical_flow: none  # none | farneback (ignored when physics is true)
+    physics: true  # IEP 7-channel input (sun mask x I_t, Norm B/R, DIS flow)
     augment: True
     image_size: [ 128, 128 ]
     image_mean: [ 0.485, 0.456, 0.406 ]
     image_std: [ 0.229, 0.224, 0.225 ]
     batch_size: 64
-    workers: 16
+    workers: 28
