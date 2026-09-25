@@ -279,6 +279,72 @@ def build_monitor_schedule(timestamps: list[str], seed: int = 1) -> pd.DataFrame
     return out.sort_values("timestamp").reset_index(drop=True)
 
 
+# §8 dose streams: short-term episode ratio and durations (minutes)
+DOSE_MIX = (("occlusion", 3, 5, 30), ("banding", 2, 1, 5), ("insect", 2, 2, 15))
+
+
+def build_dose_schedule(timestamps: list[str], rate_pct: float, seed: int) -> pd.DataFrame:
+    """A stream with about ``rate_pct`` % of frames faulty (docs/CH4_ADMISSIBILITY.md §8).
+
+    Half of the faulty frames come from whole-day soiling episodes of 1-3 days, half
+    from short-term episodes added in the DOSE_MIX ratio until the budget is met.
+    Episodes never overlap; a frame carries at most one fault.
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.Series(sorted(set(timestamps)))
+    when = pd.to_datetime(ts, format="%Y%m%d_%H%M%S")
+    day = ts.str[:8]
+    days = sorted(day.unique())
+    per_day = day.value_counts()
+    budget = rate_pct / 100 * len(ts) / 2
+    rows: dict[str, tuple[str, int]] = {}
+
+    used: set[str] = set()
+    soil_frames, e, tries = 0, 0, 0
+    while soil_frames < budget and tries < 10_000:
+        tries += 1
+        start, length = int(rng.integers(0, len(days) - 3)), int(rng.integers(1, 4))
+        block = days[start : start + length]
+        if used.intersection(block):
+            continue
+        for d in block:
+            used.add(d)
+            soil_frames += int(per_day[d])
+            for t in ts[day == d]:
+                rows[t] = ("soiling", e)
+        e += 1
+
+    short_frames, tries = 0, 0
+    counters = dict.fromkeys((k for k, *_ in DOSE_MIX), 0)
+    while short_frames < budget and tries < 100_000:
+        for kind, k, lo, hi in DOSE_MIX:
+            for _ in range(k):
+                tries += 1
+                i = int(rng.integers(len(ts)))
+                end = when[i] + pd.Timedelta(minutes=int(rng.integers(lo, hi + 1)))
+                sel = ts[(day == day[i]) & (when >= when[i]) & (when < end)]
+                added = [t for t in sel if t not in rows]
+                if len(added) < len(sel):  # would overlap an existing episode
+                    continue
+                for t in added:
+                    rows[t] = (kind, counters[kind])
+                counters[kind] += 1
+                short_frames += len(added)
+                if short_frames >= budget:
+                    break
+            if short_frames >= budget:
+                break
+    out = pd.DataFrame([(t, k, e) for t, (k, e) in rows.items()], columns=["timestamp", "kind", "episode"])
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+def build_continuous_schedule(timestamps: list[str], kind: str, start_day: str, end_day: str) -> pd.DataFrame:
+    """One episode of ``kind`` on every frame with ``start_day <= YYYYMMDD <= end_day`` (§8)."""
+    ts = pd.Series(sorted(set(timestamps)))
+    on = ts[(ts.str[:8] >= start_day) & (ts.str[:8] <= end_day)]
+    return pd.DataFrame({"timestamp": on.to_numpy(), "kind": kind, "episode": 0}).reset_index(drop=True)
+
+
 class CorruptedStream:
     """A dataset whose frames listed in ``schedule`` carry a synthetic fault.
 

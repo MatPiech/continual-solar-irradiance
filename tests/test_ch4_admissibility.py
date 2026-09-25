@@ -251,3 +251,33 @@ def test_occluders_vary_in_colour_and_shape_across_episodes():
         colours.add(tuple((pix[:, changed].mean(1) * 4).round().tolist()))  # coarse colour
         areas.add(int(changed.sum() // 200))  # coarse area
     assert len(colours) >= 3 and len(areas) >= 3
+
+
+def _synthetic_year():
+    days = pd.date_range("2016-01-01", periods=120, freq="D")
+    return [(d + pd.Timedelta(minutes=m)).strftime("%Y%m%d_%H%M%S") for d in days for m in range(420, 1080)]
+
+
+def test_dose_schedule_hits_its_budget_without_overlap():
+    from cirr.evaluation.admissibility import DOSE_MIX, build_dose_schedule
+
+    ts = _synthetic_year()
+    for rate in (1.0, 5.0, 15.0):
+        s = build_dose_schedule(ts, rate, seed=int(rate))
+        share = 100 * len(s) / len(ts)
+        # whole-day soiling blocks cannot be split: allow one 3-day block of overshoot
+        assert rate * 0.8 <= share <= max(rate * 1.3, rate + 100 * 3 * 660 / len(ts)), (rate, share)
+        assert s.timestamp.is_unique
+        assert set(s.kind) <= {"soiling", *[k for k, *_ in DOSE_MIX]}
+        soil = (s.kind == "soiling").sum()
+        assert 0.3 <= soil / len(s) <= 0.7  # about half persistent, half short-term
+
+
+def test_continuous_schedule_covers_exactly_the_window():
+    from cirr.evaluation.admissibility import build_continuous_schedule
+
+    ts = _synthetic_year()
+    s = build_continuous_schedule(ts, "soiling", "20160201", "20160210")
+    assert set(s.timestamp.str[:8]) == {f"201602{d:02d}" for d in range(1, 11)}
+    assert (s.kind == "soiling").all() and (s.episode == 0).all()
+    assert len(s) == 10 * 660

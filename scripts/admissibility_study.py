@@ -856,5 +856,177 @@ def monitor() -> None:
     print(json.dumps(verdict, indent=2))
 
 
+DOSE_STREAMS = ("r01", "r05", "r15", "cont_soiling", "cont_occluder")
+DOSE_ARMS = {"static": "static", "ungated": "last2_lowlr", "gated": "last2_lowlr_excl"}
+CONT_WINDOW = {"cont_soiling": ("20160701", "20160815"), "cont_occluder": ("20160901", "20161231")}
+
+
+def _fs(p: pd.DataFrame) -> float:
+    return 100 * (1 - np.sqrt(((p.prediction - p.target) ** 2).mean()) / np.sqrt(((p.sp - p.target) ** 2).mean()))
+
+
+def _mae(p: pd.DataFrame) -> float:
+    return W * (p.prediction - p.target).abs().mean()
+
+
+@cli.command()
+def dose() -> None:
+    """§8: fault dose and duration — static, ungated and gated policy on each fault stream."""
+    base = frames("folsom")[["timestamp", "sp"]]
+    clean_runs = {
+        "static": STATIC["folsom"],
+        "ungated": ROOT / "results" / "adaptation" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
+        "gated": RUNS / "monitor_clean" / "last2_lowlr_excl" / "seed0",
+    }
+
+    def load(path, sched):
+        p = pd.read_csv(path / "predictions.csv", dtype={"timestamp": str, "day": str}).merge(base, on="timestamp")
+        p["fault"] = p.timestamp.map(dict(zip(sched.timestamp, sched.kind, strict=True))).fillna("none")
+        p["gated_frame"] = p.get("gated", pd.Series(False, index=p.index)).astype(bool)
+        return p
+
+    rows, contrasts, weekly, alerts, phases = [], [], [], [], []
+    for stream in DOSE_STREAMS:
+        d = GATE / "dose" / stream
+        if not (d / "schedule.csv").exists():
+            print(f"{stream}: no schedule, skipped")
+            continue
+        sched = pd.read_csv(d / "schedule.csv", dtype={"timestamp": str})
+        runs = {arm: RUNS / f"dose_{stream}" / name / "seed0" for arm, name in DOSE_ARMS.items()}
+        missing = [a for a, r in runs.items() if not (r / "predictions.csv").exists()]
+        if missing:
+            print(f"{stream}: runs missing {missing}, skipped")
+            continue
+        P = {arm: load(r, sched) for arm, r in runs.items()}
+        C = {arm: load(r, sched) for arm, r in clean_runs.items() if (r / "predictions.csv").exists()}
+        for arm, p in P.items():
+            ff, fa = p[p.fault == "none"], p[p.fault != "none"]
+            upd = p[p.adapted == True]  # noqa: E712 -- pandas column
+            rows.append(
+                dict(
+                    stream=stream,
+                    arm=arm,
+                    faulty_pct=100 * len(fa) / len(p),
+                    mae_fault_free=_mae(ff),
+                    fs_fault_free=_fs(ff),
+                    mae_faulty=_mae(fa),
+                    fs_faulty=_fs(fa),
+                    withheld=int(p.gated_frame.sum()),
+                    withheld_faulty_pct=100 * float(p.gated_frame[p.fault != "none"].mean()) if len(fa) else np.nan,
+                    updates=len(upd),
+                    updates_on_faulty=int((upd.fault != "none").sum()),
+                )
+            )
+        pairs = [
+            ("ungated", "static", "faulty"),
+            ("gated", "static", "faulty"),
+            ("gated", "ungated", "faulty"),
+            ("gated", "ungated", "fault-free"),
+        ]
+        for a, b, frames_ in pairs:
+            pa, pb = P[a], P[b]
+            m = (pa.fault != "none") if frames_ == "faulty" else (pa.fault == "none")
+            mb = (pb.fault != "none") if frames_ == "faulty" else (pb.fault == "none")
+            c = contrast(_daily_on(pa[m]), _daily_on(pb[mb]), tag=f"dose-{stream}-{a}-{b}-{frames_}")
+            contrasts.append(
+                dict(
+                    stream=stream,
+                    a=a,
+                    b=b,
+                    frames=frames_,
+                    **{k: c[k] for k in ("dfs", "dfs_lo", "dfs_hi", "rel", "rel_lo", "rel_hi", "p", "n_days")},
+                )
+            )
+        if "ungated" in C:  # contamination: ungated on this stream vs the clean-stream damped run, same frames
+            pa, pb = P["ungated"], C["ungated"]
+            c = contrast(
+                _daily_on(pa[pa.fault == "none"]), _daily_on(pb[pb.fault == "none"]), tag=f"dose-{stream}-contamination"
+            )
+            contrasts.append(
+                dict(
+                    stream=stream,
+                    a="ungated",
+                    b="clean-stream ungated",
+                    frames="fault-free",
+                    **{k: c[k] for k in ("dfs", "dfs_lo", "dfs_hi", "rel", "rel_lo", "rel_hi", "p", "n_days")},
+                )
+            )
+
+        if stream in CONT_WINDOW:
+            lo, hi = CONT_WINDOW[stream]
+            sc = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+            sc["day"] = sc.timestamp.str[:8]
+            t = pd.to_datetime(sc.day, format="%Y%m%d")
+            lo_t, hi_t = pd.to_datetime(lo), pd.to_datetime(hi)
+            phase = np.where(
+                t < lo_t - pd.Timedelta(days=14),
+                "earlier",
+                np.where(
+                    t < lo_t,
+                    "14 d before",
+                    np.where(t <= hi_t, "during", np.where(t <= hi_t + pd.Timedelta(days=14), "14 d after", "later")),
+                ),
+            )
+            for ph, g in sc.groupby(phase):
+                alerts.append(
+                    dict(
+                        stream=stream,
+                        phase=ph,
+                        frames=len(g),
+                        excluded_pct=100 * g.excluded.mean(),
+                        maint_alert_pct=100 * g.maint_alert.mean(),
+                    )
+                )
+            for arm, p in P.items():
+                fa = p[p.fault != "none"].copy()
+                if fa.empty:
+                    continue
+                fa["date"] = pd.to_datetime(fa.timestamp.str[:8], format="%Y%m%d")
+                fa["week"] = fa.date.dt.isocalendar().week.astype(int)
+                for wk, g in fa.groupby("week"):
+                    weekly.append(
+                        dict(
+                            stream=stream,
+                            arm=arm,
+                            week=wk,
+                            frames=len(g),
+                            mae_faulty=_mae(g),
+                            fs_faulty=_fs(g),
+                            withheld_pct=100 * float(g.gated_frame.mean()),
+                        )
+                    )
+                # first vs last two weeks of the fault, and the clean-stream run on the same dates
+                days = sorted(fa.timestamp.str[:8].unique())
+                first, last = fa[fa.timestamp.str[:8].isin(days[:14])], fa[fa.timestamp.str[:8].isin(days[-14:])]
+                cl = C.get(arm)
+                ref_first = ref_last = np.nan
+                if cl is not None:
+                    ref_first = _mae(cl[cl.timestamp.str[:8].isin(days[:14])])
+                    ref_last = _mae(cl[cl.timestamp.str[:8].isin(days[-14:])])
+                phases.append(
+                    dict(
+                        stream=stream,
+                        arm=arm,
+                        mae_first_2wk=_mae(first),
+                        mae_last_2wk=_mae(last),
+                        clean_ref_first_2wk=ref_first,
+                        clean_ref_last_2wk=ref_last,
+                        withheld_first_2wk_pct=100 * float(first.gated_frame.mean()),
+                        withheld_last_2wk_pct=100 * float(last.gated_frame.mean()),
+                    )
+                )
+
+    pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_dose.csv", index=False)
+    pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_dose_contrasts.csv", index=False)
+    pd.DataFrame(weekly).to_csv(TABLES / "ch4_admissibility_dose_weekly.csv", index=False)
+    pd.DataFrame(alerts).to_csv(TABLES / "ch4_admissibility_dose_alerts.csv", index=False)
+    pd.DataFrame(phases).to_csv(TABLES / "ch4_admissibility_dose_phases.csv", index=False)
+    pd.set_option("display.width", 250)
+    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(pd.DataFrame(alerts).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(phases).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+
+
 if __name__ == "__main__":
     cli()
