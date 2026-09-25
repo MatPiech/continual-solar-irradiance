@@ -537,7 +537,7 @@ def monitor_grid(n: int = 24, cols: int = 6) -> None:
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
     rows = (len(top) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.04 * rows))
+    fig, axes = plt.subplots(rows, cols, figsize=(7.6, rows * 7.6 / cols * 1.12))  # square panels plus a label line
     for ax, r in zip(axes.flat, top.itertuples(), strict=False):
         img = data.dataset[where[r.timestamp]][0]
         ax.imshow(((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
