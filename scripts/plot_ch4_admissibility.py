@@ -100,7 +100,7 @@ def detection() -> None:
     if t is None:
         return
     # the §6 split rows have their own figure below; the palette has six slots and this one needs six
-    t = t[~t.detector.str.startswith("local,")]
+    t = t[~t.detector.str.startswith(("local,", "exclusion"))]
     detectors = list(dict.fromkeys(t.detector))
     faults = ["soiling", "droplets", "occlusion"]
     t = t.assign(fault=t.fault.where(~t.fault.str.startswith("none"), "clean\n(false alarms)"))

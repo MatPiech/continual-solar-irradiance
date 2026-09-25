@@ -342,3 +342,35 @@ far more opaque than the real frames that motivated them. Changed before scoring
 0.8–1.25 (was 0.6–1.5) and row noise σ 0.03 (was 0.04); wet-dome droplet radius 1–3 px (was 1–4),
 each droplet blending 60 % refracted and 40 % original sky, dark rim at 25 % (was fully refracted,
 40 % rim). No statistic, threshold or criterion changed. `scripts/fit_monitor.py` implements §7.
+
+### 7.1 Result: exclusion flag PASSES, maintenance alert FAILS
+
+Thresholds on 2014–15 calibration: $t_G$ 1.1134, $t_C$ 1.5299 (union flags 0.97 % of calibration
+frames), maintenance 1.0112. Verdict: `tables/ch4_admissibility_monitor_verdict.json`.
+
+**Criterion 1 (exclusion): PASS.** Probe of 3,070 frames per condition: banding 85.4 % flagged,
+occlusion (bird) 79.2 %, clean 2016 frames 1.2 % (bars ≥ 50 %, ≥ 50 %, ≤ 2 %). Insects 33.0 %
+(AUROC 0.94). The two statistics split the work as designed: the global median catches banding
+(79.6 %), the core max catches occlusion (78.6 %) and insects (32.4 %).
+
+**Criterion 2 (maintenance): FAIL**, on detection and on false alerts; the separation holds.
+
+- Wet dome: 7 of 19 episodes alerted, 5 of them within 90 min (bar 19 of 19). The wet-dome frames
+  are ranked well (probe AUROC 0.92 for E) but their 60-min median of $G$ mostly stays below
+  threshold.
+- Soiling: 2 of 4 within 2 h (both at 0 min on the first frame of the day, with no alert in the
+  preceding 30 min, so they count); one after 54 h, one never.
+- Fault-free frames: 3.92 % carry a maintenance alert (bar 1 %); 76 of 362 clean days. The
+  2014–15 threshold does not hold on 2016 (clean exclusion rate 1.26 % against 0.97 % on
+  calibration; maintenance 3.9 % against 1 %) — the inter-year drift of §5, now in the median.
+  Real wet-dome, bird and banding frames in the "fault-free" stream contribute an unknown share.
+- Separation: the maintenance alert fires during 3.0 % of short-term episodes (bar ≤ 10 % ✓):
+  0.8 % of banding frames, 2.9 % of bird frames, 5.0 % of insect frames.
+
+**Exclusion in series with the damped policy (reported).** Clean stream: E withholds 2,942 frames
+(1.2 %); ΔFS −0.05 [−0.10, −0.005], MAE −0.09 %. Corrupted stream: the faults cost the ungated
+policy ΔFS −0.06 [−0.16, +0.02] (not significant); E cuts the updates made on faulty frames by a
+third (4,423 → 2,938) and changes fault-free-frame skill by ΔFS −0.05 [−0.10, −0.006] with MAE
+−0.18 % [−0.28, −0.10]. Against the §4 Isolation Forest gate (ΔFS −0.15 to −0.16), E costs a third
+as much skill and improves MAE; neither effect is large, because faults with valid labels do not
+damage the policy in the first place.
