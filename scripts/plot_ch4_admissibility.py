@@ -358,7 +358,7 @@ def fault_mosaic() -> None:
     label = {k: k.replace("_edge", "\n(at rim)").replace("_", " ") for k in kinds}
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
-    fig, axes = plt.subplots(len(picks), len(kinds) + 1, figsize=(7.6, 0.95 * len(picks) + 0.35))
+    fig, axes = plt.subplots(len(picks), len(kinds) + 1, figsize=(7.6, 1.02 * len(picks) + 0.15))
     for row, ts in enumerate(picks):
         key = ts if ts in where else min(where, key=lambda t: abs(int(t[9:13]) - int(ts[9:13])) if t[:8] == ts[:8] else 9e9)
         img = data.dataset[where[key]][0]
@@ -368,8 +368,7 @@ def fault_mosaic() -> None:
             ax.axis("off")
             if row == 0:
                 ax.set_title("clean" if k is None else label[k], fontsize=6, color=INK, pad=2)
-    fig.suptitle("Synthetic sensing-path faults rendered onto real Folsom 2016 frames", fontsize=7.5, y=1.0)
-    fig.subplots_adjust(wspace=0.03, hspace=0.03, left=0.005, right=0.995, top=0.86, bottom=0.005)
+    fig.subplots_adjust(wspace=0.02, hspace=0.02, left=0.002, right=0.998, top=0.93, bottom=0.002)
     save(fig, "ch4_admissibility_fault_mosaic")
 
 
@@ -538,7 +537,7 @@ def monitor_grid(n: int = 48, cols: int = 8) -> None:
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
     rows = (len(top) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.08 * rows + 0.3))
+    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.04 * rows))
     for ax, r in zip(axes.flat, top.itertuples(), strict=False):
         img = data.dataset[where[r.timestamp]][0]
         ax.imshow(((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
@@ -555,13 +554,7 @@ def monitor_grid(n: int = 48, cols: int = 8) -> None:
         ax.axis("off")
     for ax in list(axes.flat)[len(top) :]:
         ax.axis("off")
-    fig.suptitle(
-        f"The {len(top)} real 2016 frames the exclusion flag ranks highest (one per day); score / threshold, "
-        "G = global median fired, C = core max fired (box = cell)",
-        fontsize=6.5,
-        y=1.0,
-    )
-    fig.subplots_adjust(wspace=0.04, hspace=0.22, left=0.01, right=0.99, top=0.95, bottom=0.01)
+    fig.subplots_adjust(wspace=0.02, hspace=0.16, left=0.002, right=0.998, top=0.97, bottom=0.002)
     save(fig, "ch4_admissibility_monitor_grid")
 
 
