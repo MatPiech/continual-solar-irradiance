@@ -271,3 +271,67 @@ acquisition faults with horizontal banding (4) or birds on the dome (3); the ban
 the rim puts two birds and a person over the camera in its top 3. Figures `local_top_global`,
 `local_top_core3`. Testing either statistic requires a new pre-registration (§7) with a synthetic
 acquisition fault.
+
+## 7. Two-channel monitor: exclusion from adaptation and a maintenance alert — pre-registered design (fixed 2026-09-25, before any scoring)
+
+**Motivation (post hoc, stated as such).** Inspection of real 2016 frames after §6 (figures
+`local_top_global`, `local_top_core3`) showed that sensing-path events differ in *footprint* and
+*duration*, and that each needs a different response (Mateusz's operational framing):
+
+- *short-term* events — acquisition faults (horizontal banding), birds and insects on the dome —
+  last one frame to tens of minutes; the frame is useless as training evidence, so the update
+  policy should **exclude** it, and nobody needs to be called out;
+- *persistent* faults — water droplets on the dome, soiling — last hours to days and do not go away
+  by themselves; they call for a **maintenance alert** (clean the dome).
+
+Illumination events (low sun, reflections) sit on the rim and are neither. No annotated frames are
+used: every test is on synthetic faults, as in §5–§6.
+
+**Statistics.** From the per-cell normalised distances $z$ of §6 (unchanged features, bank,
+normalisation and calibration frames):
+
+- *global* $G$ = median of $z$ over all 172 cells — frame-wide departures (banding, a bird covering
+  the dome, a wet dome);
+- *core* $C$ = max of $z$ over the 72 cells at chessboard depth ≥ 3 from the field-of-view border —
+  compact objects away from the rim (insects, a person over the camera).
+
+**Exclusion flag** $E = [G > t_G] \lor [C > t_C]$, with $t_G$, $t_C$ the 99.5th percentiles of $G$
+and $C$ on the same 3,000 calibration frames (nominal union rate ≤ 1 %). A flagged frame is
+withheld from the update policy (the `--anomaly-gate` path of Algorithm 1), nothing else.
+
+**Maintenance alert** $M$: causal rolling median of $G$ over the preceding **60 minutes** of the
+same day, thresholded at its 99th percentile on the same 30 calibration days. A 60-minute median
+cannot be moved by an event shorter than 30 minutes, which is what separates the two channels.
+
+**Synthetic faults** (rendered onto clean 2016 frames like §5's, seeded per episode):
+
+| kind | stands for | rendering | episodes (stream) |
+|---|---|---|---|
+| `banding` | acquisition fault | 6–20 horizontal bands, 1–6 px high, each with a per-channel gain of 0.6–1.5 and row noise; redrawn every frame | 40 × 1–5 min |
+| `occlusion` | bird (existing §5 fault) | dark ellipse, 8–22 % of the image | 60 × 5–30 min |
+| `insect` | insect on the dome | dark body 1.5–3.5 px with six legs 3–6 px long, within 0.6 of the radius, drifting 0–1 px per frame | 40 × 2–15 min |
+| `wet_dome` | droplets on the dome | 150–350 droplets of radius 1–4 px, uniform over the dome, each a blurred, brightened lens with a dark rim; 80 % of droplets persist within the episode, 20 % redrawn per frame | 20 × 60–240 min |
+| `soiling` | soiling (existing §5 fault) | as §5 | 4 × 1–3 days |
+
+The stream schedule uses seed 1 and the same non-overlap rule as §5 (kinds in the order of the
+table get precedence: soiling, wet_dome, occlusion, banding, insect). The §5 `droplets` fault is
+not part of this stream: it is sparse (20–40 spots) and real wet-dome frames look like `wet_dome`.
+
+**Pass criteria.**
+
+1. *Exclusion* (frame level, detection probe of §5, 3,070 frames per condition): $E$ flags at least
+   50 % of `banding` frames and at least 50 % of `occlusion` frames, and at most 2 % of clean 2016
+   frames. `insect` is reported without a bar (at 128 × 128 an insect is a few pixels).
+2. *Maintenance* (corrupted 2016 stream): $M$ fires within 90 minutes of onset in every `wet_dome`
+   episode and within 2 hours in every `soiling` episode, whose statistic must not already be above
+   threshold in the 30 minutes before onset (an alert that is already on does not count as a
+   detection); $M$ fires on at most 1 % of fault-free frames; and $M$ fires during at most 10 % of
+   short-term episodes (`banding`, `occlusion`, `insect`).
+
+**Reported, not criteria.**
+
+- *The exclusion flag in series with the policy*: the damped policy (layer3+4, encoder lr 1e-6) on
+  the §7 corrupted stream without and with $E$ as its gate, and on the clean 2016 stream with $E$
+  (against the existing ungated clean run); $\Delta$FS with the 95 % day-block bootstrap, MAE on
+  fault-free frames, updates made on faulty frames, and frames withheld.
+- On the clean 2016 stream: the rate of $E$ and $M$, and the top frames per day for $G$, $C$ and $M$.
