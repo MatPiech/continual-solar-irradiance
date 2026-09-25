@@ -40,9 +40,13 @@ from tqdm import tqdm
 
 from cirr.data.loading import DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD
 
-KINDS = ("soiling", "droplets", "occlusion")
+KINDS = ("soiling", "occlusion")
 EDGE_KINDS = ("soiling_edge", "occlusion_edge")  # the same faults at the rim (docs/CH4_ADMISSIBILITY.md §6)
-MONITOR_KINDS = ("banding", "insect", "wet_dome")  # the new faults of §7
+MONITOR_KINDS = ("banding", "insect")  # the faults of §7
+# Retired on 2026-09-25 after the §7 verdict: "droplets" (§5, too sparse to see at 128 px) and
+# "wet_dome" (§7).  corrupt() still renders them so the scored streams stay reproducible; no probe,
+# schedule or figure uses them.
+RETIRED_KINDS = ("droplets", "wet_dome")
 _MEAN = torch.tensor(DEFAULT_IMAGE_MEAN).view(3, 1, 1)
 _STD = torch.tensor(DEFAULT_IMAGE_STD).view(3, 1, 1)
 
@@ -84,9 +88,50 @@ def _rng(*parts: object) -> np.random.Generator:
     return np.random.default_rng(int(hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:15], 16))
 
 
-def _disc(h: int, w: int, cy: float, cx: float, ry: float, rx: float) -> torch.Tensor:
+def _disc(h: int, w: int, cy: float, cx: float, ry: float, rx: float, angle: float = 0.0) -> torch.Tensor:
+    """Filled ellipse, optionally rotated by ``angle`` radians."""
     y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
-    return (((y - cy) / ry) ** 2 + ((x - cx) / rx) ** 2 <= 1.0).float()
+    dy, dx = y - cy, x - cx
+    if angle:
+        c, s = float(np.cos(angle)), float(np.sin(angle))
+        dy, dx = dy * c - dx * s, dy * s + dx * c
+    return ((dy / ry) ** 2 + (dx / rx) ** 2 <= 1.0).float()
+
+
+# occluder appearance (docs/CH4_ADMISSIBILITY.md §7 amendment): colour and shape drawn per episode
+OCCLUDER_COLOURS = {
+    "black": (0.05, 0.05, 0.05),  # bird silhouette against the sky
+    "brown": (0.35, 0.24, 0.14),  # bird, leaf
+    "light": (0.85, 0.84, 0.80),  # bird underside, paper
+    "green": (0.20, 0.33, 0.14),  # leaf, branch
+}
+OCCLUDER_SHAPES = ("ellipse", "rotated", "blob", "bar")
+
+
+def _occluder(
+    rng: np.random.Generator, h: int, w: int, cy: float, cx: float
+) -> tuple[torch.Tensor, tuple[float, float, float]]:
+    """Mask and colour of one occluder: shape and colour drawn from the episode generator."""
+    shape = OCCLUDER_SHAPES[int(rng.integers(len(OCCLUDER_SHAPES)))]
+    colour = OCCLUDER_COLOURS[list(OCCLUDER_COLOURS)[int(rng.integers(len(OCCLUDER_COLOURS)))]]
+    ry, rx = rng.uniform(0.08, 0.22, 2) * (h, w)
+    if shape == "ellipse":
+        mask = _disc(h, w, cy, cx, ry, rx)
+    elif shape == "rotated":
+        mask = _disc(h, w, cy, cx, ry, rx * rng.uniform(0.4, 0.7), rng.uniform(0, np.pi))
+    elif shape == "blob":  # 3-4 overlapping lobes around the centre
+        mask = torch.zeros(h, w)
+        for _ in range(int(rng.integers(3, 5))):
+            oy, ox = rng.uniform(-0.5, 0.5, 2) * (ry, rx)
+            mask = torch.maximum(
+                mask,
+                _disc(h, w, cy + oy, cx + ox, ry * rng.uniform(0.4, 0.8), rx * rng.uniform(0.4, 0.8), rng.uniform(0, np.pi)),
+            )
+    else:  # bar: a thin elongated occluder (branch, cable, feather)
+        mask = _disc(
+            h, w, cy, cx, max(ry, rx) * rng.uniform(1.2, 1.8), min(ry, rx) * rng.uniform(0.15, 0.3), rng.uniform(0, np.pi)
+        )
+    return mask, colour
 
 
 def _edge_centre(rng: np.random.Generator, h: int, w: int) -> tuple[float, float]:
@@ -123,9 +168,9 @@ def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.T
         pix = pix * (1 - mask) + (blurred * 1.15).clamp(0, 1) * mask
     elif kind in ("occlusion", "occlusion_edge"):
         cy, cx = _edge_centre(ep, h, w) if kind == "occlusion_edge" else ep.uniform(0.25, 0.75, 2) * (h, w)
-        ry, rx = ep.uniform(0.08, 0.22, 2) * (h, w)
-        alpha = 0.9 * TF.gaussian_blur(_disc(h, w, cy, cx, ry, rx)[None], 5, 1.5)[0]
-        pix = pix * (1 - alpha) + 0.05 * alpha
+        mask, colour = _occluder(ep, h, w, cy, cx)
+        alpha = float(ep.uniform(0.85, 0.95)) * TF.gaussian_blur(mask[None], 5, 1.5)[0]
+        pix = pix * (1 - alpha) + torch.tensor(colour).view(3, 1, 1) * alpha
     elif kind == "banding":  # acquisition fault (§7): redrawn every frame
         fr = _rng(kind, episode, frame)
         gain = torch.ones(3, h, 1)
@@ -203,9 +248,9 @@ def build_schedule(timestamps: list[str], seed: int = 0) -> pd.DataFrame:
 
 
 # §7 stream: kinds in precedence order, with (episodes, min minutes, max minutes)
-MONITOR_EPISODES = (("wet_dome", 20, 60, 240), ("occlusion", 60, 5, 30), ("banding", 40, 1, 5), ("insect", 40, 2, 15))
+MONITOR_EPISODES = (("occlusion", 60, 5, 30), ("banding", 40, 1, 5), ("insect", 40, 2, 15))
 SHORT_TERM = ("banding", "occlusion", "insect")  # excluded from adaptation; should not raise the maintenance alert
-PERSISTENT = ("wet_dome", "soiling")  # should raise the maintenance alert
+PERSISTENT = ("soiling",)  # should raise the maintenance alert
 
 
 def build_monitor_schedule(timestamps: list[str], seed: int = 1) -> pd.DataFrame:

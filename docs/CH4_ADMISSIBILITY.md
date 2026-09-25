@@ -374,3 +374,12 @@ third (4,423 → 2,938) and changes fault-free-frame skill by ΔFS −0.05 [−0
 −0.18 % [−0.28, −0.10]. Against the §4 Isolation Forest gate (ΔFS −0.15 to −0.16), E costs a third
 as much skill and improves MAE; neither effect is large, because faults with valid labels do not
 damage the policy in the first place.
+
+**Amendment (2026-09-25, after the §7 verdict — affects future runs only).** On Mateusz's
+instruction the synthetic fault set was changed: `droplets` (§5) and `wet_dome` (§7) are retired
+(`RETIRED_KINDS`; still rendered by `corrupt()` so every scored stream reproduces), and the
+occluder now draws a colour (black, brown, light grey, dark green) and a shape (ellipse, rotated
+ellipse, 3–4-lobe blob, thin bar) per episode instead of a black ellipse. The §5–§7 verdicts stand
+as scored with the old faults. With `wet_dome` retired, `PERSISTENT` is soiling only; any re-scoring
+under the new fault set is a new pre-registration, not a revision of §7. Figures
+`ch4_admissibility_fault_mosaic` and `ch4_admissibility_faults` show the new set.

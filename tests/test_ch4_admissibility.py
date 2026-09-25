@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 import torch
 
-from cirr.evaluation.admissibility import KINDS, CorruptedStream, build_schedule, corrupt, nominal_split
+from cirr.evaluation.admissibility import KINDS, RETIRED_KINDS, CorruptedStream, build_schedule, corrupt, nominal_split
 
 
 def _frame(seed: int = 0) -> torch.Tensor:
@@ -48,7 +48,7 @@ def test_schedule_is_deterministic_and_assigns_one_fault_per_frame():
     a, b = build_schedule(stamps, 0), build_schedule(stamps, 0)
     pd.testing.assert_frame_equal(a, b)
     assert a.timestamp.is_unique
-    assert set(a.kind) <= set(KINDS)
+    assert set(a.kind) <= set(KINDS) | set(RETIRED_KINDS)  # the §5 stream keeps its droplets episodes
     assert not build_schedule(stamps, 1).equals(a)
 
 
@@ -199,7 +199,7 @@ def test_monitor_faults_render_inside_the_field_of_view_and_differ_as_designed()
     r = ((y - 63.5) ** 2 + (x - 63.5) ** 2).sqrt() / 63.5
     clean = ((torch.full((3, 128, 128), 0.6) - _MEAN) / _STD) * (r <= 1).float()
     changed = {}
-    for kind in ("banding", "insect", "wet_dome"):
+    for kind in ("banding", "insect", "wet_dome"):  # wet_dome retired but still renderable
         a, b = corrupt(clean, kind, 3, "20160101_120000"), corrupt(clean, kind, 3, "20160101_120100")
         diff = (a - clean).abs().sum(0) > 1e-3
         assert diff[r > 1].sum() == 0, kind  # nothing outside the field of view
@@ -217,7 +217,7 @@ def test_monitor_schedule_orders_kinds_and_never_overlaps():
     ts = [(d + pd.Timedelta(minutes=m)).strftime("%Y%m%d_%H%M%S") for d in days for m in range(420, 1080)]
     s = build_monitor_schedule(ts, seed=1)
     assert s.timestamp.is_unique
-    assert set(s.kind) == {"soiling", "wet_dome", "occlusion", "banding", "insect"}
+    assert set(s.kind) == {"soiling", "occlusion", "banding", "insect"}
     assert s[s.kind == "soiling"].episode.nunique() == 4
 
 
@@ -235,3 +235,19 @@ def test_monitor_statistics_are_median_and_core_max():
     m = gate.monitor(z)
     assert m["core"][0] == 0.5 and m["global"][0] == 0.5
     assert m["global"][1] == 2.0 and m["core"][1] == 2.0
+
+
+def test_occluders_vary_in_colour_and_shape_across_episodes():
+    from cirr.evaluation.admissibility import _MEAN, _STD, corrupt
+
+    y, x = torch.meshgrid(torch.arange(128.0), torch.arange(128.0), indexing="ij")
+    r = ((y - 63.5) ** 2 + (x - 63.5) ** 2).sqrt() / 63.5
+    clean = ((torch.full((3, 128, 128), 0.6) - _MEAN) / _STD) * (r <= 1).float()
+    colours, areas = set(), set()
+    for ep in range(12):
+        out = corrupt(clean, "occlusion", ep, "f")
+        changed = ((out - clean).abs().sum(0) > 0.05) & (r <= 1)
+        pix = (out * _STD + _MEAN).clamp(0, 1)
+        colours.add(tuple((pix[:, changed].mean(1) * 4).round().tolist()))  # coarse colour
+        areas.add(int(changed.sum() // 200))  # coarse area
+    assert len(colours) >= 3 and len(areas) >= 3

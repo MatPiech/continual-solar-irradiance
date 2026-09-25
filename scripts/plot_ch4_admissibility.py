@@ -315,7 +315,7 @@ def faults() -> None:
     """One frame, clean and with each synthetic fault, with the gate's score."""
     import torch
 
-    from cirr.evaluation.admissibility import _MEAN, _STD, anomaly_score, corrupt, load_gate
+    from cirr.evaluation.admissibility import _MEAN, _STD, EDGE_KINDS, KINDS, MONITOR_KINDS, anomaly_score, corrupt, load_gate
     from cirr.evaluation.campaign import SOURCE_CHECKPOINT, load_campaign_days
     from cirr.evaluation.runner import load_eval_model
 
@@ -326,17 +326,19 @@ def faults() -> None:
     model = load_eval_model(Path(SOURCE_CHECKPOINT), "cpu")
     data = load_campaign_days(ROOT / "data" / "folsom_prepared", "0415", 1)
     img, hist, *_, name = data.dataset[data.day_map[data.days[0]][300]]
-    kinds = ("soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge", "banding", "insect", "wet_dome")
+    kinds = KINDS + EDGE_KINDS + MONITOR_KINDS
     variants = [("clean", img)] + [(k.replace("_edge", " (rim)").replace("_", " "), corrupt(img, k, 0, name)) for k in kinds]
-    fig, axes = plt.subplots(3, 3, figsize=(5.4, 6.0))
-    for ax, (label, x) in zip(axes.flat, variants, strict=True):
+    fig, axes = plt.subplots(2, 4, figsize=(7.2, 4.2))
+    for ax in axes.flat[len(variants) :]:
+        ax.axis("off")
+    for ax, (label, x) in zip(axes.flat, variants, strict=False):
         with torch.no_grad():
             s = float(anomaly_score(forest, model.encode_fusion_features(x[None], hist[None]).numpy())[0])
         view = ((x * _STD + _MEAN).clamp(0, 1) * (x.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy()
         ax.imshow(view)
         ax.axis("off")
         verdict = "rejected" if s > meta["threshold"] else "admitted"
-        ax.set_title(f"{label}\nIF score {s:.3f}, {verdict}", fontsize=7, color=INK)
+        ax.set_title(f"{label}: {s:.3f}, {verdict}", fontsize=7, color=INK)
     fig.suptitle(
         f"Synthetic faults and the embedding gate (threshold {meta['threshold']:.3f}, p{meta['percentile']:g})",
         fontsize=8,
