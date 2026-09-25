@@ -383,3 +383,54 @@ ellipse, 3–4-lobe blob, thin bar) per episode instead of a black ellipse. The 
 as scored with the old faults. With `wet_dome` retired, `PERSISTENT` is soiling only; any re-scoring
 under the new fault set is a new pre-registration, not a revision of §7. Figures
 `ch4_admissibility_fault_mosaic` and `ch4_admissibility_faults` show the new set.
+
+## 8. Fault dose and duration — pre-registered design (fixed 2026-09-25, before any scoring)
+
+**Question.** Does input admissibility matter for the update policy, and in which direction? The
+§4 and §7 gate-in-series runs found small effects at one dose (3–4 % of frames faulty), which
+leaves the objection that the faults were too rare. This study varies the dose and the duration
+of synthetic faults, with the damped policy (layer3+4, encoder lr 1e-6), the static model and the
+§7 exclusion flag $E$ (thresholds unchanged, `results/adaptation/gate/monitor/monitor.json`).
+
+**Streams** (Folsom 2016 daylight population; faults rendered by `corrupt()` with the amended
+fault set: soiling, occlusion with varied colour/shape, banding, insect; seeds fixed):
+
+| stream | faults | construction |
+|---|---|---|
+| `r01`, `r05`, `r15` | 1, 5, 15 % of daylight frames faulty | half of the faulty frames from whole-day soiling episodes of 1–3 days, half from short-term episodes in the episode ratio occlusion : banding : insect = 3 : 2 : 2 with §7 durations; episodes added until the budget is met; seed = rate |
+| `cont_soiling` | one soiling episode (one patch set) on every daylight frame from 2016-07-01 to 2016-08-15 inclusive, then "cleaned" | continuous fault with an end |
+| `cont_occluder` | one occluder (one shape, colour and interior position) on every daylight frame from 2016-09-01 to year end | permanent fault |
+
+**Arms per stream** (single seed): *static* (policy with $T_1 = T_2 = \infty$, no updates),
+*damped ungated*, *damped gated* ($E$ withholds flagged frames from updates, Algorithm 1 line 1).
+Clean references are the existing runs (static baseline, damped, damped with $E$).
+
+**Reported per stream.** MAE and forecast skill on fault-free and on faulty frames for each arm;
+day-block bootstrap contrasts (2,000 resamples, 95 % for ΔFS, 90 % for relative MAE): (a) ungated
+vs static on faulty frames, (b) gated vs ungated on faulty and on fault-free frames, (c) ungated
+vs the clean-stream damped run on fault-free frames; frames withheld, updates, updates on faulty
+frames. For the continuous streams additionally: weekly series of faulty-frame MAE per arm, of
+the withheld share and of the maintenance-alert share; faulty-frame MAE in the first vs the last
+two weeks of the fault; alert share in the 14 days before, during, and the 14 days after.
+
+**Predictions** (each is confirmed or refuted; none is a pass criterion for a detector):
+
+- P1 *Contamination stays small*: ungated vs clean on fault-free frames within ±0.10 FS points at
+  every dose.
+- P2 *Adaptation learns around persistent faults*: on faulty frames the ungated policy beats the
+  static model at 5 % and 15 %, by more at 15 % than at 5 %; the gated policy lies between static
+  and ungated.
+- P3 *Exclusion starves adaptation under a continuous fault*: on `cont_soiling` $E$ withholds
+  more than 30 % of faulty frames; the ungated policy's faulty-frame MAE is lower in the last two
+  weeks than in the first two; the gated policy's is not (by less than half the ungated drop).
+- P4 *The maintenance alert follows a continuous fault and clears*: alert share > 50 % of frames
+  during `cont_soiling`, < 5 % in the 14 days before, and back below 5 % within the 14 days after
+  cleaning.
+- P5 *A permanent occluder is the failure case for exclusion*: on `cont_occluder` $E$ withholds
+  more than 50 % of frames from onset to year end and the alert share exceeds 50 %; the ungated
+  policy's faulty-frame MAE converges toward the clean-stream level (last two weeks within 5 % of
+  the clean damped run on the same dates), the gated policy's does not.
+
+**Cost.** Per stream: gate scoring ≈ 12 min GPU; three policy runs ≈ 1.2 h in parallel. Five
+streams across four servers ≈ one evening. Code: `scripts/make_dose_schedules.py`,
+`scripts/fit_monitor.py --schedule … --thresholds …`, `scripts/admissibility_study.py dose`.
