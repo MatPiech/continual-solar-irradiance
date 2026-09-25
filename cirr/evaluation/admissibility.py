@@ -41,6 +41,7 @@ from tqdm import tqdm
 from cirr.data.loading import DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD
 
 KINDS = ("soiling", "droplets", "occlusion")
+EDGE_KINDS = ("soiling_edge", "occlusion_edge")  # the same faults at the rim (docs/CH4_ADMISSIBILITY.md §6)
 _MEAN = torch.tensor(DEFAULT_IMAGE_MEAN).view(3, 1, 1)
 _STD = torch.tensor(DEFAULT_IMAGE_STD).view(3, 1, 1)
 
@@ -87,15 +88,25 @@ def _disc(h: int, w: int, cy: float, cx: float, ry: float, rx: float) -> torch.T
     return (((y - cy) / ry) ** 2 + ((x - cx) / rx) ** 2 <= 1.0).float()
 
 
+def _edge_centre(rng: np.random.Generator, h: int, w: int) -> tuple[float, float]:
+    """A fault centre in the annulus 0.72-0.92 of the field-of-view radius (docs/CH4_ADMISSIBILITY.md §6)."""
+    rho, phi = rng.uniform(0.72, 0.92) * h / 2, rng.uniform(0, 2 * np.pi)
+    return h / 2 + rho * np.sin(phi), w / 2 + rho * np.cos(phi)
+
+
 def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.Tensor:
-    """Apply one synthetic fault to a normalised ``[3, H, W]`` image."""
+    """Apply one synthetic fault to a normalised ``[3, H, W]`` image.
+
+    ``soiling_edge`` and ``occlusion_edge`` are the same faults with their centres
+    placed at the rim of the field of view, where the §6 split discards flags.
+    """
     _, h, w = image.shape
     crop = (image.abs().sum(0, keepdim=True) > 0).float()  # the circular field of view
     pix = (image * _STD + _MEAN).clamp(0, 1)
     ep = _rng(kind, episode)  # fixed for the episode
-    if kind == "soiling":
+    if kind in ("soiling", "soiling_edge"):
         for _ in range(int(ep.integers(3, 7))):
-            cy, cx = ep.uniform(0.2, 0.8, 2) * (h, w)
+            cy, cx = _edge_centre(ep, h, w) if kind == "soiling_edge" else ep.uniform(0.2, 0.8, 2) * (h, w)
             r = float(ep.uniform(0.06, 0.16) * h)
             soft = TF.gaussian_blur(_disc(h, w, cy, cx, r, r * ep.uniform(0.7, 1.3))[None], 9, 3.0)[0]
             alpha = float(ep.uniform(0.45, 0.8)) * soft
@@ -109,8 +120,8 @@ def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.T
             r = float(fr.uniform(2, 5))
             mask = torch.maximum(mask, _disc(h, w, cy, cx, r, r))
         pix = pix * (1 - mask) + (blurred * 1.15).clamp(0, 1) * mask
-    elif kind == "occlusion":
-        cy, cx = ep.uniform(0.25, 0.75, 2) * (h, w)
+    elif kind in ("occlusion", "occlusion_edge"):
+        cy, cx = _edge_centre(ep, h, w) if kind == "occlusion_edge" else ep.uniform(0.25, 0.75, 2) * (h, w)
         ry, rx = ep.uniform(0.08, 0.22, 2) * (h, w)
         alpha = 0.9 * TF.gaussian_blur(_disc(h, w, cy, cx, ry, rx)[None], 5, 1.5)[0]
         pix = pix * (1 - alpha) + 0.05 * alpha
@@ -212,6 +223,19 @@ def valid_cells(image: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.avg_pool2d(fov[None, None], CELL)[0, 0] >= 1.0
 
 
+def edge_cells(cells: torch.Tensor) -> torch.Tensor:
+    """Which valid cells (in scoring order) touch the border of the field of view.
+
+    A valid cell is *edge* when one of its 4-neighbours is outside the mask
+    (docs/CH4_ADMISSIBILITY.md §6): 40 of the 172 cells at 128 x 128.
+    """
+    if cells.dim() != 2:  # a flat cell list has no geometry: everything is interior
+        return torch.zeros(int(cells.sum()), dtype=torch.bool)
+    padded = torch.nn.functional.pad(cells.float(), (1, 1, 1, 1))
+    neighbours = padded[:-2, 1:-1] * padded[2:, 1:-1] * padded[1:-1, :-2] * padded[1:-1, 2:]
+    return (neighbours < 1.0)[cells]
+
+
 @torch.no_grad()
 def local_features(
     model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
@@ -243,6 +267,9 @@ class LocalGate:
     is enough.
     """
 
+    # the three frame scores of §6: max over all, interior or edge cells
+    SPLITS = ("all", "interior", "edge")
+
     def __init__(
         self,
         bank: torch.Tensor,
@@ -250,11 +277,30 @@ class LocalGate:
         scale: torch.Tensor | None = None,
         threshold: float = float("inf"),
         alert_threshold: float = float("inf"),
+        thresholds: dict[str, float] | None = None,
     ):
         self.bank = bank  # [cells, n_bank, 128]
         self.cells = cells  # [16, 16] bool
+        self.edge = edge_cells(cells)  # [cells] bool, scoring order
         self.scale = scale  # [cells] or None before calibration
         self.threshold, self.alert_threshold = threshold, alert_threshold
+        # §6 thresholds: "<split>" for the frame score, "<split>_alert" for the rolling median
+        self.thresholds: dict[str, float] = dict(thresholds or {})
+
+    def normalised(self, feats: torch.Tensor, device: str) -> torch.Tensor:
+        """Per-cell normalised distance ``[N, cells]``: the quantity every frame score is a max of."""
+        return self.distances(feats, device) / self.scale
+
+    def split(self, z: torch.Tensor | np.ndarray) -> dict[str, np.ndarray]:
+        """Frame score and blamed cell for each split of §6, from the per-cell matrix."""
+        z = torch.as_tensor(np.asarray(z, dtype=np.float32))
+        masks = {"all": torch.ones_like(self.edge), "interior": ~self.edge, "edge": self.edge}
+        out: dict[str, np.ndarray] = {}
+        for name, m in masks.items():
+            idx = torch.nonzero(m).flatten()
+            worst, where = z[:, idx].max(1)
+            out[name], out[f"{name}_cell"] = worst.numpy(), idx[where].numpy()
+        return out
 
     @torch.no_grad()
     def distances(self, feats: torch.Tensor, device: str, chunk: int = 256) -> torch.Tensor:
@@ -280,6 +326,7 @@ class LocalGate:
             scale=self.scale.numpy(),
             threshold=self.threshold,
             alert_threshold=self.alert_threshold,
+            thresholds=json.dumps(self.thresholds),
             meta=json.dumps(meta),
         )
 
@@ -292,6 +339,7 @@ class LocalGate:
             torch.from_numpy(z["scale"]),
             float(z["threshold"]),
             float(z["alert_threshold"]),
+            json.loads(str(z["thresholds"])) if "thresholds" in z else None,  # §5 files predate the split
         )
 
 
@@ -314,21 +362,19 @@ def iter_local_features(
         hook.remove()
 
 
-def local_scores(
-    model: Any, dataset: Any, indices: list[int], gate: LocalGate, device: str, workers: int = 8
-) -> tuple[np.ndarray, np.ndarray]:
-    """Frame score and blamed cell for every frame, scored batch by batch.
+def local_scores(model: Any, dataset: Any, indices: list[int], gate: LocalGate, device: str, workers: int = 8) -> np.ndarray:
+    """Per-cell normalised distances ``[N, cells]`` (float16) for every frame, scored batch by batch.
 
     A full stream's features are ~11 GB (245k frames x 172 cells x 128); holding them
     and then forking DataLoader workers from that process got the job killed, so a
-    stream is never materialised.
+    stream is never materialised.  The per-cell matrix is 84 MB and is kept, so any
+    split of the cells (§6) can be scored again without a GPU.
     """
-    scores, cells = [], []
-    for feats in iter_local_features(model, dataset, indices, gate.cells, device, workers):
-        sc, c = gate.score(feats, device)
-        scores.append(sc)
-        cells.append(c)
-    return np.concatenate(scores), np.concatenate(cells)
+    parts = [
+        gate.normalised(feats, device).half().numpy()
+        for feats in iter_local_features(model, dataset, indices, gate.cells, device, workers)
+    ]
+    return np.concatenate(parts) if parts else np.zeros((0, int(gate.cells.sum())), np.float16)
 
 
 def alert_statistic(timestamps: pd.Series, scores: np.ndarray, minutes: int = 30) -> np.ndarray:

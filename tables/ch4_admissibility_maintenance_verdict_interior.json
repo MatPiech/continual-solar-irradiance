@@ -1,0 +1,14 @@
+{
+  "split": "interior",
+  "criterion_1_frame_level": "FAIL",
+  "soiling_flagged_pct": 21.693811074918568,
+  "occlusion_flagged_pct": 62.21498371335505,
+  "dark_pixel_soiling_pct": 0.5863192182410424,
+  "dark_pixel_occlusion_pct": 22.866449511400653,
+  "criterion_2_maintenance": "FAIL",
+  "soiling_episodes_alerted_within_2h": 3,
+  "soiling_episodes": 4,
+  "fault_free_alert_pct": 1.5932074835664924,
+  "soiling_edge_flagged_pct": 10.19543973941368,
+  "occlusion_edge_flagged_pct": 40.19543973941368
+}

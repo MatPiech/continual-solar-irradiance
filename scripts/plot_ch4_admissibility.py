@@ -99,6 +99,8 @@ def detection() -> None:
     t = table("ch4_admissibility_detection")
     if t is None:
         return
+    # the §6 split rows have their own figure below; the palette has six slots and this one needs six
+    t = t[~t.detector.str.startswith("local,")]
     detectors = list(dict.fromkeys(t.detector))
     faults = ["soiling", "droplets", "occlusion"]
     t = t.assign(fault=t.fault.where(~t.fault.str.startswith("none"), "clean\n(false alarms)"))
@@ -146,6 +148,93 @@ def detection() -> None:
         *axes[0].get_legend_handles_labels(), loc="upper center", ncol=len(detectors), fontsize=6.5, bbox_to_anchor=(0.5, 1.08)
     )
     save(fig, "ch4_admissibility_detection")
+
+
+def detection_split() -> None:
+    """§6: the local detector over all, interior and edge cells against the dark-pixel baseline, five faults."""
+    t = table("ch4_admissibility_detection")
+    if t is None or not t.detector.str.startswith("local,").any():
+        return
+    keep = ["dark-pixel fraction", "local (layer2, per cell)", "local, interior cells", "local, edge cells"]
+    t = t[t.detector.isin(keep)]
+    labels = dict(
+        zip(keep, ["dark-pixel fraction", "local, all cells", "local, interior cells", "local, edge cells"], strict=True)
+    )
+    faults = ["soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge"]
+    pretty = {"soiling_edge": "soiling\n(at rim)", "occlusion_edge": "occlusion\n(at rim)", "clean": "clean\n(false alarms)"}
+    t = t.assign(fault=t.fault.where(~t.fault.str.startswith("none"), "clean"))
+    fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6), gridspec_kw={"width_ratios": [6, 5]})
+    width = 0.84 / len(keep)
+    panels = [
+        ("flagged_pct", ["clean"] + faults, "frames flagged at the 1 % threshold (%)", 70),
+        ("auroc", faults, "AUROC, faulty vs clean frames", 1.08),
+    ]
+    for panel, (col, groups, ylabel, ymax) in zip(axes, panels, strict=True):
+        for i, det in enumerate(keep):
+            d = t[t.detector == det].set_index("fault")
+            vals = [float(d.loc[f, col]) if f in d.index else np.nan for f in groups]
+            x = np.arange(len(groups)) + (i - (len(keep) - 1) / 2) * width
+            bars = panel.bar(
+                x,
+                vals,
+                width * 0.92,
+                color=SERIES[i],
+                label=labels[det],
+                hatch="////" if det.startswith("dark") else None,
+                edgecolor="white",
+                linewidth=0,
+            )
+            for b, v in zip(bars, vals, strict=True):
+                if np.isfinite(v):
+                    panel.text(
+                        b.get_x() + b.get_width() / 2,
+                        v + ymax * 0.01,
+                        f"{v:.1f}" if col == "flagged_pct" else f"{v:.2f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=5.5,
+                        color=INK,
+                        rotation=90,
+                    )
+        panel.set_xticks(range(len(groups)), [pretty.get(g, g) for g in groups], fontsize=6.5)
+        panel.set_ylabel(ylabel)
+        panel.set_ylim(0, ymax)
+        panel.grid(axis="y", lw=0.4, color="#e6e6e6")
+    axes[0].axhline(1.0, color=GREY, lw=0.8, ls="--")
+    axes[0].axhline(50.0, color=GREY, lw=0.8, ls=":")
+    axes[0].text(len(panels[0][1]) - 0.5, 50.8, "criterion 1", fontsize=6, color=MUTED, va="bottom", ha="right")
+    axes[1].axhline(0.5, color=GREY, lw=0.8, ls="--")
+    fig.legend(
+        *axes[0].get_legend_handles_labels(), loc="upper center", ncol=len(keep), fontsize=6.5, bbox_to_anchor=(0.5, 1.08)
+    )
+    save(fig, "ch4_admissibility_detection_split")
+
+
+def geometry() -> None:
+    """§6: solar elevation and distance to the sun of the clean-stream flags, interior against edge."""
+    t = table("ch4_admissibility_geometry")
+    if t is None:
+        return
+    splits = [("edge", SERIES[1]), ("interior", SERIES[2])]
+    fig, axes = plt.subplots(1, 3, figsize=(7.6, 2.3))
+    bins_el, bins_d, bins_h = np.arange(0, 80, 5), np.arange(0, 12.5, 0.5), np.arange(5, 21)
+    for split, color in splits:
+        g = t[t.split == split]
+        label = f"{split} flags (n = {len(g)})"
+        axes[0].hist(g.elevation_deg, bins=bins_el, density=True, histtype="step", color=color, lw=1.4, label=label)
+        axes[1].hist(g.sun_distance_cells.dropna(), bins=bins_d, density=True, histtype="step", color=color, lw=1.4)
+        axes[2].hist(g.hour, bins=bins_h, density=True, histtype="step", color=color, lw=1.4)
+    axes[0].axvline(20, color=GREY, lw=0.8, ls="--")
+    axes[1].axvline(2, color=GREY, lw=0.8, ls="--")
+    axes[0].set_xlabel("solar elevation (°)")
+    axes[1].set_xlabel("blamed cell to sun (cells)")
+    axes[2].set_xlabel("hour of day")
+    axes[0].set_ylabel("density")
+    for ax in axes:
+        ax.grid(axis="y", lw=0.4, color="#e6e6e6")
+    fig.legend(*axes[0].get_legend_handles_labels(), loc="upper center", ncol=2, fontsize=7, bbox_to_anchor=(0.5, 1.06))
+    fig.tight_layout()
+    save(fig, "ch4_admissibility_geometry")
 
 
 def crosssite() -> None:
@@ -237,8 +326,9 @@ def faults() -> None:
     model = load_eval_model(Path(SOURCE_CHECKPOINT), "cpu")
     data = load_campaign_days(ROOT / "data" / "folsom_prepared", "0415", 1)
     img, hist, *_, name = data.dataset[data.day_map[data.days[0]][300]]
-    variants = [("clean", img)] + [(k, corrupt(img, k, 0, name)) for k in ("soiling", "droplets", "occlusion")]
-    fig, axes = plt.subplots(1, 4, figsize=(7.2, 2.1))
+    kinds = ("soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge")
+    variants = [("clean", img)] + [(k.replace("_edge", " (rim)"), corrupt(img, k, 0, name)) for k in kinds]
+    fig, axes = plt.subplots(1, 6, figsize=(7.2, 1.6))
     for ax, (label, x) in zip(axes, variants, strict=True):
         with torch.no_grad():
             s = float(anomaly_score(forest, model.encode_fusion_features(x[None], hist[None]).numpy())[0])
@@ -284,6 +374,9 @@ def maintenance() -> None:
         ax.plot(x, g.score, color=GREY, lw=0.5, label="frame score")
         ax.plot(x, g.alert_stat, color=SERIES[0], lw=1.4, label="30-min alert statistic")
         ax.axhline(meta["alert_threshold"], color=INK, lw=0.8, ls="--", label="alert threshold")
+        if "interior_alert_stat" in g:  # the §6 split
+            ax.plot(x, g.interior_alert_stat, color=SERIES[2], lw=1.2, label="interior alert statistic")
+            ax.axhline(meta["thresholds"]["interior_alert"], color=SERIES[2], lw=0.8, ls=":", label="interior threshold")
         starts = [0] + [i for i in range(1, len(g)) if g.day[i] != g.day[i - 1]]
         ax.set_xticks(starts, [f"{g.day[i][4:6]}-{g.day[i][6:8]}" for i in starts])
         ax.set_ylabel("score")
@@ -296,9 +389,13 @@ def maintenance() -> None:
 
 
 def local_top() -> None:
-    """The real 2016 frames the local gate scores highest, one per day, with the blamed cell outlined."""
-    t = table("ch4_admissibility_local_top")
-    if t is None:
+    """The real 2016 frames the local gate scores highest, one per day, with the blamed cell outlined.
+
+    One figure per split of §6 (all / interior / edge cells), from the matching top table.
+    """
+    tables = {s: table(f"ch4_admissibility_local_top{'' if s == 'all' else '_' + s}") for s in ("all", "interior", "edge")}
+    tables = {s: t for s, t in tables.items() if t is not None}
+    if not tables:
         return
     from matplotlib.patches import Rectangle
 
@@ -309,26 +406,32 @@ def local_top() -> None:
     rows_cols = np.argwhere(gate.cells.numpy())  # the order cells are scored in
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
-    n = len(t)
-    fig, axes = plt.subplots(2, (n + 1) // 2, figsize=(7.2, 2.9))
-    for ax, r in zip(axes.flat, t.itertuples(), strict=False):
-        img = data.dataset[where[r.timestamp]][0]
-        view = ((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy()
-        ax.imshow(view)
-        cy, cx = rows_cols[int(r.cell)]
-        ax.add_patch(Rectangle((cx * 8 - 0.5, cy * 8 - 0.5), 8, 8, fill=False, ec="#e34948", lw=1.2))
-        ax.set_title(
-            f"{r.timestamp[4:6]}-{r.timestamp[6:8]} {r.timestamp[9:11]}:{r.timestamp[11:13]}  {r.score:.1f}",
-            fontsize=6,
-            color=INK,
+    for split, t in tables.items():
+        n = len(t)
+        fig, axes = plt.subplots(2, (n + 1) // 2, figsize=(7.2, 2.9))
+        for ax, r in zip(axes.flat, t.itertuples(), strict=False):
+            img = data.dataset[where[r.timestamp]][0]
+            view = ((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy()
+            ax.imshow(view)
+            cy, cx = rows_cols[int(r.cell)]
+            ax.add_patch(Rectangle((cx * 8 - 0.5, cy * 8 - 0.5), 8, 8, fill=False, ec="#e34948", lw=1.2))
+            ax.set_title(
+                f"{r.timestamp[4:6]}-{r.timestamp[6:8]} {r.timestamp[9:11]}:{r.timestamp[11:13]}  {r.score:.1f}",
+                fontsize=6,
+                color=INK,
+            )
+            ax.axis("off")
+        for ax in list(axes.flat)[n:]:
+            ax.axis("off")
+        region = {"all": "any cell", "interior": "interior cells only", "edge": "edge cells only"}[split]
+        fig.suptitle(
+            f"Real 2016 frames the local gate scores highest over {region} (one per day); box = the cell it blames",
+            fontsize=8,
+            y=1.0,
         )
-        ax.axis("off")
-    for ax in list(axes.flat)[n:]:
-        ax.axis("off")
-    fig.suptitle("Real 2016 frames the local gate scores highest (one per day); box = the cell it blames", fontsize=8, y=1.0)
-    save(fig, "ch4_admissibility_local_top")
+        save(fig, f"ch4_admissibility_local_top{'' if split == 'all' else '_' + split}")
 
 
 if __name__ == "__main__":
-    for fn in (risk_coverage, detection, crosssite, adaptation, faults, maintenance, local_top):
+    for fn in (risk_coverage, detection, detection_split, geometry, crosssite, adaptation, faults, maintenance, local_top):
         fn()

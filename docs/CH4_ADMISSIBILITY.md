@@ -232,3 +232,42 @@ within 2 cells of the sun; among interior flags, fewer than half do. This is the
 **Reporting.** Detection table rows `local, interior cells` and `local, edge cells` beside the §5
 row, for the five synthetic faults; maintenance rates, episodes and verdict for the interior
 alert; the geometry summary; the top frame per day for each split rendered as in §5.
+
+### 6.1 Result: both criteria FAIL again, with every number improved
+
+Re-fit with `--resume` reproduced the §5 thresholds exactly (1.7527 / 1.6356). Split thresholds:
+interior 1.6572 (alert 1.5469), edge 1.7439 (alert 1.6198). Verdict:
+`tables/ch4_admissibility_maintenance_verdict_interior.json`.
+
+| | §5 (all cells) | §6 interior | bar |
+|---|---|---|---|
+| clean frames flagged (probe) | 1.8 % | **0.7 %** | ≈ 1 % |
+| soiling flagged | 13.3 % | 21.7 % | ≥ 50 % → FAIL |
+| occlusion flagged | 50.5 % | **62.2 %** | ≥ 50 % ✓ |
+| AUROC soiling / occlusion | 0.89 / 0.96 | 0.94 / 0.98 | — |
+| soiling episodes alerted ≤ 2 h | 3 of 4 | 3 of 4 (episode 0: 291 min) | 4 of 4 → FAIL |
+| alerts on fault-free frames | 2.79 % | 1.59 % | ≤ 1 % → FAIL |
+| clean days with an alert | 145 of 362 | 97 of 362 | — |
+
+Three of the four soiling "detections" have a 0-minute delay, i.e. the interior alert was already on
+before the fault began — coincident alerts, as in §5.
+
+**Cost of the split.** Nothing measurable on the synthetic rim faults: the interior score flags
+more of them than the edge score (rim soiling 10.2 % vs 8.4 %, rim occlusion 40.2 % vs 21.7 %),
+because the rendered patches extend inward. The edge score is worse than the interior score on
+every fault.
+
+**Geometric hypothesis: half confirmed.** Edge flags: 76 % at solar elevation < 20° or within 2
+cells of the sun (expected ≥ 50 % ✓; base rate of low sun among all frames 28 %). Interior flags:
+69 % (expected < 50 % ✗). The one-cell-deep edge ring is too thin: exploratory depth analysis
+(`logs/ch4/admissibility/local_top_core_interim.log`) puts 95 % of clean flags on the outermost
+ring and 3.4 % on the second, and the second ring is still dominated by low-sun and wet-dome frames.
+
+**Exploratory, not pre-registered** (inspection of real frames after the verdict, recorded so it
+is not mistaken for a test): ranking by the *median* per-cell score instead of the maximum puts
+frame-wide sensing faults at the top of the 2016 stream — 7 of the top 12 (one per day) are
+acquisition faults with horizontal banding (4) or birds on the dome (3); the banding frame of
+23 Dec 07:42 ranks 2nd of 245,538 frames. Ranking by the maximum over cells at least 3 cells from
+the rim puts two birds and a person over the camera in its top 3. Figures `local_top_global`,
+`local_top_core3`. Testing either statistic requires a new pre-registration (§7) with a synthetic
+acquisition fault.

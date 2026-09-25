@@ -1,0 +1,30 @@
+{
+  "all": {
+    "flags": 3707,
+    "on_edge_pct": 91.070946857297,
+    "median_elevation_deg": 10.061591137713293,
+    "low_sun_pct": 74.42676018343674,
+    "near_sun_pct": 46.53358510925277,
+    "illumination_pct": 75.424871864041
+  },
+  "interior": {
+    "flags": 2207,
+    "on_edge_pct": 0.0,
+    "median_elevation_deg": 14.923959933155373,
+    "low_sun_pct": 62.029904848210236,
+    "near_sun_pct": 39.329406434073405,
+    "illumination_pct": 69.00770276393294
+  },
+  "edge": {
+    "flags": 3711,
+    "on_edge_pct": 100.0,
+    "median_elevation_deg": 9.843237073539285,
+    "low_sun_pct": 75.96335219617355,
+    "near_sun_pct": 47.8307733764484,
+    "illumination_pct": 76.36755591484776
+  },
+  "all_frames": {
+    "frames": 245538,
+    "low_sun_pct": 28.17282864566788
+  }
+}

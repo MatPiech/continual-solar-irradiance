@@ -1,9 +1,10 @@
 {
+  "split": "all",
   "frames": 245538,
-  "flagged_pct": 1.5073023320219274,
-  "alert_pct": 2.591452239571879,
+  "flagged_pct": 1.5097459456377424,
+  "spearman_local_vs_error": 0.26918529659442764,
+  "spearman_iforest_vs_error": 0.5476340312764774,
+  "alert_pct": 2.5967467357394782,
   "days": 362,
-  "days_with_alert": 145,
-  "spearman_local_vs_error": 0.2691832309895041,
-  "spearman_iforest_vs_error": 0.5476340312764774
+  "days_with_alert": 146
 }

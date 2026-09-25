@@ -109,9 +109,84 @@ def test_local_gate_blames_the_single_abnormal_cell():
     from cirr.evaluation.admissibility import LocalGate
 
     torch.manual_seed(0)
-    bank = torch.randn(5, 50, 128) * 0.1                      # 5 cells, 50 nominal frames each
+    bank = torch.randn(5, 50, 128) * 0.1  # 5 cells, 50 nominal frames each
     gate = LocalGate(bank, torch.ones(5, dtype=torch.bool), scale=torch.ones(5))
     frames = torch.randn(3, 5, 128) * 0.1
-    frames[1, 3] += 5.0                                       # one soiled patch in frame 1
+    frames[1, 3] += 5.0  # one soiled patch in frame 1
     score, where = gate.score(frames, "cpu")
     assert score.argmax() == 1 and where[1] == 3
+
+
+def _disc_cells(n: int = 16) -> torch.Tensor:
+    """Valid cells of a synthetic circular field of view, as valid_cells() would give at 128 x 128."""
+    from cirr.evaluation.admissibility import valid_cells
+
+    y, x = torch.meshgrid(torch.arange(128.0), torch.arange(128.0), indexing="ij")
+    inside = ((y - 63.5) ** 2 + (x - 63.5) ** 2 <= 63.5**2).float()
+    return valid_cells(inside.expand(3, 128, 128))
+
+
+def test_edge_cells_are_the_ring_touching_the_mask_border():
+    from cirr.evaluation.admissibility import edge_cells
+
+    cells = _disc_cells()
+    edge = edge_cells(cells)
+    rc = torch.nonzero(cells)
+    assert edge.shape == (len(rc),)
+    # the centre cell is interior, the topmost valid cell is edge
+    assert not edge[(rc == torch.tensor([7, 7])).all(1)].item()
+    assert edge[rc[:, 0].argmin()].item()
+    # a full square has edge cells only on its border
+    square = torch.ones(4, 4, dtype=torch.bool)
+    assert edge_cells(square).sum() == 12
+    # a flat cell list has no geometry
+    assert not edge_cells(torch.ones(5, dtype=torch.bool)).any()
+
+
+def test_local_gate_split_scores_each_region_separately():
+    from cirr.evaluation.admissibility import LocalGate
+
+    cells = _disc_cells()
+    n = int(cells.sum())
+    torch.manual_seed(0)
+    gate = LocalGate(torch.randn(n, 20, 128) * 0.1, cells, scale=torch.ones(n))
+    z = torch.rand(4, n) * 0.1
+    edge_idx, interior_idx = torch.nonzero(gate.edge).flatten(), torch.nonzero(~gate.edge).flatten()
+    z[0, edge_idx[0]] = 5.0  # an edge event in frame 0
+    z[1, interior_idx[0]] = 3.0  # an interior event in frame 1
+    s = gate.split(z)
+    assert s["all"][0] == 5.0 and s["all_cell"][0] == edge_idx[0]
+    assert s["edge"][0] == 5.0 and s["interior"][0] < 1.0  # the interior score ignores the rim
+    assert s["interior"][1] == 3.0 and s["interior_cell"][1] == interior_idx[0]
+    assert s["edge"][1] < 1.0
+    # the §5 score is what LocalGate.score gives
+    frames = torch.randn(2, n, 128) * 0.1
+    sc, where = gate.score(frames, "cpu")
+    ss = gate.split(gate.normalised(frames, "cpu"))
+    assert np.allclose(sc, ss["all"]) and np.array_equal(where, ss["all_cell"])
+
+
+def test_local_gate_thresholds_survive_save_and_load(tmp_path):
+    from cirr.evaluation.admissibility import LocalGate
+
+    cells = _disc_cells()
+    n = int(cells.sum())
+    gate = LocalGate(torch.zeros(n, 3, 128), cells, scale=torch.ones(n), threshold=1.5, alert_threshold=1.2)
+    gate.thresholds = {"all": 1.5, "interior": 1.1, "edge": 1.7, "interior_alert": 1.0}
+    gate.save(tmp_path / "g.npz", note="test")
+    back = LocalGate.load(tmp_path / "g.npz")
+    assert back.thresholds == gate.thresholds and back.threshold == 1.5
+    assert torch.equal(back.edge, gate.edge)
+
+
+def test_edge_faults_sit_at_the_rim_and_interior_faults_do_not():
+    from cirr.evaluation.admissibility import _MEAN, _STD, corrupt
+
+    y, x = torch.meshgrid(torch.arange(128.0), torch.arange(128.0), indexing="ij")
+    r = ((y - 63.5) ** 2 + (x - 63.5) ** 2).sqrt() / 63.5
+    clean = ((torch.full((3, 128, 128), 0.6) - _MEAN) / _STD) * (r <= 1).float()
+    for kind, rim in (("occlusion_edge", True), ("occlusion", False), ("soiling_edge", True), ("soiling", False)):
+        changed = ((corrupt(clean, kind, 0, "f") - clean).abs().sum(0) > 1e-3) & (r <= 1)
+        centre = float(r[changed].mean())
+        assert (centre > 0.6) if rim else (centre < 0.6), (kind, centre)
+        assert changed[r > 1].sum() == 0  # nothing outside the field of view

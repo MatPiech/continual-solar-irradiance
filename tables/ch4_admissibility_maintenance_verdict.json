@@ -1,4 +1,5 @@
 {
+  "split": "all",
   "criterion_1_frame_level": "FAIL",
   "soiling_flagged_pct": 13.257328990228013,
   "occlusion_flagged_pct": 50.52117263843648,
@@ -7,5 +8,7 @@
   "criterion_2_maintenance": "FAIL",
   "soiling_episodes_alerted_within_2h": 3,
   "soiling_episodes": 4,
-  "fault_free_alert_pct": 2.794117647058824
+  "fault_free_alert_pct": 2.8008595988538683,
+  "soiling_edge_flagged_pct": 9.185667752442995,
+  "occlusion_edge_flagged_pct": 32.14983713355049
 }
