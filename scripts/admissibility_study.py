@@ -895,9 +895,10 @@ def dose() -> None:
         runs = {arm: RUNS / f"dose_{stream}" / name / "seed0" for arm, name in DOSE_ARMS.items()}
         missing = [a for a, r in runs.items() if not (r / "predictions.csv").exists()]
         if missing:
-            print(f"{stream}: runs missing {missing}, skipped")
+            print(f"{stream}: runs missing {missing}; analysed without them")
+        P = {arm: load(r, sched) for arm, r in runs.items() if arm not in missing}
+        if "ungated" not in P:
             continue
-        P = {arm: load(r, sched) for arm, r in runs.items()}
         C = {arm: load(r, sched) for arm, r in clean_runs.items() if (r / "predictions.csv").exists()}
         for arm, p in P.items():
             ff, fa = p[p.fault == "none"], p[p.fault != "none"]
@@ -924,6 +925,8 @@ def dose() -> None:
             ("gated", "ungated", "fault-free"),
         ]
         for a, b, frames_ in pairs:
+            if a not in P or b not in P:
+                continue
             pa, pb = P[a], P[b]
             m = (pa.fault != "none") if frames_ == "faulty" else (pa.fault == "none")
             mb = (pb.fault != "none") if frames_ == "faulty" else (pb.fault == "none")
