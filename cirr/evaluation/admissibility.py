@@ -42,6 +42,7 @@ from cirr.data.loading import DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD
 
 KINDS = ("soiling", "droplets", "occlusion")
 EDGE_KINDS = ("soiling_edge", "occlusion_edge")  # the same faults at the rim (docs/CH4_ADMISSIBILITY.md §6)
+MONITOR_KINDS = ("banding", "insect", "wet_dome")  # the new faults of §7
 _MEAN = torch.tensor(DEFAULT_IMAGE_MEAN).view(3, 1, 1)
 _STD = torch.tensor(DEFAULT_IMAGE_STD).view(3, 1, 1)
 
@@ -125,6 +126,50 @@ def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.T
         ry, rx = ep.uniform(0.08, 0.22, 2) * (h, w)
         alpha = 0.9 * TF.gaussian_blur(_disc(h, w, cy, cx, ry, rx)[None], 5, 1.5)[0]
         pix = pix * (1 - alpha) + 0.05 * alpha
+    elif kind == "banding":  # acquisition fault (§7): redrawn every frame
+        fr = _rng(kind, episode, frame)
+        gain = torch.ones(3, h, 1)
+        for _ in range(int(fr.integers(6, 21))):
+            top, height = int(fr.integers(0, h)), int(fr.integers(1, 7))
+            gain[:, top : top + height] = torch.from_numpy(fr.uniform(0.8, 1.25, (3, 1, 1))).float()
+        noise = torch.from_numpy(fr.normal(0, 0.03, (3, h, 1))).float()
+        pix = (pix * gain + noise).clamp(0, 1)
+    elif kind == "insect":  # a few pixels: body and six legs, within 0.6 of the radius (§7)
+        fr = _rng(kind, episode, frame)
+        rho, phi = ep.uniform(0, 0.6) * h / 2, ep.uniform(0, 2 * np.pi)
+        # the episode fixes the position; each frame moves it by up to 1 px
+        cy, cx = h / 2 + rho * np.sin(phi) + fr.uniform(-1, 1), w / 2 + rho * np.cos(phi) + fr.uniform(-1, 1)
+        r = float(ep.uniform(1.5, 3.5))
+        body = _disc(h, w, cy, cx, r, r * 1.6)
+        y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+        legs = torch.zeros(h, w)
+        for a in np.linspace(0, 2 * np.pi, 6, endpoint=False) + ep.uniform(0, np.pi):
+            length = float(ep.uniform(3, 6)) + r
+            t = torch.linspace(0, 1, 16)
+            ly, lx = (cy + t * length * np.sin(a)).round().long(), (cx + t * length * np.cos(a)).round().long()
+            ok = (ly >= 0) & (ly < h) & (lx >= 0) & (lx < w)
+            legs[ly[ok], lx[ok]] = 1.0
+        alpha = 0.9 * torch.maximum(body, legs)
+        pix = pix * (1 - alpha) + 0.05 * alpha
+    elif kind == "wet_dome":  # dense droplets over the whole dome (§7)
+        n = int(ep.integers(150, 351))
+        fr = _rng(kind, episode, frame)
+
+        def draw(g: np.random.Generator, k: int) -> np.ndarray:
+            rho, phi = np.sqrt(g.uniform(0, 1, k)) * 0.95 * h / 2, g.uniform(0, 2 * np.pi, k)  # uniform over the disc
+            return np.stack([h / 2 + rho * np.sin(phi), w / 2 + rho * np.cos(phi), g.uniform(1, 3, k)], 1)
+
+        drops = draw(ep, n)
+        moved = fr.random(n) < 0.2  # 20 % of the water moves between frames
+        drops[moved] = draw(fr, int(moved.sum()))
+        d = torch.from_numpy(drops).float()
+        y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+        dist = ((y[None] - d[:, 0, None, None]) ** 2 + (x[None] - d[:, 1, None, None]) ** 2).sqrt() / d[:, 2, None, None]
+        lens = (dist <= 0.8).any(0).float()
+        rim = ((dist > 0.8) & (dist <= 1.0)).any(0).float() * (1 - lens)
+        lensed = (TF.gaussian_blur(pix, 7, 2.5) * 1.2).clamp(0, 1)
+        pix = pix * (1 - 0.6 * lens) + lensed * 0.6 * lens  # a droplet refracts; it does not hide the sky
+        pix = pix * (1 - 0.25 * rim)
     else:
         raise ValueError(f"unknown fault kind {kind!r}")
     return ((pix - _MEAN) / _STD) * crop
@@ -148,6 +193,38 @@ def build_schedule(timestamps: list[str], seed: int = 0) -> pd.DataFrame:
             for t in ts[ts.str[:8] == d]:
                 rows.setdefault(t, ("soiling", e))
     for kind, n, lo, hi in (("droplets", 20, 60, 180), ("occlusion", 60, 5, 30)):
+        for e, i in enumerate(rng.choice(len(ts), size=n, replace=False)):
+            end = when[i] + pd.Timedelta(minutes=int(rng.integers(lo, hi + 1)))
+            same_day = ts.str[:8] == ts[i][:8]
+            for t in ts[same_day & (when >= when[i]) & (when < end)]:
+                rows.setdefault(t, (kind, e))
+    out = pd.DataFrame([(t, k, e) for t, (k, e) in rows.items()], columns=["timestamp", "kind", "episode"])
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+# §7 stream: kinds in precedence order, with (episodes, min minutes, max minutes)
+MONITOR_EPISODES = (("wet_dome", 20, 60, 240), ("occlusion", 60, 5, 30), ("banding", 40, 1, 5), ("insect", 40, 2, 15))
+SHORT_TERM = ("banding", "occlusion", "insect")  # excluded from adaptation; should not raise the maintenance alert
+PERSISTENT = ("wet_dome", "soiling")  # should raise the maintenance alert
+
+
+def build_monitor_schedule(timestamps: list[str], seed: int = 1) -> pd.DataFrame:
+    """The §7 fault stream (docs/CH4_ADMISSIBILITY.md): soiling, wet dome, bird, banding, insect.
+
+    Same construction as :func:`build_schedule`: soiling fills 1-3 whole days (4
+    episodes), every other kind starts at a random frame and lasts a random number
+    of minutes within the same day; earlier kinds take precedence.
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.Series(sorted(set(timestamps)))
+    when = pd.to_datetime(ts, format="%Y%m%d_%H%M%S")
+    days = sorted(ts.str[:8].unique())
+    rows: dict[str, tuple[str, int]] = {}
+    for e, start in enumerate(rng.choice(len(days) - 3, size=4, replace=False)):
+        for d in days[start : start + int(rng.integers(1, 4))]:
+            for t in ts[ts.str[:8] == d]:
+                rows.setdefault(t, ("soiling", e))
+    for kind, n, lo, hi in MONITOR_EPISODES:
         for e, i in enumerate(rng.choice(len(ts), size=n, replace=False)):
             end = when[i] + pd.Timedelta(minutes=int(rng.integers(lo, hi + 1)))
             same_day = ts.str[:8] == ts[i][:8]
@@ -236,6 +313,22 @@ def edge_cells(cells: torch.Tensor) -> torch.Tensor:
     return (neighbours < 1.0)[cells]
 
 
+def cell_depth(cells: torch.Tensor) -> torch.Tensor:
+    """Chessboard distance, in cells, from each valid cell (scoring order) to the nearest cell outside the mask.
+
+    1 is the outermost ring.  §7's core statistic uses depth >= 3 (72 of 172 cells).
+    """
+    from scipy.ndimage import distance_transform_cdt
+
+    if cells.dim() != 2:
+        return torch.full((int(cells.sum()),), 99, dtype=torch.long)
+    m = cells.numpy()
+    return torch.from_numpy(distance_transform_cdt(np.pad(m, 1), metric="chessboard")[1:-1, 1:-1][m]).long()
+
+
+CORE_DEPTH = 3
+
+
 @torch.no_grad()
 def local_features(
     model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
@@ -282,6 +375,7 @@ class LocalGate:
         self.bank = bank  # [cells, n_bank, 128]
         self.cells = cells  # [16, 16] bool
         self.edge = edge_cells(cells)  # [cells] bool, scoring order
+        self.core = cell_depth(cells) >= CORE_DEPTH  # [cells] bool, §7
         self.scale = scale  # [cells] or None before calibration
         self.threshold, self.alert_threshold = threshold, alert_threshold
         # §6 thresholds: "<split>" for the frame score, "<split>_alert" for the rolling median
@@ -301,6 +395,13 @@ class LocalGate:
             worst, where = z[:, idx].max(1)
             out[name], out[f"{name}_cell"] = worst.numpy(), idx[where].numpy()
         return out
+
+    def monitor(self, z: torch.Tensor | np.ndarray) -> dict[str, np.ndarray]:
+        """The §7 statistics: global = median over all cells, core = max over cells at depth >= 3."""
+        z = torch.as_tensor(np.asarray(z, dtype=np.float32))
+        idx = torch.nonzero(self.core).flatten()
+        worst, where = z[:, idx].max(1)
+        return {"global": z.median(1).values.numpy(), "core": worst.numpy(), "core_cell": idx[where].numpy()}
 
     @torch.no_grad()
     def distances(self, feats: torch.Tensor, device: str, chunk: int = 256) -> torch.Tensor:

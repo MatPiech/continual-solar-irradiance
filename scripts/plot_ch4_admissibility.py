@@ -326,9 +326,9 @@ def faults() -> None:
     model = load_eval_model(Path(SOURCE_CHECKPOINT), "cpu")
     data = load_campaign_days(ROOT / "data" / "folsom_prepared", "0415", 1)
     img, hist, *_, name = data.dataset[data.day_map[data.days[0]][300]]
-    kinds = ("soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge")
+    kinds = ("soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge", "banding", "insect", "wet_dome")
     variants = [("clean", img)] + [(k.replace("_edge", " (rim)"), corrupt(img, k, 0, name)) for k in kinds]
-    fig, axes = plt.subplots(1, 6, figsize=(7.2, 1.6))
+    fig, axes = plt.subplots(1, 9, figsize=(7.6, 1.3))
     for ax, (label, x) in zip(axes, variants, strict=True):
         with torch.no_grad():
             s = float(anomaly_score(forest, model.encode_fusion_features(x[None], hist[None]).numpy())[0])

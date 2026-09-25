@@ -190,3 +190,48 @@ def test_edge_faults_sit_at_the_rim_and_interior_faults_do_not():
         centre = float(r[changed].mean())
         assert (centre > 0.6) if rim else (centre < 0.6), (kind, centre)
         assert changed[r > 1].sum() == 0  # nothing outside the field of view
+
+
+def test_monitor_faults_render_inside_the_field_of_view_and_differ_as_designed():
+    from cirr.evaluation.admissibility import _MEAN, _STD, corrupt
+
+    y, x = torch.meshgrid(torch.arange(128.0), torch.arange(128.0), indexing="ij")
+    r = ((y - 63.5) ** 2 + (x - 63.5) ** 2).sqrt() / 63.5
+    clean = ((torch.full((3, 128, 128), 0.6) - _MEAN) / _STD) * (r <= 1).float()
+    changed = {}
+    for kind in ("banding", "insect", "wet_dome"):
+        a, b = corrupt(clean, kind, 3, "20160101_120000"), corrupt(clean, kind, 3, "20160101_120100")
+        diff = (a - clean).abs().sum(0) > 1e-3
+        assert diff[r > 1].sum() == 0, kind  # nothing outside the field of view
+        changed[kind] = float(diff[r <= 1].float().mean())
+        assert torch.equal(a, corrupt(clean, kind, 3, "20160101_120000"))  # deterministic per frame
+        assert not torch.equal(a, b)  # every kind changes between frames
+    assert changed["insect"] < 0.01 < changed["wet_dome"]  # an insect is a few pixels, a wet dome is everywhere
+    assert changed["banding"] > 0.3  # banding spans the frame
+
+
+def test_monitor_schedule_orders_kinds_and_never_overlaps():
+    from cirr.evaluation.admissibility import build_monitor_schedule
+
+    days = pd.date_range("2016-01-01", periods=40, freq="D")
+    ts = [(d + pd.Timedelta(minutes=m)).strftime("%Y%m%d_%H%M%S") for d in days for m in range(420, 1080)]
+    s = build_monitor_schedule(ts, seed=1)
+    assert s.timestamp.is_unique
+    assert set(s.kind) == {"soiling", "wet_dome", "occlusion", "banding", "insect"}
+    assert s[s.kind == "soiling"].episode.nunique() == 4
+
+
+def test_monitor_statistics_are_median_and_core_max():
+    from cirr.evaluation.admissibility import LocalGate, cell_depth
+
+    cells = _disc_cells()
+    n = int(cells.sum())
+    gate = LocalGate(torch.zeros(n, 2, 128), cells, scale=torch.ones(n))
+    depth = cell_depth(cells)
+    assert int((depth >= 3).sum()) == int(gate.core.sum()) and depth.min() == 1
+    z = torch.full((2, n), 0.5)
+    z[0, torch.nonzero(~gate.core).flatten()[0]] = 9.0  # a rim spike: not core, barely moves the median
+    z[1] = 2.0  # frame-wide departure
+    m = gate.monitor(z)
+    assert m["core"][0] == 0.5 and m["global"][0] == 0.5
+    assert m["global"][1] == 2.0 and m["core"][1] == 2.0

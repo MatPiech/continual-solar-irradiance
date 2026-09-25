@@ -335,3 +335,10 @@ not part of this stream: it is sparse (20–40 spots) and real wet-dome frames l
   (against the existing ungated clean run); $\Delta$FS with the 95 % day-block bootstrap, MAE on
   fault-free frames, updates made on faulty frames, and frames withheld.
 - On the clean 2016 stream: the rate of $E$ and $M$, and the top frames per day for $G$, $C$ and $M$.
+
+**Amendment (2026-09-25, before any scoring).** A visual preview of the rendered faults
+(`figures/ch4/ch4_monitor_faults_preview`) showed `banding` far more saturated and `wet_dome`
+far more opaque than the real frames that motivated them. Changed before scoring: banding gain
+0.8–1.25 (was 0.6–1.5) and row noise σ 0.03 (was 0.04); wet-dome droplet radius 1–3 px (was 1–4),
+each droplet blending 60 % refracted and 40 % original sky, dark rim at 25 % (was fully refracted,
+40 % rim). No statistic, threshold or criterion changed. `scripts/fit_monitor.py` implements §7.

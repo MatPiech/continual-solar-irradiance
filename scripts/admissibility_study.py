@@ -33,6 +33,9 @@ from cirr.evaluation.admissibility import (
     _STD,
     EDGE_KINDS,
     KINDS,
+    MONITOR_KINDS,
+    PERSISTENT,
+    SHORT_TERM,
     LocalGate,
     anomaly_score,
     build_schedule,
@@ -55,7 +58,7 @@ RUNS = GATE / "runs"
 TABLES = ROOT / "tables"
 W = 1000.0
 SITES = ("folsom", "karpicko", "poznan")
-PROBE_KINDS = KINDS + EDGE_KINDS  # the synthetic faults every detector is probed with
+PROBE_KINDS = KINDS + EDGE_KINDS + MONITOR_KINDS  # the synthetic faults every detector is probed with
 # detection-table row per split of the local detector (docs/CH4_ADMISSIBILITY.md §5 and §6)
 LOCAL_ROWS = {"all": "local (layer2, per cell)", "interior": "local, interior cells", "edge": "local, edge cells"}
 # the policy each site's forecasts come from: head-only, the stable policy of Section 4.3
@@ -365,6 +368,40 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
                         auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
                     )
                 )
+        mon = GATE / "monitor" / "monitor.json"
+        if mon.exists():  # §7: global median, core max, and the exclusion flag they make
+            thr = json.loads(mon.read_text())["thresholds"]
+            m = gate.monitor(z)
+            flags = {
+                "local, global median": (m["global"], m["global"] > thr["global"]),
+                "local, core max": (m["core"], m["core"] > thr["core"]),
+                "exclusion flag (global or core)": (
+                    np.maximum(m["global"] / thr["global"], m["core"] / thr["core"]),
+                    (m["global"] > thr["global"]) | (m["core"] > thr["core"]),
+                ),
+            }
+            for name, (score, flag) in flags.items():
+                clean = score[kind == "clean"]
+                rows.append(
+                    dict(
+                        detector=name,
+                        fault="none (clean 2016)",
+                        n=int(clean.size),
+                        flagged_pct=100 * float(flag[kind == "clean"].mean()),
+                        auroc=np.nan,
+                    )
+                )
+                for k in PROBE_KINDS:
+                    f = score[kind == k]
+                    rows.append(
+                        dict(
+                            detector=name,
+                            fault=k,
+                            n=int(f.size),
+                            flagged_pct=100 * float(flag[kind == k].mean()),
+                            auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                        )
+                    )
     out = pd.DataFrame(rows)
     out.to_csv(TABLES / "ch4_admissibility_detection.csv", index=False)
     print(out.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
@@ -675,6 +712,148 @@ def geometry() -> None:
     summary["all_frames"] = base
     (TABLES / "ch4_admissibility_geometry.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
+
+
+@cli.command()
+def monitor() -> None:
+    """§7: exclusion flag and maintenance alert against their pre-registered criteria, and E in series with the policy."""
+    d = GATE / "monitor"
+    meta = json.loads((d / "monitor.json").read_text())
+    sched = pd.read_csv(d / "schedule.csv", dtype={"timestamp": str})
+    cor = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cln = pd.read_csv(d / "scores_clean.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cor = cor.merge(sched, on="timestamp", how="left")
+    cor["kind"] = cor.kind.fillna("none")
+    cor["t"] = pd.to_datetime(cor.timestamp, format="%Y%m%d_%H%M%S")
+    cor["day"] = cor.timestamp.str[:8]
+    cln["day"] = cln.timestamp.str[:8]
+
+    rates = cor.groupby("kind").agg(
+        frames=("timestamp", "size"), excluded_pct=("excluded", "mean"), maint_alert_pct=("maint_alert", "mean")
+    )
+    rates[["excluded_pct", "maint_alert_pct"]] *= 100
+    rates = rates.reset_index()
+    rates.to_csv(TABLES / "ch4_admissibility_monitor_rates.csv", index=False)
+
+    # every episode: excluded share, and whether / when the maintenance alert fires
+    eps = []
+    for (kind, ep), g in cor[cor.kind != "none"].groupby(["kind", "episode"]):
+        g = g.sort_values("t")
+        onset = g.t.iloc[0]
+        day = cor[(cor.day == g.day.iloc[0])]
+        before = day[(day.t < onset) & (day.t >= onset - pd.Timedelta(minutes=30))]
+        hit = g[g.maint_alert]
+        eps.append(
+            dict(
+                kind=kind,
+                episode=int(ep),
+                start=g.timestamp.iloc[0],
+                frames=len(g),
+                minutes=(g.t.iloc[-1] - onset).total_seconds() / 60 + 1,
+                excluded_pct=100 * g.excluded.mean(),
+                alert_already_on=bool(before.maint_alert.any()),
+                alerted=bool(len(hit)),
+                first_alert_delay_min=(hit.t.iloc[0] - onset).total_seconds() / 60 if len(hit) else np.nan,
+            )
+        )
+    eps = pd.DataFrame(eps)
+    eps.to_csv(TABLES / "ch4_admissibility_monitor_episodes.csv", index=False)
+
+    det = pd.read_csv(TABLES / "ch4_admissibility_detection.csv")
+    ex = det[det.detector == "exclusion flag (global or core)"].set_index("fault").flagged_pct
+    c1 = ex["banding"] >= 50 and ex["occlusion"] >= 50 and ex["none (clean 2016)"] <= 2
+    limits = {"wet_dome": 90, "soiling": 120}
+    detected = {
+        k: bool(
+            ((eps.kind == k) & ~eps.alert_already_on & (eps.first_alert_delay_min <= limits[k])).sum() == (eps.kind == k).sum()
+        )
+        for k in PERSISTENT
+    }
+    fault_free = float(rates.set_index("kind").loc["none", "maint_alert_pct"])
+    short = eps[eps.kind.isin(SHORT_TERM)]
+    short_alerted = 100 * float(short.alerted.mean())
+    c2 = all(detected.values()) and fault_free <= 1.0 and short_alerted <= 10.0
+    verdict = dict(
+        criterion_1_exclusion="PASS" if c1 else "FAIL",
+        excluded_banding_pct=float(ex["banding"]),
+        excluded_occlusion_pct=float(ex["occlusion"]),
+        excluded_insect_pct=float(ex["insect"]),
+        excluded_clean_pct=float(ex["none (clean 2016)"]),
+        criterion_2_maintenance="PASS" if c2 else "FAIL",
+        wet_dome_episodes_detected=int(
+            ((eps.kind == "wet_dome") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 90)).sum()
+        ),
+        wet_dome_episodes=int((eps.kind == "wet_dome").sum()),
+        soiling_episodes_detected=int(
+            ((eps.kind == "soiling") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 120)).sum()
+        ),
+        soiling_episodes=int((eps.kind == "soiling").sum()),
+        maint_alert_fault_free_pct=fault_free,
+        short_term_episodes_with_alert_pct=short_alerted,
+        clean_stream_exclusion_pct=float(100 * cln.excluded.mean()),
+        clean_stream_maint_alert_pct=float(100 * cln.maint_alert.mean()),
+        clean_days_with_maint_alert=int(cln.groupby("day").maint_alert.any().sum()),
+        thresholds=meta["thresholds"],
+    )
+    (TABLES / "ch4_admissibility_monitor_verdict.json").write_text(json.dumps(verdict, indent=2))
+
+    for col, name in (("global", "global"), ("core", "core"), ("maint_stat", "maint")):
+        top = cln.sort_values(col, ascending=False).drop_duplicates("day").head(12)
+        cell = top.core_cell if col == "core" else pd.Series(-1, index=top.index)
+        pd.DataFrame({"timestamp": top.timestamp, "score": top[col], "cell": cell}).to_csv(
+            TABLES / f"ch4_admissibility_monitor_top_{name}.csv", index=False
+        )
+
+    # E in series with the damped policy
+    faulty = dict(zip(sched.timestamp, sched.kind, strict=True))
+    base = frames("folsom")[["timestamp", "sp"]]
+    arms = {
+        "clean stream, no exclusion": ROOT
+        / "results"
+        / "adaptation"
+        / "ablation"
+        / "folsom"
+        / "conditional_last2_lowlr"
+        / "seed0",
+        "clean stream, exclusion": RUNS / "monitor_clean" / "last2_lowlr_excl" / "seed0",
+        "corrupted, no exclusion": RUNS / "monitor_corrupted" / "last2_lowlr" / "seed0",
+        "corrupted, exclusion": RUNS / "monitor_corrupted" / "last2_lowlr_excl" / "seed0",
+    }
+    rows, contrasts, table = [], [], {}
+    for arm, path in arms.items():
+        if not (path / "predictions.csv").exists():
+            print(f"{arm}: run missing ({path}), skipped")
+            continue
+        p = pd.read_csv(path / "predictions.csv", dtype={"timestamp": str, "day": str}).merge(base, on="timestamp")
+        p["fault"] = p.timestamp.map(faulty).fillna("none") if arm.startswith("corrupted") else "none"
+        upd = p[p.adapted == True]  # noqa: E712 -- pandas column
+        table[arm] = p[p.fault == "none"]
+        rows.append(
+            dict(
+                arm=arm,
+                mae_all=W * (p.prediction - p.target).abs().mean(),
+                mae_fault_free_frames=W * (table[arm].prediction - table[arm].target).abs().mean(),
+                updates=len(upd),
+                updates_on_faulty_frames=int((upd.fault != "none").sum()),
+                withheld=int(p.get("gated", pd.Series(False, index=p.index)).sum()),
+            )
+        )
+    for a, b in [
+        ("clean stream, exclusion", "clean stream, no exclusion"),
+        ("corrupted, no exclusion", "clean stream, no exclusion"),
+        ("corrupted, exclusion", "corrupted, no exclusion"),
+    ]:
+        if a in table and b in table:
+            c = contrast(_daily_on(table[a]), _daily_on(table[b]), tag=f"mon-{a}-{b}")
+            contrasts.append(dict(comparison=f"{a} vs {b}", frames="fault-free frames", **c))
+    pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_monitor_adaptation.csv", index=False)
+    pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_monitor_contrasts.csv", index=False)
+
+    print(rates.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(eps[eps.kind.isin(PERSISTENT)].to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(json.dumps(verdict, indent=2))
 
 
 if __name__ == "__main__":
