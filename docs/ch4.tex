@@ -1,0 +1,683 @@
+\chapter{Reliable adaptation on the deployed device}
+\label{ch:on-device-adaptation}
+
+The predictive performance of a deployed model may deteriorate as operating conditions change. This chapter addresses RQ3 by examining how selective updates under delayed supervision affect prediction and update cost. It also contributes to RQ2 through a separate study of accelerator-supported local training. \Cref{sec:ch4-conditional-adaptation,sec:ch4-admissibility,sec:ch4-accelerator-execution} build on three publications of the author~\cite{10.1007/978-3-032-07343-328,Piechocki2025:i63677,piechocki2026empowering}. The chapter relates them through the adaptation protocol, the three-site predictive comparison (\cref{tab:ch4-solar-benchmark}), the separate execution benchmark (\cref{tab:ch4-solar-edge-benchmark}), and the cost model of \cref{eq:ch4-speedup-model}.
+
+The adaptation protocol of \cref{sec:ch2-protocols} must accommodate three difficulties: learning shares resources with real-time inference~\cite{satyanarayanan2017emergence}, a corrupted observation may or may not be usable as evidence, and supervision arrives late or not at all. These failure modes motivate the criteria of input admissibility, update justification and update affordability developed in \cref{sec:ch4-post-deployment-constraints}. The subsequent sections examine an error-triggered update policy, a sensing-fault monitor placed in front of it, and an accelerator execution path. Their evidence differs: the policy is evaluated over three year-long campaigns with every update action recorded, the monitor is evaluated in series with the policy on clean and synthetically corrupted streams whose faults last from a minute to four months, and accelerator costs are measured on classification workloads. The accelerator path is not composed with the policy, the principal open item of \cref{sec:ch4-summary}.
+
+Update affordability also reconnects adaptation to deployment. The encoder--head partition, precision and runtime examined in \cref{ch:resource-efficient-perception} determine what an update costs. This chapter inherits those choices as constraints; \cref{sec:ch4-accelerator-execution} varies the backbone to examine their effect on selected workloads, without re-certifying a single artifact across chapters.
+
+% =========================================================================
+\section{Adaptation protocol and constraints}
+\label{sec:ch4-post-deployment-constraints}
+% =========================================================================
+
+\subsection{The adaptation protocol}
+\label{sec:ch4-adaptation-protocol}
+Formally, the deployed device operates a streaming loop. At time $t$ it observes an input $x_t$ and emits a forecast $\hat I_{t+H} = f_{\theta_t}(x_t)$ at horizon $H$, where $\theta_t$ denotes the model parameters currently in force. Supervision is lagged, in that the corresponding measurement $I_{t+H}$ becomes available only after $H$ has elapsed. This is the delayed-supervision regime of \cref{sec:ch2-supervision-regimes}, and it imposes the buffering cost described there; the policy requires a supervision key, the stored prediction, and an update state $u_t$. The actual retained tensors and their reuse in the timed implementation remain unverified, as discussed in \cref{sec:ch4-conditional-adaptation-evaluation}.
+
+The three criteria become decidable at different times: candidate input screening at $t$, update justification at $t+H$ when the label arrives, and affordability before deployment from the platform and parameterization. The sections that follow are ordered by their evidence instead: the update policy first (\cref{sec:ch4-conditional-adaptation}), because the monitor of \cref{sec:ch4-admissibility} is evaluated in series with it, and the execution path last (\cref{sec:ch4-accelerator-execution}). Because inference and learning share device resources, the measurement procedure of \cref{sec:ch2-system-metrics-measurement} assesses update cost alongside prediction cost.
+
+\paragraph{On stability.} The protocol does not establish convergence of the update law in \cref{eq:ch2-adaptation-update}. Here $\theta$ enters $f$ non-linearly, has $10^{6}$--$10^{7}$ coordinates, and is updated from a learned regressor with delayed error. No Lyapunov analysis or persistent-excitation verification is provided; this describes the analysis performed, not an impossibility of obtaining a certificate.
+
+What the design provides instead is a set of mechanisms that limit parameter excursions by construction, each with a recognizable counterpart in adaptive control. The lower of the two error thresholds introduced in \cref{sec:ch4-conditional-adaptation-method} acts as a dead zone. Applying a threshold naively to a noisy stream causes updates in response to measurement noise and oscillation around the threshold itself. Inhibiting updates while the signal remains within a band treated as noise instead of degradation is the classical remedy for parameter drift under limited disturbances. Requiring a sustained excursion instead of an instantaneous one would address the oscillation, but the policy as implemented in \cref{eq:ch4-update-trigger,alg:ch4-conditional-adaptation} acts on the instantaneous absolute error of each buffered sample. The dead zone of \SI{10}{\watt\per\square\meter} is small against the typical errors of \SI{30}{\watt\per\square\meter} to \SI{70}{\watt\per\square\meter} in \cref{tab:ch4-solar-benchmark}, and the recorded actions confirm it: the proposed instantiation leaves \SIrange{30}{57}{\percent} of buffered samples unmodified, updates the head on \SIrange{34}{51}{\percent}, and selects the encoder action on \SIrange{9}{19}{\percent} (\cref{tab:ch4-actions}).
+
+Freezing the backbone confines the trajectory to an affine set with update directions in the subspace $\mathcal{S}$ of \cref{eq:ch4-head-only-update}, so the reachable parameter set has fewer dimensions than $\mathbb{R}^{P}$. This is a hard restriction on which coordinates can change and the strongest of the structural constraints available here. Two further mechanisms act on the optimizer itself. Gradient-norm clipping limits the gradient supplied to the optimizer, moderating the influence of an individual sample without establishing a stability bound for AdamW, and reduced moment decay rates trade the smoothing of the optimizer state against tracking speed, in the manner of a forgetting factor. Their settings are stated once, with the rest of the adaptation-phase configuration, in \cref{sec:ch4-conditional-adaptation-method}. The exclusion flag of \cref{sec:ch4-admissibility} withholds frames carrying transient sensing events from the loop; \cref{sec:ch4-admissibility-evaluation} shows that this is the only kind of withholding the evidence supports, and that withholding a persistent fault slows the adaptation that would otherwise absorb it.
+
+These mechanisms constrain individual updates without establishing convergence, and the campaign of \cref{sec:ch4-conditional-adaptation-evaluation} shows the case the previous sentence anticipates: an unconstrained encoder update, limited at each step by clipping and the dead zone, still drifts over months at the source site, whereas the same action with a damped encoder step does not. The evaluated regression adaptation of NOTE degrades substantially as well, although its incompletely documented scalar objective and memory configuration prevent a formal diagnosis of parameter divergence. Reliability is therefore assessed empirically. A separate stability analysis could begin with the final linear layer on frozen features, where the model is linear in the updated parameters and dead-zone normalized least-mean-squares or recursive least-squares updates offer a more tractable starting point (\cref{sec:ch6-future-work}); neither action is certified here.
+
+\subsection{Encoder--head factorization}
+\label{sec:ch4-system-factorization}
+The main application in this chapter is the vision-based solar irradiance forecasting system introduced in \cref{sec:ch2-workload-solar}; the accelerator study uses separate classification workloads to examine the execution pattern. At each forecasting step the device acquires a sky image together with recent irradiance history and predicts irradiance at horizon $H$. A common architectural decision makes it possible to discuss the three protocol conditions together, and is stated here because all three subsequent sections depend on it.
+
+\paragraph{Input representation used in this chapter.} The forecaster consumes the sky image and four scalar irradiance values. It omits the solar-geometry, cloud-segmentation and optical-flow channels evaluated for ResNet50 in \cref{sec:ch3-solar}. This chapter and the next hold the input fixed while varying adaptation and exchange. A crossed representation--policy check, reported at the end of \cref{sec:ch4-conditional-adaptation-evaluation}, asks whether the physical channels complement the update policy or absorb the shift it otherwise corrects. The reported errors elsewhere characterize the reduced input. Continuity with \cref{ch:resource-efficient-perception} lies in supported operators, precision, the host--accelerator partition and possible feature reuse; their combined predictive and cost effects remain unmeasured.
+
+The forecaster is the composition of \cref{eq:ch2-backbone-head}, drawn with its secondary uses in \cref{fig:ch2-encoder-head}, with embedding $z_t = g(x_t;\theta_b)\in\mathbb{R}^{d}$ and a head that additionally consumes auxiliary conditioning $r_t$, giving $\hat I_{t+H} = h([z_t, r_t];\theta_{h,t})$ with $[\cdot,\cdot]$ denoting concatenation. The head-only specialization is the most restrictive of the parameter-efficient schemes considered here (\cref{sec:ch2-on-device-ft}), obtained by fixing the trainable subspace of \cref{eq:ch2-adaptation-update} to the head coordinates:
+\begin{equation}
+\label{eq:ch4-head-only-update}
+\mathcal{S} = \{0\}^{|\theta_b|} \times \mathbb{R}^{|\theta_h|}
+\quad\Longrightarrow\quad
+\theta_{b,t+1} = \theta_{b,t}, \qquad
+\theta_{h,t+1} = \theta_{h,t} - \gamma_t\,\eta_t\, \nabla_{\theta_h}\mathcal{L}\!\left(\theta_t;\mathcal{B}_t\right).
+\end{equation}
+Because $\Pi_{\mathcal{S}}$ annihilates the backbone coordinates, $\nabla_{\theta_b}\mathcal{L}$ is never required; backpropagation terminates at the embedding interface and the intermediate activations of $g$ need not be retained. Encoder updates, which widen $\mathcal{S}$ into the backbone coordinates, are selected at the higher error threshold because they require more computation and update state; their observed frequency is reported in \cref{tab:ch4-actions}. This factorization gives a common interface for discussing the three components, but does not make their update paths interchangeable. \Cref{tab:ch4-notation} summarizes the symbols used throughout this chapter.
+
+The encoder supports the three uses drawn in \cref{fig:ch2-encoder-head}: anomaly scoring, buffering for a frozen-encoder head update, and accelerator execution of the frozen stage. Reuse is simplest while the encoder stays fixed. An encoder update changes its feature coordinates, so cached embeddings and any detector fitted on them must be reconsidered together; the monitor of \cref{sec:ch4-admissibility} reads an early encoder stage that the damped action of \cref{eq:ch4-damped-encoder-update} leaves untouched, which is why the two compose without refitting.
+
+\begin{table}[!t]
+\caption[Notation used throughout this chapter.]{Notation used throughout this chapter. Symbols carry the same meaning across all three case studies, and the frozen-encoder/head-only specialization of $\theta_t$ is the factorization on which the cost model of \cref{eq:ch4-speedup-model} rests.}
+\label{tab:ch4-notation}
+\centering
+\small
+\TableCompact
+\begin{tabular}{l l}
+\toprule
+\thead{Symbol} & \thead{Meaning}\\
+\midrule
+$x_t$ & Input at time $t$: sky image and auxiliary history\\
+$r_t$ & Auxiliary conditioning signal (recent irradiance history)\\
+$H$ & Forecast horizon; also the supervision lag\\
+$\hat I_{t+H}$, $I_{t+H}$ & Predicted and measured irradiance at $t+H$\\
+$g(\cdot\,;\theta_b)$, $\theta_b$ & Encoder and its parameters (frozen for head-only updates)\\
+$\theta_{b}^{(3:4)}$ & Parameters of the last two encoder stages (layer3, layer4 of ResNet50)\\
+$h(\cdot\,;\theta_h)$, $\theta_{h,t}$ & Forecasting head and its trainable parameters at time $t$\\
+$\theta_t=(\theta_b,\theta_{h,t})$ & Parameters at $t$ in the frozen-encoder notation\\
+$z_t = g(x_t;\theta_b)$ & Encoder embedding\\
+$\mathcal{S}_t$ & Trainable subspace selected at time $t$\\
+$\gamma_t$ & Update trigger, $\gamma_t\in\{0,1\}$\\
+$\eta_h$, $\eta_b$ & Head and encoder learning rates ($\eta_b = 0.1\,\eta_h$ in the proposed instantiation)\\
+$\mathcal{B}_t$ & Evidence buffer admissible for learning at time $t$\\
+$u_t$ & Compact update state buffered until the label arrives\\
+$s_t$, $s_{\mathrm{anom}}$ & Exclusion score of the sensing-fault monitor and its threshold\\
+$L$ & Realized absolute forecast error once $I_{t+H}$ is observed\\
+$T_1 < T_2$ & Error thresholds selecting the update action\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =========================================================================
+\section{Error-triggered updates under lagged supervision}
+\label{sec:ch4-conditional-adaptation}
+% =========================================================================
+This section studies whether an update is warranted by delayed forecast error. The realized forecast error, under lagged supervision, arrives only at $t+H$. This section addresses the second condition of the adaptation protocol, update justification. It develops an error-triggered policy in the sense of \cref{sec:ch2-update-triggers}, fitted with the dead zone that section identifies as the standard remedy for triggering on noise, and mapping the realized lagged error onto a finite action space of no update, a head-only update, and an encoder update. The evidence is reported in two parts. Accuracy is measured against published alternatives over a year of continuous operation at each of three sites, where the policy matches the strongest comparator on absolute error and trails it slightly on forecast skill, and cost is measured over a day-scale stream, where its case actually rests. The campaign also shows that the form of the encoder action decides whether the policy is usable at all.
+
+\subsection{Method}
+\label{sec:ch4-conditional-adaptation-method}
+The shift a deployed forecaster meets can invalidate the model outright, as \cref{sec:ch4-conditional-adaptation-evaluation} shows, and it is what on-device specialization exists to absorb, but error alone is a poor trigger, since irradiance is volatile at the minute scale on which the label arrives and a policy updating on every residual would fire on noise and drift the parameters away from an operating point that remains valid.
+
+\paragraph{Note on the Folsom partitions.} This chapter and \cref{ch:collaborative-learning} use the second Folsom partition of \cref{sec:ch2-folsom-partitions}, training on 2014 and 2015 and holding out 2016, so no sample of the evaluation stream appears in the training data. The forecaster is refitted from scratch with the BerHu loss and without the physics-informed channels (\cref{sec:ch4-system-factorization}, \cref{tab:ch2-forecaster-configs}), and absolute errors at Folsom are not comparable with \cref{ch:resource-efficient-perception} for the reason stated there. The same checkpoint (SHA-256 \texttt{cdbb71ff\ldots}) is the source model of every run in this chapter and in \cref{ch:collaborative-learning}, and its static scores coincide across the two chapters.
+
+\paragraph{Conditional update rule.} Conditional adaptation under lagged supervision is framed as an error-triggered update policy over a finite action set, in which, for each buffered sample, only a finite set of update actions is applicable once supervisory feedback arrives. The buffering constraint this imposes is specified in \cref{sec:ch4-adaptation-protocol}. A supervision key, the stored prediction $\hat I_{t+H}$, and a compact update state $u_t$ must be retained until the label is observed, and a detached embedding $z_t$ together with auxiliary history is sufficient for a head-only update on a frozen encoder. An encoder update requires the original input or another state that preserves the encoder training path; a detached embedding alone is insufficient. The implemented retained tensors, encoder-version handling and cache policy are not documented, so the buffer memory and encoder-update path cannot be reconstructed from this specification.
+
+Once $I_{t+H}$ becomes available, the absolute error of the stored forecast is computed as given in \cref{eq:ch4-abs-error}. In the composition with the monitor of \cref{sec:ch4-admissibility}, only samples it has not excluded reach this step:
+\begin{equation}
+\label{eq:ch4-abs-error}
+L = \left|I_{t+H} - \hat I_{t+H}\right|,
+\end{equation}
+and mapped to an update action using two explicit thresholds $T_1<T_2$. Formally, the policy specializes the general update law of \cref{eq:ch2-adaptation-update} by making both the trigger and the trainable subspace functions of the realized error and the input-admissibility gate. With $s_t$ the exclusion score of \cref{sec:ch4-admissibility}, a sensing-fault monitor rather than the embedding anomaly score of the originating publication, and $\mathbb{1}[\cdot]$ the indicator function,
+\begin{equation}
+\label{eq:ch4-update-trigger}
+\gamma_t \;=\; \mathbb{1}\!\left[s_t \le s_{\mathrm{anom}}\right]\cdot\mathbb{1}\!\left[L \ge T_1\right],
+\qquad
+\mathcal{S}_t \;=\;
+\begin{cases}
+\{0\}^{P}, & L < T_1,\\[2pt]
+\{0\}^{|\theta_b|}\times\mathbb{R}^{|\theta_h|}, & T_1 \le L < T_2,\\[2pt]
+\mathcal{S}_{\mathrm{enc}}, & L \ge T_2,
+\end{cases}
+\end{equation}
+so that the indicators represent exclusion and the error threshold, while $\mathcal{S}_t$ selects the trainable parameters. Small errors leave the model unmodified; intermediate errors select a head update; and large errors select an encoder update whose subspace $\mathcal{S}_{\mathrm{enc}}$ is an instantiation choice. These are heuristic decisions, not tests that distinguish noise, drift and corruption or certify parameter validity. The per-step cost is governed by $\dim\mathcal{S}_t$. \Cref{eq:ch4-update-trigger} therefore makes the expected update cost a direct function of the error distribution and the thresholds, with encoder-update frequency and per-action work needed to quantify that cost. This procedure is specified operationally in \cref{alg:ch4-conditional-adaptation}, whereas \cref{fig:ch4-threshold-adaptation-graph} presents a compact system-level representation of the lagged-label pipeline, with particular emphasis on the buffering stage and on the mapping between the realized error and the corresponding update level. The two thresholds, like $s_{\mathrm{anom}}$, are deployment choices and not properties of the model, and they are fixed once before installation. Here they are derived from the Standard Test Conditions reference irradiance of \SI{1000}{\watt\per\square\meter}~\cite{dunlop2010guidelines}, with $T_1$ and $T_2$ set to \SI{1}{\percent} and \SI{10}{\percent} of that reference, namely \SI{10}{\watt\per\square\meter} and \SI{100}{\watt\per\square\meter}. Anchoring them to a reference the deployment already possesses, rather than to the error distribution of a particular site, makes the setting reproducible across sites, and equally means it is not tuned to any of them, a point returned to in \cref{sec:ch4-conditional-adaptation-conclusions}.
+
+\paragraph{Instantiations of the encoder action.} The originating publication~\cite{10.1007/978-3-032-07343-328} specified $\mathcal{S}_{\mathrm{enc}}=\mathbb{R}^{P}$, an update of the whole network at the head learning rate. The year-long campaign of \cref{sec:ch4-conditional-adaptation-evaluation} shows that this action drifts the model away from a valid operating point within months at the source site. The instantiation proposed here therefore damps the encoder action in two ways: the trainable subspace is restricted to the last two encoder stages together with the head,
+\begin{equation}
+\label{eq:ch4-damped-encoder-update}
+\mathcal{S}_{\mathrm{enc}} \;=\; \{0\}^{|\theta_b|-|\theta_b^{(3:4)}|}\times\mathbb{R}^{|\theta_b^{(3:4)}|}\times\mathbb{R}^{|\theta_h|},
+\qquad
+\eta_b \;=\; 0.1\,\eta_h ,
+\end{equation}
+and the encoder coordinates are stepped at one tenth of the head learning rate. The head-only policy, obtained with $T_2\to\infty$ so that every triggered update stays in the head, is evaluated as a reference. The policy as first specified in the originating publication~\cite{10.1007/978-3-032-07343-328}, an undamped update of the whole encoder at the head learning rate, appears only in the ablation that motivates \cref{eq:ch4-damped-encoder-update}, together with variants that restrict the subspace without damping the step or add replay or an anchor toward the deployed weights. The damping factor and the choice of stages were selected on the evaluation streams themselves, a limitation stated in \cref{sec:ch4-conditional-adaptation-conclusions}.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/on_device_treshold_based_adaptation_algorithm.pdf}
+\caption[Threshold-based conditional adaptation under lagged supervision.]{Threshold-based conditional adaptation under lagged supervision. The device buffers predictions and the minimal state required for learning; once delayed ground truth arrives, the absolute error is compared to two thresholds to select between (1) no update, (2) a parameter-efficient head update, or (3) a damped partial-encoder update (\cref{eq:ch4-damped-encoder-update}).}
+\label{fig:ch4-threshold-adaptation-graph}
+\end{figure}
+
+\begin{algorithm}[!t]
+\caption{Conditional on-device adaptation under lagged labels. The exclusion branch is evaluated in series with the policy in \cref{sec:ch4-admissibility-evaluation} and is inactive in the campaign of \cref{tab:ch4-solar-benchmark}.}
+\label{alg:ch4-conditional-adaptation}
+\begin{algorithmic}[1]
+\Require buffered tuple $(t, \hat I_{t+H}, u_t)$, lagged label $I_{t+H}$, exclusion score $s_t$, threshold $s_{\mathrm{anom}}$, thresholds $T_1<T_2$
+\If{$s_t > s_{\mathrm{anom}}$}
+  \State exclude (no update)
+\Else
+  \State $L \gets \left|I_{t+H} - \hat I_{t+H}\right|$
+  \If{$L < T_1$}
+    \State no update
+  \ElsIf{$T_1 \leq L < T_2$}
+    \State fine-tune forecasting head layers
+  \Else
+    \State damped update of the last two encoder stages and the head (\cref{eq:ch4-damped-encoder-update})
+  \EndIf
+\EndIf
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Comparators.} The policy is positioned against three families of alternative that differ in what supervision they require and when they act. Instance-based \gls{tta} updates the model immediately before prediction using only the incoming sample and requires no ground truth. MEMO~\cite{NEURIPS2022memo} minimizes prediction entropy over augmentations, and NOTE~\cite{gong2022note} targets temporally correlated streams. Both were designed for class outputs, so their objectives had to be adapted to a scalar regression output. The scalar entropy objective used for MEMO and the adaptation of NOTE's class-balanced memory are not documented. Their results therefore characterize the evaluated regression implementations and do not establish the behavior of the original classification methods or test-time adaptation generally. Few-shot site adaptation performs a single adaptation per site from a small local dataset collected before deployment, with no subsequent loop~\cite{PALETTA2024118398}, evaluated with one and seven days of local data. Delayed-supervision online adaptation defers updates until measurements arrive, as the present policy does: \citet{8397688} adapt only the final layer through a Sherman--Morrison recursive least-squares update, while~\citet{LARABENITEZ2023126312} perform sliding-window mini-batch gradient adaptation over a rolling buffer of the most recent labeled samples.
+
+\paragraph{Smart Persistence reference.} The statistical reference is Smart Persistence, defined in \cref{eq:ch2-smart-persistence}.
+
+\paragraph{Adaptation-phase optimization.} The offline phase minimizes the BerHu loss with the AdamW optimizer~\cite{loshchilov2019decoupled} at an initial learning rate of $3\times10^{-4}$, batch size 64, for at most 20 epochs with early stopping after five epochs without improvement (\cref{tab:ch2-forecaster-configs}). The online phase minimizes the squared error and performs one optimizer step per buffered sample once its label arrives, at a head learning rate $\eta_h = 10^{-5}$ with weight decay $10^{-4}$, moment decay rates of \num{0.5} and \num{0.975}, and gradient clipping at a maximum norm of \num{1.0}, the safeguards whose role \cref{sec:ch4-adaptation-protocol} sets out.
+The forecasting head itself comprises two fully connected layers (\num{2052} and \num{256} input features), consuming the concatenation of the \num{2048}-dimensional encoder embedding with the four-element irradiance history at $t$, $t-5$, $t-10$, and $t-15$ minutes.
+
+\paragraph{Week-scale streams of the originating publication.} The originating publication~\cite{10.1007/978-3-032-07343-328} additionally evaluated the policy at three horizons on week-scale streams, including a stream from Modena with Saharan dust episodes~\cite{PIECHOCKI2026127533}. Those results are not re-analysed here. The Modena collection covers only a few days of a single season, its scored population includes night samples, and the ordering of forecast, label arrival and update in those runs could not be verified under the campaign protocol of this chapter. The Karpicko and Poznań campaigns used below cover the same sites over a full season cycle and replace them. \Cref{fig:ch4-deployment-sites} shows a representative frame from each site, including Modena, because the differences in optics, exposure, horizon obstruction and prevailing cloud regime that the figure makes visible are the reason a model fitted at one location does not transfer unchanged to another.
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{gfx/4/sky_images.pdf}
+    \caption[Representative sky images from the training site and the deployment sites.]{Representative sky images from the training site and the deployment sites. Differences in optics, exposure, horizon obstruction, and prevailing cloud regime are visible directly, and are the reason a model fitted at one location does not transfer unchanged to another. Sites: (A) Folsom, the training site; (B) Modena, the week-scale stream of the originating publication, not re-analysed in this chapter; (C) Karpicko and (D) Poznań, the two deployment campaigns of \cref{tab:ch4-solar-benchmark}.}
+    \label{fig:ch4-deployment-sites}
+\end{figure}
+
+\subsection{Evaluation}
+\label{sec:ch4-conditional-adaptation-evaluation}
+
+\paragraph{Evaluation protocol.} Evidence is reported under one task-metric protocol, together with the system-level cost of each strategy measured under the procedure of \cref{sec:ch2-system-metrics-measurement}:
+\begin{itemize}
+  \item \textbf{Comparative benchmark (primary):} MAE, RMSE, WAPE (\cref{eq:ch2-ts-wape}) and forecast skill against Smart Persistence at $H=15$ minutes over the campaign period of each of three sites, evaluated against the frozen model, two test-time adaptation methods, four prior site-adaptation methods and the head-only reference instantiation of the policy (\cref{tab:ch4-solar-benchmark}). All four metrics are defined in \cref{sec:ch2-task-metrics}. Every run starts from the one checkpoint of \cref{sec:ch4-conditional-adaptation-method} and scores the same population per site: samples whose clear-sky irradiance exceeds \SI{1}{\watt\per\square\meter}, \num{245538} at Folsom over 362 days, \num{123523} at Poznań over 213 days and \num{179858} at Karpicko over 298 days. MAE and RMSE are pooled over that population; WAPE is a sample-weighted mean of daily values, as in \cref{ch:collaborative-learning}. Few-shot adaptation is averaged over three seeds; every other arm is one run.
+  \item \textbf{Uncertainty:} paired contrasts against the static model and against the sliding-window adaptation of \citet{LARABENITEZ2023126312} with a moving-block bootstrap over days (block 7, 2000 date-paired resamples), and an equivalence margin of $\pm\SI{5}{\percent}$ on relative MAE for the tie claim (\cref{fig:ch4-contrasts}). The bootstrap is the one estimator of \cref{sec:ch5-statistical-treatment}; its intervals are unadjusted for the number of contrasts a figure shows. With one run per arm they describe temporal variability conditional on the trained models, not training variability.
+  \item \textbf{Update actions:} the recorded share of no-update, head and encoder actions per site, and the measured per-action latencies on the target platforms, combined into an update budget per day (\cref{tab:ch4-actions}).
+  \item \textbf{System metrics:} an execution benchmark reporting adaptation latency, end-to-end latency, throughput, and peak process memory for each adaptation strategy (\cref{tab:ch4-solar-edge-benchmark}).
+\end{itemize}
+The earlier version of this benchmark, reported in the originating publication, came from a code path whose encoder action silently trained only the head, and scored a population that differs from the present one at the Polish sites; it is not reproduced here.
+
+\paragraph{Comparative benchmark.} \Cref{tab:ch4-solar-benchmark} positions the conditional update policy against the literature over the campaign period of each site, and \cref{fig:ch4-contrasts} the corresponding intervals. Four patterns follow.
+
+First, deployment shift can erase the learned model's advantage over a local statistical reference. The frozen forecaster retains \SI{+10.73}{\percent} skill at Poznań but only \SI{+1.63}{\percent} at Karpicko, and Smart Persistence has lower MAE at both sites (\num{67.73} against \num{69.56} and \num{67.19} against \SI{80.40}{\watt\per\square\meter}). Higher MAE alongside lower RMSE indicates a trade-off between average absolute error and larger errors, rather than uniform superiority. Attribution to irradiance ramps would require regime-level analysis. These outcomes, and the visible differences between the sites in \cref{fig:ch4-deployment-sites}, motivate testing whether post-deployment learning helps a model transferred from Californian sky imagery.
+
+Second, adaptation helps most where there is shift to absorb. On the held-out Folsom year, the head-only and the proposed instantiation have the lowest MAE of any method (\num{31.03} and \num{31.16} against \num{31.51} for the static model), and the proposed instantiation improves forecast skill by \num{3.5} points over the static model. At the unseen sites it reduces MAE by \SI{15.8}{\percent} (Poznań) and \SI{18.0}{\percent} (Karpicko), with skill gains of \num{8.2} and \num{10.7} points, both with intervals well clear of zero; \cref{fig:ch4-monthly-vs-static} shows that the gain is present in every month at Karpicko, largest from November to February, and in every month but December at Poznań, where every adapted method and Smart Persistence deteriorate together. This favors checking local evidence before updating, but does not isolate the trigger's effect or its energy benefit.
+
+Third, the evaluated regression implementation of MEMO~\citep{NEURIPS2022memo} changes accuracy only marginally, while that of NOTE~\citep{gong2022note} degrades it substantially. MAE rises to \num{104.79}, \num{96.66} and \num{134.07} across the three sites, \num{3.3}$\times$, \num{1.4}$\times$ and \num{1.7}$\times$ the static baseline. Because their scalar objectives and memory adaptations are incompletely specified, these results do not establish a general limitation of the original methods or of label-free adaptation.
+
+Fourth, the policy presents an accuracy--update-cost trade-off against the sliding-window adaptation of \citet{LARABENITEZ2023126312}. The proposed instantiation has lower MAE than that method at all three sites, by \SIrange{0.6}{1.3}{\percent}, and is equivalent to it within the $\pm\SI{5}{\percent}$ margin everywhere; on forecast skill it is indistinguishable at Folsom and Karpicko ($-0.08$ and $-0.10$ points, neither significant) and \num{0.66} points lower at Poznań. \citet{LARABENITEZ2023126312} therefore keep a small lead on the squared-error metric, and the two methods tie on absolute error. The head-only instantiation is also equivalent on MAE but trails on forecast skill by \numrange{0.8}{2.3} points at every site, so the damped encoder action buys \numrange{0.7}{2.2} points of skill over head-only updates, at the update cost quantified below.
+
+\paragraph{The encoder action decides usability.} The policy as first specified, with a full-network update at the head learning rate, is the worst adapted method at Folsom: its MAE is \SI{32}{\percent} above the static model and its forecast skill \num{5.4} points below it, whereas the same policy with the damped action is \SI{1.1}{\percent} better than the static model on MAE and \num{3.5} points better on skill. The monthly errors behind \cref{tab:ch4-encoder-ablation} show how this arises. The full-encoder policy tracks the other methods until May, then departs from the static model progressively, reaching \SI{+140}{\percent} MAE in July and September and never recovering; at the unseen sites, where the shift is large, the drift is masked by the adaptation gain and the same policy stays within \SI{3}{\percent} of the damped one. \Cref{tab:ch4-encoder-ablation} isolates what stops the drift. Restricting the update to the last two encoder stages does not (worst month \SI{+102}{\percent}), and adding replay of buffered source samples does not (\SI{+92}{\percent}); limiting the size of each encoder step does, whether by an anchor toward the deployed weights (\SI{+8}{\percent}) or by the tenfold lower encoder learning rate of \cref{eq:ch4-damped-encoder-update} (\SI{+7}{\percent}, the level of the head-only policy at \SI{+8}{\percent}). The ablation does not contain a full-encoder run with the damped step, so it establishes that damping is necessary and does not establish that restricting the subspace contributes anything beyond it.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/monthly_error_vs_static.pdf}
+\caption[Monthly error relative to the static model.]{Monthly MAE (left) and RMSE (right) of each adaptation strategy relative to the static model in the same month, over the campaign period of each site; \SI{0}{\percent} is the static model and negative values are better. Proposed is the damped instantiation of \cref{eq:ch4-damped-encoder-update} and the dashed line the head-only instantiation. The comparators are \citet{LARABENITEZ2023126312}, \citet{8397688}, \citet{PALETTA2024118398} with one (D1) or seven (D7) days of local data, and MEMO~\citep{NEURIPS2022memo}; NOTE~\citep{gong2022note} is omitted, since its errors set the vertical range. Months without measurements leave gaps.}
+\label{fig:ch4-monthly-vs-static}
+\end{figure}
+
+\begin{table}[!t]
+\caption[Continual adaptation for 15-minute irradiance forecasting.]{Comparative benchmark of continual adaptation strategies for 15-minute-ahead irradiance forecasting, over the campaign period of each site: Folsom, the 2016 calendar year (362 scored days); Poznań, 18 October 2024 to 30 June 2025 (213 days); Karpicko, November 2024 to October 2025 (298 days). MAE and RMSE in \si{\watt\per\square\meter}, pooled over the scored population; WAPE (\cref{eq:ch2-ts-wape}) in \si{\percent}, a sample-weighted mean of daily values; lower is better for all three. Forecast skill (FS, \si{\percent}) is computed against the Smart Persistence row of the same site by \cref{eq:ch2-forecast-skill}, so a negative value denotes higher RMSE than the statistical reference. Every arm starts from the same checkpoint and scores the same population; few-shot rows are three-seed means, all others single runs. Bold marks the column extremum among the adapted and static models.}
+\label{tab:ch4-solar-benchmark}
+\centering
+\small
+\TableDense
+\begin{tabularx}{\textwidth}{@{}l >{\raggedright\arraybackslash}X S[table-format=3.2] S[table-format=3.2] S[table-format=2.2] S[table-format=-2.2]@{}}
+\toprule
+\thead{Site} & \thead{Method} & \multicolumn{1}{c}{\thead{MAE $\downarrow$}} & \multicolumn{1}{c}{\thead{RMSE $\downarrow$}} & \multicolumn{1}{c}{\thead{WAPE\\(\si{\percent})$\downarrow$}} & \multicolumn{1}{c}{\thead{FS\\(\si{\percent})$\uparrow$}}\\
+\midrule
+\multirow{10}{*}{Folsom} & Persistence & 35.95 & 86.10 & 12.17 & 0.00\\
+ & Static model & 31.51 & 72.60 & 11.19 & 15.68\\
+ & MEMO~\cite{NEURIPS2022memo} & 33.26 & 72.74 & 11.40 & 15.51\\
+ & NOTE~\cite{gong2022note} & 104.79 & 138.62 & 43.94 & -61.01\\
+ & \citet{8397688} & 31.31 & 71.94 & 11.11 & 16.44\\
+ & \citet{LARABENITEZ2023126312} & 31.50 & \textbf{69.48} & 11.08 & \textbf{19.30}\\
+ & \citet{PALETTA2024118398}, 1 day & 31.78 & 73.15 & 11.23 & 15.04\\
+ & \citet{PALETTA2024118398}, 7 days & 37.14 & 74.75 & 12.60 & 13.18\\
+ & Conditional, head only & \textbf{31.03} & 70.16 & \textbf{10.95} & 18.51\\
+ & \textbf{Conditional, damped (proposed)} & 31.16 & 69.54 & 11.01 & 19.23\\
+\midrule
+\multirow{10}{*}{Poznań} & Persistence & 67.73 & 138.99 & 29.55 & 0.00\\
+ & Static model & 69.56 & 124.08 & 35.06 & 10.73\\
+ & MEMO~\cite{NEURIPS2022memo} & 68.00 & 122.48 & 34.37 & 11.88\\
+ & NOTE~\cite{gong2022note} & 96.66 & 135.68 & 46.20 & 2.38\\
+ & \citet{8397688} & 66.56 & 120.84 & 33.20 & 13.06\\
+ & \citet{LARABENITEZ2023126312} & 58.92 & \textbf{111.78} & \textbf{28.67} & \textbf{19.57}\\
+ & \citet{PALETTA2024118398}, 1 day & 69.19 & 124.44 & 33.99 & 10.46\\
+ & \citet{PALETTA2024118398}, 7 days & 63.49 & 121.50 & 31.71 & 12.58\\
+ & Conditional, head only & 59.65 & 114.85 & 29.24 & 17.37\\
+ & \textbf{Conditional, damped (proposed)} & \textbf{58.58} & 112.70 & 28.83 & 18.91\\
+\midrule
+\multirow{10}{*}{Karpicko} & Persistence & 67.19 & 142.46 & 35.90 & 0.00\\
+ & Static model & 80.40 & 140.14 & 48.28 & 1.63\\
+ & MEMO~\cite{NEURIPS2022memo} & 79.58 & 140.90 & 47.48 & 1.09\\
+ & NOTE~\cite{gong2022note} & 134.07 & 169.51 & 76.59 & -18.99\\
+ & \citet{8397688} & 75.84 & 134.54 & 45.56 & 5.56\\
+ & \citet{LARABENITEZ2023126312} & 66.76 & \textbf{124.77} & \textbf{35.56} & \textbf{12.42}\\
+ & \citet{PALETTA2024118398}, 1 day & 68.65 & 136.60 & 36.51 & 4.11\\
+ & \citet{PALETTA2024118398}, 7 days & 68.53 & 138.38 & 36.62 & 2.87\\
+ & Conditional, head only & 66.58 & 127.99 & 35.66 & 10.16\\
+ & \textbf{Conditional, damped (proposed)} & \textbf{65.90} & 124.92 & 35.65 & 12.32\\
+\bottomrule
+\end{tabularx}
+\par\smallskip
+\begin{minipage}{\textwidth}
+\small\raggedright
+Method key: Persistence = Smart Persistence; MEMO and NOTE = the evaluated regression implementations of the two \gls{tta} methods; \citet{8397688} = final-layer recursive least squares; \citet{LARABENITEZ2023126312} = sliding-window adaptation; \citet{PALETTA2024118398} = few-shot site adaptation on one or seven days of local data; Conditional = this work, in the two instantiations of \cref{sec:ch4-conditional-adaptation-method}.
+\end{minipage}
+\end{table}
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\textwidth]{gfx/4/ch4_contrasts.pdf}
+  \caption[Contrasts against the static model and against sliding-window adaptation.]{Paired contrasts of each adapted method against the static model (left: $\Delta$FS in percentage points, positive favours the method) and against the sliding-window adaptation of \citet{LARABENITEZ2023126312} (right: MAE as a percentage of that method's MAE minus 100). Intervals are moving-block bootstraps over days (block 7, 2000 date-paired resamples): 95\,\% for $\Delta$FS and 90\,\% for relative MAE, the interval whose inclusion in the shaded $\pm\SI{5}{\percent}$ band declares equivalence on absolute error. Values beyond the axis are printed. Single runs, so the intervals describe temporal variability only and are unadjusted for the 21 contrasts shown.}
+  \label{fig:ch4-contrasts}
+\end{figure}
+
+
+\begin{table}[!t]
+\caption[Ablation of the encoder action.]{Ablation of the high-error action of \cref{eq:ch4-update-trigger}. All rows are the same policy with the same thresholds; only the encoder action differs. Forecast skill (\si{\percent}) per site and mean MAE over the three sites (\si{\watt\per\square\meter}); the last two columns give, at Folsom, the worst monthly MAE relative to the static model and the number of months with higher MAE than the static model. Replay draws buffered source samples into each update; anchor adds a pull toward the deployed weights. All runs single-seed; the variants were examined on the evaluation streams.}
+\label{tab:ch4-encoder-ablation}
+\centering
+\small
+\TableTight
+\begin{tabular}{l S[table-format=2.2] S[table-format=2.2] S[table-format=2.2] S[table-format=2.2] S[table-format=+3.0] c}
+\toprule
+\thead{Encoder action} & \multicolumn{1}{c}{\thead{FS Folsom}} & \multicolumn{1}{c}{\thead{FS Poznań}} & \multicolumn{1}{c}{\thead{FS Karpicko}} & \multicolumn{1}{c}{\thead{mean MAE}} & \multicolumn{1}{c}{\thead{worst month\\vs. static (\si{\percent})}} & \thead{months\\worse}\\
+\midrule
+full encoder & 10.32 & 16.99 & 10.11 & 57.63 & +141 & 12/12\\
+layer3+4 & 15.42 & 19.89 & 13.46 & 54.47 & +102 & 12/12\\
+layer3+4, replay & 13.71 & 19.37 & 14.05 & 54.76 & +92 & 12/12\\
+layer3+4, anchor & 17.82 & 17.80 & 8.24 & 52.88 & +8 & 7/12\\
+\textbf{damped (proposed)} & 19.23 & 18.91 & 12.32 & 51.88 & +7 & 6/12\\
+head only & 18.51 & 17.37 & 10.16 & 52.42 & +8 & 6/12\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Adaptation cost and the accuracy-per-cost argument.} \Cref{tab:ch4-actions} reports the actions the policy actually selected. The proposed instantiation triggers an encoder update on \SI{8.6}{\percent} of buffered samples at Folsom and on \SIrange{17}{19}{\percent} at the unseen sites, and leaves the model unmodified on \SI{57}{\percent} of samples at Folsom against \SIrange{30}{35}{\percent} at the unseen sites, which is the intended behaviour of a dead zone: it fires more where the deployed prior is wrong. Multiplying the recorded counts by the measured per-action latencies in the same table gives the update compute per day, \SIrange{70}{111}{\second} on Raspberry~Pi~5 and \SIrange{11}{17}{\second} on Orin Nano, against \SIrange{49}{71}{\second} and \SIrange{7}{11}{\second} for the head-only instantiation. This arithmetic assumes that the timed latency applies to every triggered update and that updates do not overlap with inference; it gives the order of magnitude, not a measurement, and shows that the skill the damped encoder action adds over head-only updates costs \numrange{1.4}{1.6}$\times$ their update time.
+
+\Cref{tab:ch4-solar-edge-benchmark} profiles 640 samples, the average daylight count for one day. In this device profile the policy adapts \num{2.5}$\times$ faster than the method of \citet{LARABENITEZ2023126312} (\SI{165.6}{\milli\second} against \SI{416.7}{\milli\second}) and sustains \num{1.8}$\times$ the throughput. The choice depends on the installation budget and value of the accuracy difference. Both strategies comfortably fit the one-minute sampling interval, so lower latency creates idle time rather than resolving a deadline failure. Whether it saves daily energy was not measured. The profile predates the damped instantiation and its action proportions are unspecified; these ratios cannot establish campaign-average energy savings or a matched accuracy--cost optimum.
+
+The same table shows why update cost deserves separate attention. MEMO reduces throughput roughly \num{22}$\times$ for little reported accuracy change, although it still fits the sampling interval. Even the fastest gradient-based strategy retains only \SI{45}{\percent} of baseline inference throughput. The three non-TTA strategies roughly triple peak process memory, from \SI{995.7}{\mega\byte} to \SI{3095.6}{\mega\byte}, while MEMO reaches \SI{1323.0}{\mega\byte}. Identical peaks across distinct update rules, including recursive least squares without optimizer moments, are consistent with shared training-mode allocations, but do not isolate the cause. For scale, the head's approximately \num{0.53} million FP32 parameters, gradients and two AdamW moments require about \SI{8.5}{\mega\byte}, before activations, buffers and runtime allocations. That arithmetic estimate is not a breakdown of the measured peak. Memory may constrain smaller platforms, but neither the first binding limit nor the allocation breakdown is established.
+
+\begin{table}[!t]
+\caption[Recorded update actions, per-action latency and the resulting update budget.]{Recorded update actions per site for the two instantiations of the policy, as a share of buffered samples (\si{\percent}), and the update compute per day obtained by multiplying the recorded head and encoder counts by the per-action latencies measured on the two target devices (bottom rows: milliseconds per sample, mean $\pm$ standard deviation, for a $128\times128$ image with four irradiance values). The damped action backpropagates through the last two encoder stages only; its latency was not measured separately and is bounded above by the full-model value. The budget assumes the timed latency for every triggered update and no overlap with inference.}
+\label{tab:ch4-actions}
+\centering
+\small
+\TableTight
+\begin{tabular}{ll S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=3.0] S[table-format=2.1]}
+\toprule
+ & & \multicolumn{3}{c}{\thead{action share (\si{\percent})}} & \multicolumn{2}{c}{\thead{update compute (\si{\second\per day})}}\\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}
+\thead{Encoder action} & \thead{Site} & \multicolumn{1}{c}{\thead{none}} & \multicolumn{1}{c}{\thead{head}} & \multicolumn{1}{c}{\thead{encoder}} & \multicolumn{1}{c}{\thead{RPi 5}} & \multicolumn{1}{c}{\thead{Orin Nano}}\\
+\midrule
+\multirow{3}{*}{damped (proposed)} & Folsom & 56.9 & 34.4 & 8.6 & 70 & 10.5\\
+ & Poznań & 34.5 & 48.5 & 17.0 & 98 & 14.8\\
+ & Karpicko & 30.3 & 50.5 & 19.2 & 111 & 16.8\\
+\midrule
+\multirow{3}{*}{head only} & Folsom & 57.3 & 42.7 & 0.0 & 49 & 7.4\\
+ & Poznań & 34.8 & 65.2 & 0.0 & 64 & 9.7\\
+ & Karpicko & 31.0 & 69.0 & 0.0 & 71 & 10.6\\
+\midrule
+\multicolumn{7}{@{}l}{\itshape Per-action latency (\si{\milli\second} per sample): inference / head update / full-model update}\\
+\multicolumn{2}{@{}l}{Raspberry Pi 5} & \multicolumn{5}{l}{$166.3 \pm 9.2$ / $174.0 \pm 6.7$ / $526.1 \pm 21.3$}\\
+\multicolumn{2}{@{}l}{Jetson Orin Nano} & \multicolumn{5}{l}{$21.6 \pm 0.1$ / $26.2 \pm 0.2$ / $79.5 \pm 15.9$}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[!t]
+\caption[Execution benchmark for continual adaptation strategies.]{Edge-device execution benchmark for continual adaptation strategies over a fixed stream of 640 samples. Latencies are reported as means in milliseconds; throughput (Tput) in \si{\sample\per\second}; peak process memory (Mem.) in \si{\mega\byte}. E2E denotes end-to-end latency for a single sample, including inference and any adaptation step. The exact sample selection and action proportions are not reported, and this timing stream is separate from the campaign accuracy evaluation.}
+\label{tab:ch4-solar-edge-benchmark}
+\centering
+\small
+\TableNormal
+\begin{tabular}{l S[table-format=4.2] S[table-format=4.2] S[table-format=1.2] S[table-format=4.2]}
+\toprule
+\thead{Method} & \multicolumn{1}{c}{\thead{Adaptation $\downarrow$}} & \multicolumn{1}{c}{\thead{E2E $\downarrow$}} & \multicolumn{1}{c}{\thead{Tput $\uparrow$}} & \multicolumn{1}{c}{\thead{Mem. $\downarrow$}}\\
+\midrule
+Baseline (no adaptation) & \multicolumn{1}{c}{--} & 130.54 & 7.59 & 995.73\\
+MEMO~\cite{NEURIPS2022memo} (TTA) & 2825.56 & 2975.90 & 0.34 & 1322.97\\
+\citet{8397688} & 147.38 & 291.62 & 3.41 & 3095.62\\
+\citet{LARABENITEZ2023126312} & 416.66 & 566.09 & 1.76 & 3095.62\\
+Conditional policy (this work) & 165.64 & 311.14 & 3.20 & 3095.62\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+\Cref{tab:ch4-actions} shows that a head update costs approximately one additional inference on Raspberry Pi 5 and \num{1.2} on Orin Nano, compared with \num{3.2} and \num{3.7} for a full-model update. The measured actions fit the one-minute interval even if selected for every sample, without guaranteeing deadlines under concurrent work. The near-inference head-update time does not establish whether features were cached or recomputed. Until the retained tensors and timed path are documented, buffer memory, encoder updating from that state and transfer of accelerator savings to this forecaster remain unresolved.
+
+\paragraph{Physics-informed input and the policy.} The crossed check announced in \cref{sec:ch4-system-factorization} repeats the static and conditional runs with the seven-channel input of \cref{sec:ch3-solar}: the sky image, the sun mask scaled by the current irradiance, the normalized blue--red ratio cloud channel and dense optical flow. A second ResNet50 was trained on the same Folsom partition and with the same loss, the sun-mask camera model was refitted for each site on the centre crop the datamodule uses, and every evaluation flag of \cref{tab:ch4-solar-benchmark} was kept. The check was run with the policy as first specified in the originating publication~\cite{10.1007/978-3-032-07343-328}, before the damped instantiation existed; a single seed per cell. \Cref{fig:ch4-iep} gives the result. With the physics-informed input the static model collapses at Karpicko (forecast skill \SI{-40.5}{\percent}): from May to August the noon sun is occluded by trees in that camera's field of view while the pyranometer is unobstructed, and the model reads the occluded sun as cloud and underpredicts by up to \SI{290}{\watt\per\square\meter} at noon. Blanking the image channels of the physics-informed model on the affected days lowers its RMSE from \num{243} to \SI{173}{\watt\per\square\meter}, whereas zeroing the sun channel raises it to \num{307}, so the failure sits in the image appearance and not in the physical channels. Conditional adaptation repairs it: the adapted physics-informed model is the best cell at every site, by \numrange{1.3}{2.8} points of skill over the adapted reduced-input model, and the gain from adaptation is larger on the physics-informed input at both unseen sites, by \num{3.7} points at Poznań (interval $[2.0, 6.2]$) and by \num{43} points at Karpicko, where it is dominated by the static collapse. At Folsom the difference is not distinguishable from zero. Two caveats bound the reading. The reduced-input checkpoint was trained with a translation augmentation that blanked about half of the augmented frames, and the physics-informed one with the intended \SI{10}{\percent} shift, so the comparison mixes representation and training recipe; a reduced-input model retrained with the corrected augmentation matches the physics-informed one on the Folsom test partition (RMSE \num{71.6} against \SI{72.4}{\watt\per\square\meter}), which argues against attributing the static-model differences to the physical channels. And the check concerns the policy as first specified, not the damped instantiation. What it supports is complementarity: the update policy remains useful, and at the unseen sites more useful, when the input already carries physical context, and it recovers a failure of that input which no static model could.
+
+\begin{figure}[!t]
+  \centering
+  \includegraphics[width=\textwidth]{gfx/4/representation_ch4.pdf}
+  \caption[Reduced and physics-informed input under conditional adaptation.]{Forecast skill of the static model and of the conditional policy with the reduced input of this chapter (RGB, hollow) and with the seven-channel physics-informed input of \cref{sec:ch3-solar} (IEP, filled), on the populations of \cref{tab:ch4-solar-benchmark} (left), and the IEP-minus-RGB difference with its 95\,\% day-block bootstrap interval (right). Conditional rows use the policy as first specified in the originating publication; one run per cell; the two checkpoints differ in training augmentation as stated in the text.}
+  \label{fig:ch4-iep}
+\end{figure}
+
+
+\subsection{Conclusions}
+\label{sec:ch4-conditional-adaptation-conclusions}
+Over three year-long campaigns from one checkpoint, the conditional policy with a damped encoder action improves accuracy under deployment shift, ties the sliding-window adaptation of \citet{LARABENITEZ2023126312} on absolute error within a $\pm\SI{5}{\percent}$ margin at every site, and trails it on forecast skill only at Poznań. The same policy with the full-encoder action first specified drifts within months at the source site; damping the encoder step, not restricting it, removes the drift. The recorded actions give the update budget the policy implies, \SIrange{70}{111}{\second} of update compute per day on a Raspberry Pi 5, and a separate 640-sample profile gives a lower mean update latency than sliding-window adaptation; without matched daily energy this supports a conditional accuracy--time trade-off rather than an overall efficiency verdict. \Cref{sec:ch4-accelerator-execution} separately measures a frozen-encoder classification path that recomputes features at each training step; its savings do not establish the buffering or execution path used here. The threshold derivation and the comparison against the published adaptation methods in their original form are set out in~\cite{10.1007/978-3-032-07343-328}.
+
+\paragraph{Limitations.} The assertions in this section are limited by four constraints.
+\begin{itemize}
+  \item \textbf{Selection on the evaluation streams.} The damping factor, the choice of encoder stages and the comparison among the variants of \cref{tab:ch4-encoder-ablation} were made on the same year-long streams the results are reported on; no separate selection split exists. The claims that survive this are the qualitative ones: that the full-encoder action drifts, that damping the step removes the drift, and that the damped policy is on par with sliding-window adaptation. That it is the best of the variants is optimistic by an unestimated amount.
+  \item \textbf{Single-run results.} Every arm except few-shot adaptation is one run, consistent with the thesis-wide reporting caveat on repeatability, so the intervals of \cref{fig:ch4-contrasts} describe temporal variability over days and not training variance. This matters most for the \numrange{0.7}{2.2}-point gains of the damped action over head-only updates. The three few-shot seeds vary by at most \num{0.12} points of skill.
+  \item \textbf{Representation.} The crossed check of \cref{fig:ch4-iep} uses the policy as first specified and one seed per cell, and its two checkpoints differ in training augmentation as well as input. Whether the damped policy and the physics-informed input are complementary is therefore supported only indirectly.
+  \item \textbf{Retention.} Forgetting of the source distribution is not part of the question this chapter asks and is not measured; the reported gains describe the deployment stream alone.
+\end{itemize}
+
+% =========================================================================
+\section{Input admissibility: withhold supervision, not images}
+\label{sec:ch4-admissibility}
+% =========================================================================
+The policy of \cref{sec:ch4-conditional-adaptation} acts on every buffered sample once its label arrives. This section asks whether some samples should never reach it, the first condition of the adaptation protocol and the only one decidable at $t$, from the input alone, before any label has arrived. The originating publication~\cite{Piechocki2025:i63677} proposed an anomaly score on the forecasting embedding as that screen. The evidence assembled here, three detectors and the policy run on four fault streams, reverses the premise. A score on the pooled embedding measures forecasting difficulty and is blind to sensing faults; a per-position score on an early encoder stage detects them; and, once they are detected, withholding them turns out to be the wrong response for every fault that persists. A corrupted frame whose label is still valid is a training example, and the policy learns to see through dirt or around an occluder within weeks if it is allowed to. What a screen may legitimately withhold is a transient event, which the policy cannot learn from, and a frame whose label is wrong, which this section does not test. The remainder specifies the detectors, what each one detects, and what the policy does with and without them.
+
+\subsection{Method}
+\label{sec:ch4-admissibility-method}
+Not every departure from the training distribution is a fault, and not every fault is unlearnable. Dirt, insects and birds on the dome, water on it, and acquisition faults in the camera all change the frame without changing the irradiance it must predict. The methods below were developed in sequence, each pre-registered with its pass criteria before it was scored, and the sequence is reported as it happened, including the designs that failed.
+
+\paragraph{Data and detector fitting.} All detectors are fitted on the Folsom record in the second partition of \cref{tab:ch2-shared-assets}. The training and validation partitions, already used to fit the forecaster, additionally serve to fit the detectors, and the held-out 2016 year is replayed as a stream of previously unseen samples. Every fifth frame of 2014--2015 is used, split by whole days: 458 days (\num{62251} frames) fit each detector and 115 held-out days (\num{15466} frames) set its threshold, always at the 99th percentile of the detector's own calibration scores, a nominal false-alarm rate of \SI{1}{\percent} following \cref{sec:ch2-ood}.
+
+\paragraph{Embedding-space scoring.} The reused ResNet50 encoder maps each frame to $z_t = g(x_t;\theta_b) \in \mathbb{R}^{\num{2048}}$. An Isolation Forest~\cite{articleLiu2012} with 100 estimators is fitted to nominal training embeddings and applied unchanged; a Mahalanobis distance and a $k$-nearest-neighbour distance on the same embeddings, and two model-free references on raw pixels, a dark-pixel fraction and a Laplacian-variance blur score, are compared with it. Scoring traverses the fitted trees without a second encoder pass, so its added work depends on the forest rather than on image resolution. This is the screen of the originating publication, retained here because what it fails to detect is instructive.
+
+\paragraph{Per-position scoring.} The camera never moves, so every position in the frame has its own notion of normal. The second detector reads the encoder's second stage, a $512 \times 16 \times 16$ tensor at the $128 \times 128$ input, so one cell per $8 \times 8$ pixel block, pools each cell with its $3 \times 3$ neighbourhood and projects it to 128 dimensions with a fixed random matrix. For each of the 172 cells whose block lies inside the circular field of view, a memory bank holds that cell's features from \num{2000} nominal frames; a cell's score is its nearest-neighbour distance to its own bank, divided by the 95th percentile of the same distance on \num{1000} other nominal frames. The design follows the memory-bank detectors of industrial inspection~\cite{roth2022towards}, transposed to a fixed camera. The bank occupies \SI{176}{\mega\byte} in \gls{fp32}; scoring latency on the target platform is not measured. Because the second stage is below the encoder stages that the damped action of \cref{eq:ch4-damped-encoder-update} updates, the detector is unaffected by adaptation and needs no refitting as the policy runs.
+
+\paragraph{The exclusion flag.} A frame score is some statistic of its 172 cell scores, and the choice of statistic decides which faults are visible. The maximum over all cells, the first pre-registered design, is dominated by the outermost ring of cells, where the low sun and its reflections sit: \SI{95}{\percent} of the frames it flags on the clean 2016 stream are blamed on that ring, and three quarters of them fall at solar elevations below \ang{20} or within two cells of the projected sun. The design retained, the third pre-registered, uses two statistics chosen for two footprints. The \emph{global} score $G$ is the median over all cells and responds to frame-wide departures, an acquisition fault or water over the dome; the \emph{core} score $C$ is the maximum over the 72 cells at least three cells from the border and responds to compact objects away from the rim. The exclusion score is $s_t = \max(G/t_G,\, C/t_C)$ with $t_G$ and $t_C$ the 99.5th percentiles of $G$ and $C$ on the calibration frames, so that $s_t > s_{\mathrm{anom}} = 1$ flags about \SI{1}{\percent} of nominal frames, and a flagged frame is withheld from the update loop by line 1 of \cref{alg:ch4-conditional-adaptation}. Nothing else happens to it: the forecast is issued as usual.
+
+\paragraph{Synthetic faults.} No annotated sensing faults exist for any of the three sites, so detection is measured on faults rendered onto clean 2016 frames (\cref{fig:ch4-fault-mosaic}): \emph{soiling}, three to six diffuse dark patches persisting for one to three whole days; \emph{occlusion}, an opaque object of a colour and shape drawn per episode, standing in for a bird and lasting 5 to 30 minutes; \emph{banding}, horizontal gain bands and row noise redrawn every frame, modelled on an acquisition fault of the Folsom camera and lasting 1 to 5 minutes; and \emph{insect}, a body of a few pixels with legs, lasting 2 to 15 minutes. Soiling and occlusion are also rendered at the rim of the field of view, where the exclusion flag discards evidence by construction. Two further faults were used along the way and retired: sparse droplets, too small at this resolution for any detector, and a dense wet-dome rendering that was more opaque than the real frames motivating it; their rows are reported in the reproduction record and omitted here.
+
+\paragraph{The maintenance alert.} A persistent fault calls for a different response than exclusion: someone has to clean the dome. Three alert designs were pre-registered and tested, each a causal rolling median of a frame score over the preceding 30 or 60 minutes of the same day, thresholded at its 99th percentile on 30 whole calibration days, with the criterion that every soiling episode of the corrupted stream raises an alert within two hours while alerts fire on at most \SI{1}{\percent} of fault-free frames. Their outcome is reported below in one paragraph, because all three fail, and for reasons that bear on the exclusion flag.
+
+\subsection{Evaluation}
+\label{sec:ch4-admissibility-evaluation}
+
+\paragraph{Evaluation protocol.} The following are reported.
+\begin{itemize}
+  \item \textbf{Detection of synthetic faults:} for each detector, the share of faulty frames flagged at its own threshold and the AUROC against clean frames, on \num{3070} Folsom 2016 daylight frames per condition (\cref{tab:ch4-detection}); for the exclusion flag, the pre-registered criterion of at least \SI{50}{\percent} of banding and occlusion frames flagged at no more than \SI{2}{\percent} of clean frames.
+  \item \textbf{Real flagged frames:} the frames the exclusion flag ranks highest on the replayed 2016 stream, one per day, inspected and grouped by the physical condition producing them (\cref{fig:ch4-flagged-frames}).
+  \item \textbf{The policy under faults:} the static model, the damped policy and the damped policy with the exclusion flag active, on four streams: the clean year; a year with mixed episodes of every fault on \SI{3.9}{\percent} of daylight frames; a continuous soiling from 1 July to 15 August, then cleaned; and a permanent occluder from 1 September to the end of the year. Error on fault-free and on faulty frames, updates made on faulty frames, frames withheld, and the paired day-block bootstrap contrasts of \cref{fig:ch4-contrasts} (\cref{tab:ch4-streams}, \cref{fig:ch4-continuous}). Three further streams with mixed episodes on 1, 5 and \SI{15}{\percent} of frames were run to test whether the dose matters; it does not, and they are reduced to one sentence.
+  \item \textbf{The maintenance alert:} the three designs against their pre-registered criteria.
+\end{itemize}
+Every arm is a single run from the checkpoint of \cref{sec:ch4-conditional-adaptation-method} on the population of \cref{tab:ch4-solar-benchmark}, and every fault stream is one draw of its schedule. The pre-registrations, the reproduction commands and the retired designs are in the repository's admissibility record.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/ch4_admissibility_fault_mosaic.pdf}
+\caption[Synthetic sensing-path faults on real frames.]{Synthetic sensing-path faults rendered onto three real Folsom 2016 frames (rows: clear, cumulus, overcast). Columns: the clean frame; soiling; occlusion, whose colour and shape are drawn per episode; the same two faults at the rim of the field of view; banding, an acquisition fault; and an insect on the dome. Every frame carries its valid irradiance label; only the image is altered.}
+\label{fig:ch4-fault-mosaic}
+\end{figure}
+
+\paragraph{The embedding score does not detect sensing faults; the per-position score does.} \Cref{tab:ch4-detection} gives the result for the two detector families and the exclusion flag built from the second. At its threshold the Isolation Forest flags \SIrange{0.9}{1.7}{\percent} of frames carrying any of the six faults, indistinguishable from its \SI{1.2}{\percent} rate on clean frames, and its AUROC against clean frames is \numrange{0.54}{0.77}; the Mahalanobis and nearest-neighbour scores behave alike. The reason is the representation. The pooled embedding of an encoder trained to predict irradiance is invariant to corruptions that do not change the irradiance, which is what the invariance of its score across the columns of \cref{fig:ch4-fault-mosaic} shows. A model-free dark-pixel fraction sees opaque occlusion (\SI{22.9}{\percent}) and nothing else. The per-position score, taking the frame maximum, ranks every fault well (AUROC \numrange{0.84}{0.97}) but flags \SI{1.8}{\percent} of clean frames against the \SI{1}{\percent} it was calibrated to, because its rim cells drift between years. The exclusion flag removes the rim from the statistic and holds its calibration: it flags \SI{1.2}{\percent} of clean frames, \SI{85.4}{\percent} of banding frames and \SI{79.2}{\percent} of occlusions, passing its pre-registered criterion, together with \SI{33.0}{\percent} of insects, a few pixels at this resolution, and \SI{39.8}{\percent} of soiled frames. Its two statistics divide the work as designed: banding is caught by the global median (\SI{79.6}{\percent} alone), birds and insects by the core maximum. Faults placed at the rim are its blind spot (\SI{35.9}{\percent} of rim occlusions, \SI{8.5}{\percent} of rim soiling), the price of discarding the ring where illumination events live.
+
+\begin{table}[!t]
+\caption[Detection of synthetic sensing faults.]{Detection of synthetic sensing faults on \num{3070} Folsom 2016 daylight frames per condition. Flagged: share of frames above the detector's own threshold, calibrated on held-out 2014--2015 days to a nominal \SI{1}{\percent} false-alarm rate (\SI{0.5}{\percent} per statistic for the exclusion flag), so the clean column is the realized false-alarm rate on the evaluation year; AUROC against the clean frames. The embedding detector scores the pooled \num{2048}-dimensional embedding of the forecasting pass; the dark-pixel fraction scores raw pixels; the per-position detector scores each cell of the encoder's second stage against a per-cell memory bank, either as the frame maximum or as the exclusion flag of \cref{sec:ch4-admissibility-method}. Rim: the same fault with its centre in the outer fifth of the field-of-view radius.}
+\label{tab:ch4-detection}
+\centering
+\small
+\TableTight
+\begin{tabular}{l S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=2.1] S[table-format=1.2] S[table-format=1.2] S[table-format=1.2] S[table-format=1.2]}
+\toprule
+ & \multicolumn{7}{c}{\thead{flagged at the calibrated threshold (\si{\percent})}} & \multicolumn{4}{c}{\thead{AUROC vs. clean}}\\
+\cmidrule(lr){2-8}\cmidrule(lr){9-12}
+\thead{Detector} & \multicolumn{1}{c}{\thead{clean}} & \multicolumn{1}{c}{\thead{soil.}} & \multicolumn{1}{c}{\thead{soil.\\rim}} & \multicolumn{1}{c}{\thead{occl.}} & \multicolumn{1}{c}{\thead{occl.\\rim}} & \multicolumn{1}{c}{\thead{band.}} & \multicolumn{1}{c}{\thead{insect}} & \multicolumn{1}{c}{\thead{soil.}} & \multicolumn{1}{c}{\thead{occl.}} & \multicolumn{1}{c}{\thead{band.}} & \multicolumn{1}{c}{\thead{insect}}\\
+\midrule
+Isolation Forest (embedding) & 1.2 & 0.9 & 1.2 & 1.2 & 1.4 & 1.7 & 1.1 & 0.69 & 0.62 & 0.77 & 0.54\\
+Dark-pixel fraction & 0.7 & 0.6 & 0.1 & 22.9 & 13.7 & 0.6 & 1.1 & 0.49 & 0.74 & 0.49 & 0.52\\
+Per-position, frame maximum & 1.8 & 13.3 & 9.2 & 50.5 & 32.1 & 58.3 & 10.8 & 0.89 & 0.96 & 0.97 & 0.84\\
+\textbf{Exclusion flag} $\max(G/t_G, C/t_C)$ & 1.2 & 39.8 & 8.5 & 79.2 & 35.9 & 85.4 & 33.0 & 0.96 & 0.99 & 0.99 & 0.94\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{What the flag finds on the real stream.} \Cref{fig:ch4-flagged-frames} shows the 48 real 2016 frames the exclusion score ranks highest, one per day. The top of the ranking is sensing faults: four birds on the dome, a person standing over the camera, and three frames with the banding fault that motivated the synthetic one, together with a run of wet-dome frames in January and a reflection pattern inside the dome. Below them the ranking fills with rare sky, isolated cumulus, cirrus streaks, dense overcast and a red sunrise, which are under-represented in the 2014--2015 bank and are the frames behind the \SI{1.2}{\percent} clean-stream rate. This is a qualitative reading of unlabelled frames and is reported as such. It matches the synthetic result in the one respect that matters for the section: the frames the flag withholds from the policy are, at the top, unusable evidence and, further down, unusual but valid evidence.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/ch4_admissibility_monitor_grid.pdf}
+\caption[Real frames the exclusion flag ranks highest.]{The 48 real Folsom 2016 frames the exclusion score ranks highest, one per day, in rank order. Each title gives the date, the time, which statistic fired (G, the global median; C, the core maximum, whose cell is boxed) and the score as a multiple of the threshold. Birds, a person over the camera, acquisition banding, water on the dome and an internal reflection occupy the top rows; unusual but valid sky fills the rest.}
+\label{fig:ch4-flagged-frames}
+\end{figure}
+
+\paragraph{The policy under faults.} \Cref{tab:ch4-streams} is the substantive result of the section. It reports the static model, the damped policy and the damped policy with the exclusion flag active on the clean year and on three corrupted copies of it. Three findings follow, in order of increasing consequence.
+
+First, learning from faulty frames does not contaminate the forecasts on clean ones. On the mixed-episode stream the policy makes \num{4423} of its updates on faulty frames, \SI{35}{\percent} more than the same frames attract when clean, because the faults raise the lagged error that triggers it; its skill on the fault-free frames is within \num{0.06} points of the clean-year run. The three dose streams say the same at 1, 5 and \SI{15}{\percent} of frames faulty (\num{-0.01}, \num{-0.05} and \num{-0.03} points), so the objection that the faults were too rare to matter does not survive. The labels of a soiled or occluded frame are valid, and an update toward a valid label from a corrupted image is a small perturbation, not a poisoning.
+
+Second, the exclusion flag is accuracy-neutral on transient faults and cheap. On the clean year it withholds \SI{1.2}{\percent} of frames and changes skill by \num{-0.05} points ($[-0.10, -0.00]$) with MAE \SI{0.09}{\percent} lower; on the mixed-episode stream it withholds \SI{82}{\percent} of the banding frames and \SI{78}{\percent} of the occlusions in their episodes, removes a third of the updates made on faulty frames, and changes fault-free skill by the same \num{-0.05} points. It costs a third of what the embedding gate of the originating publication costs on the same runs (\num{-0.15} points, $[-0.26, -0.03]$), because what it withholds is mostly uninformative rather than mostly informative. Its justification is therefore not accuracy but budget: the updates it saves are made on frames the model cannot generalize from.
+
+Third, and this is the finding that decides the section, withholding a persistent fault is harmful. Under continuous soiling the flag withholds \SI{38}{\percent} of the soiled frames; under the permanent occluder, \SI{87}{\percent}. The ungated policy learns through both. \Cref{fig:ch4-continuous} follows its error on the faulty frames week by week: under soiling its excess over the clean-year run on the same dates halves between the first and the last two weeks of the episode (from \num{+1.4} to \SI{+0.7}{\watt\per\square\meter}), and under the occluder its error in the last two weeks is within \SI{1}{\percent} of the clean-year run on the same dates. The gated policy, starved of the frames it would learn from, does neither: its excess under soiling grows (from \num{+2.1} to \num{+3.4}), and under the occluder it stays \SI{4}{\percent} above the clean-year run. Over the whole episode the flag costs \SI{21}{\percent} of MAE on the soiled frames ($[+11, +29]$, \num{-4.6} skill points, $[-13.4, -1.6]$) and \SI{3.2}{\percent} on the occluded ones ($[+1.9, +5.1]$, \num{-1.4} points, $[-1.9, -1.1]$). Against the static model, which cannot learn through either fault, the ungated policy is \num{13.7} skill points better on the soiled frames ($[+4.2, +43.5]$; MAE \SI{34}{\percent} lower) and \num{2.5} points better on the occluded ones ($[+1.9, +3.7]$); the gated policy keeps \num{9.1} and \num{1.1} of those points. The same holds on the mixed-dose streams, where the policy beats the static model on faulty frames by \num{4.0}, \num{14.5} and \num{7.5} points at 1, 5 and \SI{15}{\percent} of frames faulty, with the gated policy always between the two.
+
+\begin{table}[!t]
+\caption[The policy under sensing faults, with and without exclusion.]{The static model, the damped policy of \cref{eq:ch4-damped-encoder-update} and the same policy with the exclusion flag active, on the clean Folsom 2016 year and three corrupted copies of it: mixed episodes of every fault of \cref{fig:ch4-fault-mosaic} (the pre-registered stream of the exclusion flag, which also carried a dense-droplet fault later retired); one continuous soiling from 1 July to 15 August, then cleaned; and one permanent occluder from 1 September. MAE (\si{\watt\per\square\meter}) and forecast skill (\si{\percent}) on the fault-free and on the faulty frames of each stream; updates made in total and on faulty frames; share of faulty frames the flag withholds; and the paired contrast in forecast skill on the faulty frames, policy against static in the policy row and gated against ungated in the gated row, with its 95\,\% day-block bootstrap interval. Single runs.}
+\label{tab:ch4-streams}
+\centering
+\small
+\TableTight
+\begin{tabular}{l S[table-format=2.2] S[table-format=2.2] c c S[table-format=6.0] c c l}
+\toprule
+ & \multicolumn{2}{c}{\thead{fault-free frames}} & \multicolumn{2}{c}{\thead{faulty frames}} & & & & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+\thead{Stream, arm} & \multicolumn{1}{c}{\thead{MAE}} & \multicolumn{1}{c}{\thead{FS}} & \thead{MAE} & \thead{FS} & \multicolumn{1}{c}{\thead{updates}} & \thead{on faulty} & \thead{withheld\\(\si{\percent})} & \thead{$\Delta$FS, faulty frames}\\
+\midrule
+\input{tables/ch4_streams.tex}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/ch4_admissibility_continuous.pdf}
+\caption[Adaptation through a persistent fault, with and without exclusion.]{Weekly MAE on the faulty frames under continuous soiling (left, 1 July to 15 August) and under the permanent occluder (right, from 1 September): the static model, the damped policy, and the same policy with the exclusion flag active; bars give the share of faulty frames the flag withholds each week. The ungated policy converges toward its clean-year error on the same dates; the gated policy, denied the frames, does not.}
+\label{fig:ch4-continuous}
+\end{figure}
+
+\paragraph{The maintenance alert fails, for a reason that matters.} None of the three pre-registered alert designs meets its criteria. The frame-maximum alert raises an alert within two hours in three of four soiling episodes and fires on \SI{2.8}{\percent} of fault-free frames against the \SI{1}{\percent} bar, because a threshold calibrated on 2014--2015 flags \SI{1.5}{\percent} of 2016 frames and the rolling median amplifies clustered exceedances; restricting it to interior cells brings the false alerts to \SI{1.6}{\percent} and detects the same three episodes. The third design, a 60-minute median of the global score, separates transient from persistent events as intended, alerting during \SI{3}{\percent} of bird, banding and insect episodes, but fires on \SI{3.9}{\percent} of fault-free frames and, decisively, during only \SI{2.9}{\percent} of the frames of the continuous soiling and \SI{5.0}{\percent} of the occluded ones. Three to six soiling patches or one occluder cover a minority of the 172 cells, so the median cell score never moves; the faults the policy handles best are the ones this statistic cannot see. A per-cell persistence measure would be the next design, and is not attempted here.
+
+\subsection{Conclusions}
+\label{sec:ch4-admissibility-conclusions}
+Admissibility is a property of the supervision, not of the image. The evidence of this section supports a screen that withholds transient sensing events from the update loop, reliably detected by a per-position score on an early encoder stage at a cost of one percent of clean frames and no measurable accuracy, and it argues against withholding anything that persists: a soiled or occluded frame with a valid label is evidence the policy uses, within weeks, to forecast through the fault, and a screen that removes it slows that recovery by the amount it removes. The pooled-embedding score of the originating publication detects neither class, because it measures forecasting difficulty. What remains for a screen to do is the case this section does not test: a fault in the label path, where the supervision itself is wrong and no update should be made. The design rule is stated once, in \cref{sec:ch4-summary}: withhold supervision, not images.
+
+\paragraph{Limitations.} The evidence is limited by five constraints.
+\begin{itemize}
+  \item \textbf{Label-path faults are untested.} Every synthetic fault leaves the irradiance label valid. A soiled pyranometer or a clock offset corrupts the supervision, which is the case where withholding is certainly right; the section establishes only that image-path faults do not require it.
+  \item \textbf{Synthetic faults only.} Detection rates and the recovery curves rest on rendered faults whose realism is not validated against annotated real ones; the real flagged frames of \cref{fig:ch4-flagged-frames} are characterized by inspection alone. The banding fault is more saturated than the real frames that motivated it, so its detection rate is optimistic.
+  \item \textbf{Thresholds do not transfer across years.} Every detector was calibrated on 2014--2015 and drifts on 2016 by \numrange{0.2}{2.9} percentage points of false alarms; the exclusion flag drifts least, but none was recalibrated on the deployment year, and the same drift would be larger after relocation.
+  \item \textbf{One site, one year, single runs.} All runs are Folsom 2016, one run per arm and one draw per fault schedule, so the intervals describe temporal variability only. The recovery curves of \cref{fig:ch4-continuous} are one episode each.
+  \item \textbf{A guided sequence.} The three detector designs and the fault streams were pre-registered one after another, each after inspecting the previous result. Every criterion was fixed before scoring, but the sequence itself was not, and the exclusion flag is the third design tried.
+\end{itemize}
+The cost of the per-position detector on the target platform, the \SI{176}{\mega\byte} bank and the scoring latency, is not measured; only the second-stage activations of the forecasting pass are reused, so the added work is the nearest-neighbour search.
+
+% =========================================================================
+\section{Update affordability through accelerator-backed execution}
+\label{sec:ch4-accelerator-execution}
+% =========================================================================
+Update affordability, the third protocol condition, turns on where the backbone forward pass executes, and this is the point at which the deployment protocol of \cref{ch:resource-efficient-perception} starts to determine what adaptation costs and does not merely precede. Every ingredient the execution pattern requires is an artifact of deployment-time work. The backbone must be quantized to a precision the accelerator admits, compiled through a toolchain that accepts its operator set, and partitioned across the host--accelerator boundary. A model that failed any of those checks cannot be adapted by this pattern at all, whatever its learning algorithm. The update affordability condition is accordingly not settled by a choice made in this chapter but by choices made in the previous one, and what this section measures is how much they are worth. The head updates it would accelerate are the majority action of the policy of \cref{sec:ch4-conditional-adaptation}, \SIrange{34}{51}{\percent} of buffered samples in \cref{tab:ch4-actions}.
+
+The execution pattern is a property of the encoder--head factorization of \cref{eq:ch2-backbone-head} and is independent of any particular task, requiring only a frozen backbone, a trainable head, and a feature-tensor interface between them. It is accordingly evaluated on standard supervised image-classification benchmarks, which permits comparison against established baselines and isolates the systems contribution from task-specific confounds, with the frozen backbone playing the role of the sky-image encoder $g(\cdot\,;\theta_b)$ and the trainable head that of the irradiance predictor $h(\cdot\,;\theta_h)$. That correspondence is architectural, not measured, and \cref{sec:ch4-accelerator-execution-conclusions} treats the gap explicitly.
+
+\subsection{Method}
+\label{sec:ch4-accelerator-execution-method}
+The asymmetry that makes on-device learning tractable is a property of the hardware. Edge accelerators are optimized for the forward pass that dominates an update while lacking the operator support, writable weights and autograd a training pipeline needs, so they can execute the expensive part of an update and none of the part that makes it an update, which the pattern below exploits.
+
+The proposed methodology decomposes an on-device model update into two tightly coupled stages: (1) a frozen backbone, quantized to \gls{int8} and executed as an inference graph on the hardware accelerator, and (2) a compact task-specific head, maintained in \gls{fp32} on the host processor. At each adaptation step, the accelerator performs feature extraction and streams the resulting intermediate feature tensor to the host. The host then executes the forward pass of the head, computes the loss, performs backpropagation restricted to the head parameters, and applies the corresponding optimizer update.
+Contribution is the Hailo/ONNX Runtime implementation and its characterization across backbones, restoration settings, latency and energy. The frozen-accelerator/CPU-head partition itself has direct prior art: Coral documents compiled Edge TPU embedding extraction followed by CPU last-layer backpropagation.\footnote{Google Coral, \href{https://coral.ai/docs/edgetpu/retrain-classification-ondevice-backprop/}{\emph{Retrain a classification model on-device with backpropagation}}, accessed 21 September 2026.} That guide uses TensorFlow Lite/PyCoral and a softmax head, with an embedding-extraction procedure based on quantization-aware models; it collects embeddings before head training. Here, Hailo INT8 preparation and restoration are paired with an ONNX Runtime FP32 head, and the measured training path recomputes features at each step. No matched cross-accelerator or cached-feature benchmark is claimed. Gradients stop at this interface, which eliminates the need to store backbone activations or perform backpropagation through the deep backbone network. \Cref{fig:ch4-on-device-training-flow} provides an overview of the heterogeneous adaptation pipeline employed in this chapter.
+
+\paragraph{Formal statement.} Writing the deployed predictor in the composed form of \cref{eq:ch2-backbone-head}, the heterogeneous configuration replaces the backbone parameters with their quantized counterpart $\tilde\theta_b = Q(\theta_b)$, where $Q$ denotes the \gls{int8} quantization and restoration operator specified below, and evaluates that stage on the accelerator:
+\begin{equation}
+\label{eq:ch4-heterogeneous-split}
+\hat y \;=\; \underbrace{h\bigl(\,\cdot\;;\theta_h\bigr)}_{\text{host, FP32, trainable}}\!\left(\underbrace{g\bigl(x;\, \tilde\theta_b\bigr)}_{\text{accelerator, INT8, frozen}}\right),
+\qquad
+\Delta\tilde\theta_b \equiv 0 .
+\end{equation}
+The second condition of \cref{eq:ch4-heterogeneous-split} fixes the backbone update to zero; it does not assert that the loss is mathematically independent of its parameters. The trainable subspace is $\mathcal{S}=\{0\}^{|\theta_b|}\times\mathbb{R}^{|\theta_h|}$ as in \cref{eq:ch4-head-only-update}, so the chain rule is required only along the head, $\nabla_{\theta_h}\mathcal{L} = (\partial\mathcal{L}/\partial h)(\partial h/\partial\theta_h)$, and no intermediate activation of $g$ enters the backward pass. The accelerator need support only inference, the capability such devices provide.
+
+\paragraph{Cost model.} Let $C^{\mathrm{fwd}}_g$ and $C^{\mathrm{fwd}}_h$ denote the forward cost of backbone and head, and $C^{\mathrm{bwd}}_h$ the head backward cost. For a path that recomputes features at each update, a host-only head-only update costs $C_{\mathrm{host}} = C^{\mathrm{fwd}}_g + C^{\mathrm{fwd}}_h + C^{\mathrm{bwd}}_h$, whereas the heterogeneous configuration replaces the first term with its accelerated counterpart $\tilde C^{\mathrm{fwd}}_g$, giving a per-update speedup
+\begin{equation}
+\label{eq:ch4-speedup-model}
+S \;=\;
+\frac{C^{\mathrm{fwd}}_g + C^{\mathrm{fwd}}_h + C^{\mathrm{bwd}}_h}
+     {\tilde C^{\mathrm{fwd}}_g + C^{\mathrm{fwd}}_h + C^{\mathrm{bwd}}_h}.
+\end{equation}
+\Cref{eq:ch4-speedup-model} provides two limiting regimes for interpreting the total step times in \cref{sec:ch4-heterogeneous-evaluation}; the individual cost terms are not profiled separately. When the backbone dominates, $C^{\mathrm{fwd}}_g \gg C^{\mathrm{fwd}}_h + C^{\mathrm{bwd}}_h$ and $S \to C^{\mathrm{fwd}}_g/\tilde C^{\mathrm{fwd}}_g$, so the realized speedup approaches the raw accelerator speedup. When the head terms dominate both configurations, $S \to 1$ irrespective of how fast the accelerator is. Feature-transfer and runtime overhead are included only insofar as they are covered by the measured forward-cost terms; the expression is not a complete memory or duty-cycle energy model. The benefit of this execution pattern is governed by the ratio of frozen-backbone cost to trainable-head cost, not by accelerator performance alone. This is a prediction against which the measured per-architecture results are compared in \cref{sec:ch4-heterogeneous-evaluation}.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/accelerator_training_flow.pdf}
+\caption[Execution partition of the heterogeneous on-device adaptation pipeline.]{Execution partition of the heterogeneous on-device adaptation pipeline. The frozen backbone executes as an INT8 computation graph on the accelerator, and the resulting feature tensor is transferred to the host, where the FP32 head is adapted.}
+\label{fig:ch4-on-device-training-flow}
+\end{figure}
+
+\paragraph{Backbone selection and characterization.} Four ImageNet-pretrained backbones (ResNet18 \cite{ResNet}, EfficientNet-Lite 4 \cite{pmlr-v97-tan19a}, MobileNetV3 Large \cite{howard2019searching}, and FastViT-SA12 \cite{10377971}) from \textit{PyTorch Image Models (timm)} \cite{rw2019timm} are evaluated. For each, a single linear classification head is trained on the emitted feature vector, and although only one layer is considered here the same pipeline applies to deeper head variants.
+
+\Cref{tab:ch4-backbone-characterization} gives the two architectural quantities relevant to \cref{eq:ch4-speedup-model}. Backbone multiply--accumulate operations describe the workload offloaded from the host; feature width determines the input dimension of the head left there. Their ratio motivates a speedup prediction, although operation counts do not measure execution time.
+
+ResNet18 combines the highest operation count with the narrowest feature vector, suggesting the backbone-dominated regime. MobileNetV3 Large has roughly \num{8}$\times$ fewer backbone operations but a \num{2.5}$\times$ wider vector, leaving relatively more head work on the host. This interpretation must be tested against the timings: accelerator mapping, feature transfer and synchronization can also affect speedup.
+
+\begin{table}[!t]
+\caption[Frozen-backbone characterization at $3\times224\times224$ input resolution.]{Frozen-backbone characterization at $3\times224\times224$ input resolution. Multiply--accumulate operations (MACs) and parameter counts describe the portion of the network offloaded to the accelerator; output features is the width of the feature vector delivered across the host interface, and therefore the input dimension of the trainable head. $B$ denotes batch size.}
+\label{tab:ch4-backbone-characterization}
+\centering
+\small
+\TableTight
+\begin{tabular}{l S[table-format=2.2] S[table-format=2.2] l}
+\toprule
+\thead{Backbone} & \multicolumn{1}{c}{\thead{MACs (G)}} & \multicolumn{1}{c}{\thead{Params (M)}} & \thead{Output features}\\
+\midrule
+ResNet18            & 1.82 & 11.19 & $B \times 512$\\
+EfficientNet-Lite 4 & 1.35 & 11.67 & $B \times 1280$\\
+MobileNetV3 Large   & 0.22 &  4.23 & $B \times 1280$\\
+FastViT-SA12        & 1.38 & 10.55 & $B \times 1024$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Model conversion and quantization.} The subgraph-delegation path of \cref{sec:ch2-toolchains-pipeline} places the partition at the encoder--head interface. Hailo Dataflow Compiler 3.31.0 \cite{hailo-dataflow} prepares the frozen stage, whose output terminates backpropagation. The practical difficulty is feature fidelity: converting the backbone from \gls{fp32} to \gls{int8} can degrade the representations from which the host head learns. Performance-restoration techniques are therefore incorporated during compilation.
+
+\begin{table}[!t]
+\centering
+\small
+\TableNormal
+\caption[Performance restoration strategies and configurations.]{Evaluated performance restoration strategies and their configurations. Configuration definitions and values reproduced from Table 1 of \cite{piechocki2026empowering}. Eq. denotes channel equalization, IBC represents iterative bias correction, FT denotes knowledge-distillation fine-tuning, and AR stands for the AdaRound algorithm.}
+\label{tab:ch4-perf-restoration-strategies}
+\begin{tabular}{c c c l}
+\toprule
+\thead{\#} & \thead{Techniques} & \thead{Cost} & \thead{Configuration Details} \\
+\midrule
+0 & None & -- & -- \\
+1 & Eq. & low & -- \\
+2 & Eq. + IBC & low & 64 unlabeled images \\
+3 & Eq. + FT & medium & 4 epochs \& 1024 images \\
+4 & Eq. + AR & high & 320 epochs \& 256 images on all layers \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The five configurations of \cref{tab:ch4-perf-restoration-strategies} escalate in cost. Channel equalization reduces scale imbalances across adjacent layers~\cite{meller2019same} and iterative bias correction compensates mean shifts in quantized activations~\cite{finkelstein2019fighting}, with the IBC configuration using 64 unlabeled images as listed in \cref{tab:ch4-perf-restoration-strategies}. The two data-driven methods are knowledge-distillation fine-tuning of the quantization degrees of freedom~\cite{10.1007/978-3-031-25082-8_8} and AdaRound, which optimizes weight-rounding decisions to minimize local task loss~\cite{nagel2020up}. Restoration is performed within the accelerator compilation flow, using the Hailo Dataflow Compiler with default settings and a small calibration subset sampled from ImageNet (\cref{sec:ch4-heterogeneous-evaluation}).
+
+\Cref{fig:ch4-model-conversion} follows the backbone from floating-point \gls{onnx} export through \gls{int8} compilation and restoration to integration with the trainable head.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/conversion_pipeline.pdf}
+\caption{\gls{onnx}-based toolchain for heterogeneous adaptation: export, INT8 compilation and restoration, and training-graph generation.}
+\label{fig:ch4-model-conversion}
+\end{figure}
+
+\subsection{Evaluation}
+\label{sec:ch4-heterogeneous-evaluation}
+
+\paragraph{Evaluation protocol.} The claim under test is that an \gls{int8} frozen backbone executed on an inference accelerator, combined with a small \gls{fp32} trainable head on the host, makes frequent on-device updates practical in both respects that matter, update quality and the latency and energy cost of a training step. The claim is tested on four classification backbones and two classification datasets, not on the ResNet50 forecaster of \cref{sec:ch4-conditional-adaptation}, so the results below characterize this implementation, and its benefit for the forecasting head is an inference from the cost model rather than a measurement. The following are reported:
+\begin{itemize}
+  \item \textbf{Task metrics:} test accuracy after five epochs of head-only fine-tuning on CIFAR-100 and Oxford-IIIT Pet, across four backbones and three execution configurations (\cref{tab:ch4-high-level-results}), together with accuracy under alternative \gls{int8} restoration strategies (\cref{fig:ch4-quant-restoration}).
+  \item \textbf{System metrics.} Training-step latency (\si{\milli\second\per\step}) and energy per training step (\si{\milli\joule\per\step}) at batch size 1, where a step comprises backbone feature extraction, head forward pass, loss computation, backpropagation through the head, and the optimizer update. Throughput against batch sizes 1, 4, and 16 (\cref{fig:ch4-batch-scaling}), plus time-to-accuracy convergence profiles (\cref{fig:ch4-convergence}). These are collected under the measurement procedure of \cref{sec:ch2-system-metrics-measurement}. Energy is obtained from an external inline meter sampling at \SI{5}{\hertz} on the Raspberry~Pi~5, used for both the \gls{cpu} baseline and the accelerator-backed configuration, and from on-module sensors read through \texttt{tegrastats} at \SI{1}{\hertz} on the embedded-\glsentryshort{gpu} baseline, in both cases without idle-power subtraction. The two instruments are not commensurable, since module telemetry excludes carrier-board losses that an inline meter on the supply includes, so cross-platform energy comparisons indicate the scale of a margin rather than a like-for-like measurement.
+\end{itemize}
+
+\paragraph{Tasks and datasets.} Adaptation quality is measured on CIFAR-100 \cite{Krizhevsky09learningmultiple} and Oxford-IIIT Pet \cite{parkhi12a}. All images are resized to $224\times224$ and normalized with ImageNet statistics; any additional augmentation is kept identical across devices to isolate systems effects. For \gls{int8} compilation and performance restoration techniques, a calibration set of \num{1024} images sampled from \textit{ILSVRC2012\_val} \cite{deng2009imagenet} is used.
+
+\paragraph{Training configuration.} All runs use cross-entropy loss and AdamW with a fixed learning rate of $1\times10^{-3}$. The results are reported after five epochs with batch size 1. All results are from a single seed and should therefore be interpreted as point estimates.
+
+\paragraph{Hardware and software.} The heterogeneous pipeline uses a Raspberry Pi 5 host \cite{raspberrypi5} connected via M.2 to a Hailo-8L accelerator \cite{hailo-8l}. Baselines are Raspberry Pi 5 \glsentryshort{cpu}-only and NVIDIA Jetson Orin Nano \gls{gpu} \cite{jetson-orin-nano}. All runs use \gls{onnx} Runtime (on-device training) v1.22.1 \cite{onnxruntime}. In the heterogeneous configuration, the backbone forward pass executes through the Hailo execution provider (HailoRT v4.23.0) \cite{hailort}, while the head forward pass, loss, backward pass, and optimizer update execute on the host \gls{cpu}.
+
+\paragraph{Results and discussion.} \Cref{tab:ch4-high-level-results} summarizes the primary trade-off associated with heterogeneous head-only fine-tuning. For the test-selected restoration configurations of ResNet18 and EfficientNet-Lite 4, the reported accuracies remain close to or above the floating-point references while measured per-step work is reduced. This is selected, single-seed evidence rather than an unbiased equivalence test. This effect is most pronounced for ResNet18, for which the Hailo+RPi configuration reduces latency from \SI{92.85}{\milli\second\per\step} (RPi 5) to \SI{6.04}{\milli\second\per\step} and energy consumption from \SI{525.65}{\milli\joule\per\step} to \SI{38.65}{\milli\joule\per\step} on CIFAR-100, with reported test-selected accuracies of (\SI{64.68}{\percent} vs. \SI{64.62}{\percent}). A similar descriptive pattern is observed for EfficientNet-Lite 4, whose selected test accuracy is slightly higher, and the heterogeneous configuration achieves latency comparable to Orin Nano at substantially lower energy cost.
+
+However, the results also highlight performance degradation for backbones that are more sensitive to quantization, such as those employing Hard-Swish activations (MobileNetV3) or self-attention mechanisms (FastViT-SA12), which exhibit increased vulnerability to \gls{int8}-induced errors. The cost is large. On CIFAR-100, FastViT-SA12 falls from \SI{71.19}{\percent} on the \gls{cpu} baseline to \SI{50.19}{\percent} in the heterogeneous configuration, and MobileNetV3 Large from \SI{68.26}{\percent} to \SI{55.53}{\percent}, even with the best restoration strategy. For these two backbones the speedup is obtained on a model that has lost a fifth to a third of its accuracy. \Cref{fig:ch4-quant-restoration} attributes these regressions primarily to quantization sensitivity and incomplete restoration, since varying restoration strategies systematically alters the final accuracy, indicating that model preparation matters more for adaptation quality in the heterogeneous regime than raw computational capacity does. The results make preservation of task accuracy under INT8 preparation a condition for using the measured speedup. Stronger restoration, improved calibration or selective higher precision are possible mitigations, but their success for the failed configurations is not established here.
+
+\paragraph{Where the speedup goes.} ResNet18 attains up to \num{15.4}$\times$ the \glsentryshort{cpu}-only training speed, compared with roughly \num{4}$\times$ for MobileNetV3 Large. This agrees qualitatively with the partition model: a lightweight backbone and wide feature vector leave more relative work in the host head. Total timings cannot establish the binding component, however; separate backbone, transfer, head and synchronization measurements are needed. The practical implication is to assess the whole partition rather than infer update speed from accelerator throughput alone.
+
+The baseline recomputes features for every training sample. Caching across the five repeated epochs was not evaluated. Where fixed features can be cached, or retained with auxiliary inputs during frozen-encoder inference, the head update needs no backbone pass. In that case the accelerator shortens inference rather than the update, an important boundary when transferring these measurements to delayed supervision.
+
+\paragraph{Restoration strategy selection.} The configurations in \cref{tab:ch4-perf-restoration-strategies} differ in preparation cost and yield architecture-dependent accuracy changes in \cref{fig:ch4-quant-restoration}. The rows of \cref{tab:ch4-high-level-results} report the strategy with the highest test accuracy: \#4 for ResNet18 on both datasets and \#3 or \#4 for EfficientNet-Lite 4. The complete fixed-strategy display in the figure is therefore needed to assess the choices. Selecting among five strategies on the reported test split makes the selected accuracies optimistic by an unestimated amount; close values cannot establish preserved quality or equivalence. The observed results motivate evaluating inexpensive restoration first, but a deployment selection rule would require a separate validation set and a declared acceptable accuracy loss. For MobileNetV3 and FastViT, even the test-selected settings leave substantial losses in the reported cases, so this comparison does not establish a generally adequate restoration strategy.
+
+\paragraph{Throughput and batch scaling.} \Cref{fig:ch4-batch-scaling} extends the batch-one results to batches of 4 and 16. The \glsentryshort{cpu}-only baseline improves little, plausibly because feature extraction and updating share host resources, although their separate costs are unmeasured. The heterogeneous path gains through batch size 4, with smaller improvements thereafter. Its advantage thus extends to the evaluated small-batch range. Against Orin Nano, the batch-one timing advantage remains workload-dependent: ResNet18 leads on both datasets, EfficientNet-Lite 4 and FastViT-SA12 lead only on Oxford-IIIT Pet, and MobileNetV3 Large trails on both. The complete endpoints are in \cref{tab:ch4-high-level-results}; they do not isolate host backpropagation as the cause of these differences.
+
+Energy is the cleaner result, since the accelerator-backed configuration consumes the least energy per training step in all eight backbone-dataset cells, between \numrange{1.4}{3.3}$\times$ below the edge \gls{gpu} and between \numrange{3.7}{13.6}$\times$ below the \gls{cpu} baseline, including on MobileNetV3 Large where it is the slower of the two. The margin against the \gls{cpu} baseline is measured with one instrument on one board and is therefore like-for-like. The margin against the edge \gls{gpu} crosses the instrumentation difference noted in \cref{sec:ch4-heterogeneous-evaluation} and should be read with that measurement-method difference in view. This is the signature of an inference-centric design, and it aligns with on-device adaptation, where large batches are undesirable because they inflate buffering requirements and update latency.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/throughput_grid.pdf}
+\caption[Training throughput against batch size on Oxford-IIIT Pet.]{Training throughput against batch size on Oxford-IIIT Pet, in images per second, for the \glsentryshort{cpu}-only baseline, the edge \gls{gpu} baseline, and the accelerator-backed pipeline. One panel per backbone; higher is better.}
+\label{fig:ch4-batch-scaling}
+\end{figure}
+
+\begin{table}[!t]
+\caption[End-to-end head-only fine-tuning results with batch size 1.]{End-to-end head-only fine-tuning results with batch size 1. \textit{Acc.} is test accuracy after five epochs. \textit{Lat.} is training-step latency (\si{\milli\second\per\step}) and \textit{E} is energy per training step (\si{\milli\joule\per\step}), measured as described above. For the heterogeneous pipeline, ``Hailo (\#\,$\cdot$\,, \#\,$\cdot$\,)'' indicates the restoration strategy IDs used for INT8 backbone preparation (corresponding to the variants presented in \cref{tab:ch4-perf-restoration-strategies} and compared in \cref{fig:ch4-quant-restoration}; the choice with the highest test accuracy per architecture and dataset is reported, so selection uses the test set. The size of the resulting bias is unknown, and the selected accuracies do not establish equivalence). Best value per column in bold.}
+\label{tab:ch4-high-level-results}
+\TableDense
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ll S[table-format=2.2] S[table-format=3.2] S[table-format=4.2] S[table-format=2.2] S[table-format=3.2] S[table-format=4.2]}
+\toprule
+\multirow{2}{*}{\thead{Model}} & \multirow{2}{*}{\thead{Hardware}} & \multicolumn{3}{c}{\thead{CIFAR-100}} & \multicolumn{3}{c}{\thead{Oxford-IIIT Pet}} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-8}
+ &  & \multicolumn{1}{c}{\thead{Acc. (\si{\percent})$\uparrow$}} & \multicolumn{1}{c}{\thead{Lat. (\si{\milli\second})$\downarrow$}} & \multicolumn{1}{c}{\thead{E (\si{\milli\joule})$\downarrow$}} & \multicolumn{1}{c}{\thead{Acc. (\si{\percent})$\uparrow$}} & \multicolumn{1}{c}{\thead{Lat. (\si{\milli\second})$\downarrow$}} & \multicolumn{1}{c}{\thead{E (\si{\milli\joule})$\downarrow$}} \\
+\midrule
+\multirow{3}{*}{ResNet18} & RPi 5 (CPU) & {\bfseries 64.68} & 92.85 & 525.65 & 86.97 & 102.84 & 561.25 \\
+ & Orin Nano (GPU) & 64.67 & 13.70 & 128.25 & {\bfseries 87.00} & 9.22 & 128.13 \\
+ & \textbf{Hailo (\#4, \#4) + RPi 5} & 64.62 & {\bfseries 6.04} & {\bfseries 38.65} & 86.94 & {\bfseries 7.17} & {\bfseries 46.35} \\
+\addlinespace[0.25em]
+\multirow{3}{*}{\shortstack{EfficientNet\\Lite 4}} & RPi 5 (CPU) & 58.48 & 178.28 & 1042.91 & 83.37 & 194.02 & 1064.18 \\
+ & Orin Nano (GPU) & 58.80 & \textbf{23.56} & 234.09 & 83.43 & 24.39 & 184.00 \\
+ & \textbf{Hailo (\#3, \#4) + RPi 5} & \textbf{60.23} & 23.91 & \textbf{124.64} & \textbf{84.08} & \textbf{23.01} & \textbf{111.99} \\
+\addlinespace[0.25em]
+\multirow{3}{*}{\shortstack{MobileNetV3\\Large}} & RPi 5 (CPU) & \textbf{68.26} & 57.33 & 286.97 & \textbf{88.88} & 52.71 & 315.63 \\
+ & Orin Nano (GPU) & 68.10 & \textbf{9.49} & 110.04 & 88.83 & \textbf{9.30} & 102.19 \\
+ & \textbf{Hailo (\#4, \#4) + RPi 5} & 55.53 & 13.73 & \textbf{78.22} & 87.00 & 12.31 & \textbf{65.37} \\
+\addlinespace[0.25em]
+\multirow{3}{*}{FastViT-SA12} & RPi 5 (CPU) & 71.19 & 223.89 & 1224.60 & \textbf{91.88} & 229.26 & 1228.60 \\
+ & Orin Nano (GPU) & \textbf{71.20} & \textbf{21.92} & 306.73 & \textbf{91.88} & 27.31 & 220.37 \\
+ & \textbf{Hailo (\#3, \#3) + RPi 5} & 50.19 & 22.81 & \textbf{119.64} & 83.54 & \textbf{21.84} & \textbf{105.80} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/quant_restoration.pdf}
+\caption[Test accuracy under five INT8 restoration strategies.]{Test accuracy after five epochs of head-only fine-tuning under each of the five INT8 restoration strategies of \cref{tab:ch4-perf-restoration-strategies}, across the four backbones and both datasets. Strategy 0 is unrestored post-training quantization. The spread across strategies is widest for the quantization-sensitive backbones, the divide described in the accompanying text.}
+\label{fig:ch4-quant-restoration}
+\end{figure}
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=\textwidth]{gfx/4/convergence_grid.pdf}
+\caption[Time-to-accuracy convergence on the classification workloads.]{Time-to-accuracy convergence for the four backbones on CIFAR-100 and Oxford-IIIT Pet, one panel per pairing. Curves give training accuracy against wall-clock time under head-only fine-tuning at batch size 1, markers indicate epoch boundaries, and horizontal dashed lines give final test accuracy. The three execution configurations of \cref{tab:ch4-high-level-results} are compared.}
+\label{fig:ch4-convergence}
+\end{figure}
+
+\Cref{fig:ch4-convergence} connects per-step savings to the time needed to reach the displayed accuracy levels. Selected configurations with close reported accuracy take less time than the \glsentryshort{cpu}-only path, conditional on test-selected restoration and feature recomputation. The curves do not establish general time-to-equivalent-quality gains, especially for the quantization-sensitive backbones.
+
+\subsection{Conclusions}
+\label{sec:ch4-accelerator-execution-conclusions}
+Freezing and quantizing the backbone gives high-throughput, energy-efficient feature extraction on the co-processor while the head keeps a conventional training pipeline on the host, and the result is best read as a statement about deployment, since the benefit scales with the ratio of frozen-backbone cost to trainable-head cost, a property of the architecture and of the precision and partition chosen at installation rather than of the adaptation algorithm. The pattern pays only where the \gls{int8} backbone keeps sufficient feature fidelity; the evaluated quantization-sensitive backbones retain losses even after test-selected restoration, and the proposed mitigations remain unvalidated. The conversion pipeline, the five restoration configurations and the batch-scaling measurements are reported in~\cite{piechocki2026empowering}.
+
+\paragraph{Limitations.} Two gaps qualify the systems claims.
+\begin{itemize}
+  \item \textbf{Peak update-time memory is not quantified.} The evaluation reports latency, throughput and energy, departing from \cref{sec:ch2-system-metrics-measurement}. Terminating gradients avoids retaining backbone activations, but its effect on peak process memory needs measurement. The separate forecasting profile's roughly threefold increase (\cref{sec:ch4-conditional-adaptation-evaluation}) motivates this check; its unavailable allocation breakdown prevents assigning that increase to the backbone or predicting how much the partition avoids.
+  \item \textbf{A proxy workload.} The experiments use CIFAR-100 and Oxford-IIIT Pet rather than solar forecasting. The execution pattern is task-agnostic by construction, but its benefit for the forecasting head is argued architecturally rather than measured. The damped encoder action of \cref{eq:ch4-damped-encoder-update} backpropagates into the last two encoder stages and is outside this pattern; only the head action, the majority action in \cref{tab:ch4-actions}, maps onto it.
+\end{itemize}
+\noindent Results in both cases are single-seed point estimates.
+
+% =========================================================================
+\section{Summary and the limits of local adaptation}
+\label{sec:ch4-summary}
+% =========================================================================
+The chapter examined conditional updates under delayed labels, a sensing-fault monitor in front of them, and a separate accelerator execution path. The encoder--head interface relates their designs. The policy and the monitor were evaluated in series; the accelerator path was not composed with either, and its measurements apply to frozen-encoder classification with feature recomputation and test-selected restoration. Five design rules follow, each resting on one workload and single runs, so for other workloads they are hypotheses.
+\begin{enumerate}
+  \item Compare adaptation with a frozen local reference on each metric: at the source site the frozen model is hard to beat on absolute error, and an unconstrained update rule loses to it.
+  \item Damp the encoder action: updates of the whole encoder from single delayed samples drift over months; limiting the step size, not the subspace, is what removes the drift.
+  \item Retain a local statistical reference when assessing relocation: a transferred forecaster can lose its RMSE advantage over Smart Persistence.
+  \item Withhold supervision, not images: a corrupted frame whose label is valid is a training example, and withholding it slows adaptation to a persistent fault by weeks; a screen should exclude transient events and label faults, and a score computed on the pooled forecasting representation detects neither, because it measures forecasting difficulty.
+  \item Profile update memory as well as latency: the measured process-memory increase is substantial, but its allocation breakdown and the accelerator path's peak update memory are unavailable.
+\end{enumerate}
+
+\paragraph{Evidence for RQ2 and RQ3.} The accelerator study establishes execution gains for particular frozen-encoder classification configurations, with predictive losses for some quantized backbones. The conditional policy, in its damped instantiation, matches the strongest published comparator on absolute error at all three sites and trails it on forecast skill at one, from one checkpoint and one scored population per site, with a recorded update budget and a faster update path in the separate timing benchmark. Its timing and predictive results come from different streams, so they do not establish a matched performance and cost optimum, and its instantiation was selected on the evaluation streams. The measured execution benefits provide bounded support for the efficiency part of the hypothesis, and the campaign provides support for the adaptation part within those bounds. Input admissibility is established in the sense that matters for the policy: sensing faults in the image path with valid labels need no screen, because the policy learns through them, and screening them out costs accuracy; what remains to be screened, label-path faults, was not tested. The complete device cost of the composed policy remains unresolved.
+
+RQ4 asks whether peers add predictive value beyond local adaptation and replay, and what that exchange costs. Chapter~\ref{ch:collaborative-learning} studies a separate daily-learning configuration with a trainable encoder and post-update prototype extraction. It does not execute the frozen-encoder accelerator path unchanged or use this chapter's per-sample conditional policy. Collaboration still depends on locally available delayed labels.
+
+The next chapter includes a local-only prototype control and controlled withholding experiments, so it can ask more specifically what peers add beyond local learning. The supplementary hardware profile provides initial timing and payload evidence, while a matched own-versus-peer device comparison remains necessary to establish incremental collaboration overhead. Within those boundaries, the next chapter examines what another site's experience can add to a model that already adapts to its own observations.
+
+% =========================================================================
+% Reference table: the benchmark as published, retained for comparison.
+% Place in an appendix if the chapter should not carry two versions.
+% =========================================================================

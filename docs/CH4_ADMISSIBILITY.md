@@ -434,3 +434,39 @@ two weeks of the fault; alert share in the 14 days before, during, and the 14 da
 **Cost.** Per stream: gate scoring ≈ 12 min GPU; three policy runs ≈ 1.2 h in parallel. Five
 streams across four servers ≈ one evening. Code: `scripts/make_dose_schedules.py`,
 `scripts/fit_monitor.py --schedule … --thresholds …`, `scripts/admissibility_study.py dose`.
+
+### 8.1 Result: P1, P3 confirmed; P2 and P5 in part; P4 refuted
+
+Runs: `results/adaptation/gate/runs/dose_<stream>/{static,last2_lowlr,last2_lowlr_excl}` (the static arm
+is the policy with `--t1 1e9 --t2 1e10`; the first attempt with `--t2 1e9` failed at argument parsing and
+was re-run). Tables: `tables/ch4_admissibility_dose*.csv`, `tables/ch4_admissibility_streams*.csv`,
+`tables/ch4_streams.tex`. Figure: `ch4_admissibility_continuous`.
+
+- **P1 confirmed.** Ungated vs clean-stream run on fault-free frames: ΔFS −0.01 (1 %), −0.05 (5 %),
+  −0.03 (15 %), −0.02 (continuous soiling), −0.00 (occluder); all within ±0.10. Two are non-zero
+  (5 %: MAE +0.22 % [0.06, 0.42]; continuous soiling: +0.32 % [0.10, 0.63]).
+- **P2 in part.** Ungated vs static on faulty frames: +4.0 [−0.8, +8.5] at 1 %, +14.5 [+1.3, +31.4] at
+  5 %, +7.5 [+4.8, +10.2] at 15 %. The policy beats the static model at 5 % and 15 % ✓; the gain is not
+  larger at 15 % than at 5 % ✗ (the 5 % interval is wide); the gated policy lies between static and
+  ungated at every dose ✓ (+3.3, +14.3, +7.3).
+- **P3 confirmed.** E withholds 38 % of the soiled frames (bar 30 %). Ungated faulty-frame MAE 10.82 →
+  7.60 W/m² between the first and last two weeks (clean-year run on the same dates 9.47 → 6.92, so the
+  excess halves, +1.35 → +0.68); gated 11.55 → 10.31, a drop of 1.24 < half of 3.22 (excess grows,
+  +2.11 → +3.43). Whole episode, gated vs ungated on soiled frames: MAE +20.7 % [+11.0, +29.3], ΔFS −4.6
+  [−13.4, −1.6]. Ungated vs static on soiled frames: ΔFS +13.7 [+4.2, +43.5], MAE −34 % [−42, −26].
+- **P4 refuted.** Maintenance-alert share: 1.6 % in the 14 days before, **2.9 % during** continuous
+  soiling (bar > 50 %), 0.0 % after. Under the occluder 5.0 % during. Three to six patches or one
+  occluder cover a minority of cells, so the median cell score does not move; the exclusion channel
+  catches them through the core maximum. "Clears after cleaning" holds trivially.
+- **P5 in part.** E withholds 89 % of frames from onset (bar 50 %) ✓; alert share 5.0 % (bar 50 %) ✗;
+  ungated last-two-weeks MAE 25.34 vs clean-year run 25.08 (+1.0 %, within 5 %) ✓; gated 26.09 (+4.2 %),
+  does not converge ✓. Whole episode, gated vs ungated on occluded frames: MAE +3.2 % [+1.9, +5.1],
+  ΔFS −1.4 [−1.9, −1.1]. Ungated vs static: ΔFS +2.5 [+1.9, +3.7], MAE +0.6 % [−0.9, +1.4] (n.s.; one
+  occluder barely hurts the static model's MAE).
+
+**Reading for the chapter.** Learning from image-path faults with valid labels does not contaminate
+clean forecasts at any dose; the policy learns through persistent faults within weeks and beats the
+static model on them; exclusion of persistent faults costs 21 % (soiling) and 3 % (occluder) of MAE
+on the faulty frames. Exclusion of transient events is accuracy-neutral. The maintenance statistic
+(frame median) is blind to localised persistent faults. The dose sweep contributes one sentence (P1)
+and is not given a figure.

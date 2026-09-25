@@ -565,6 +565,51 @@ def monitor_grid(n: int = 48, cols: int = 8) -> None:
     save(fig, "ch4_admissibility_monitor_grid")
 
 
+def continuous() -> None:
+    """§8: weekly faulty-frame MAE under the two continuous faults, static / policy / gated, with the withheld share."""
+    w = table("ch4_admissibility_dose_weekly")
+    if w is None:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6))
+    for ax, stream, title in zip(
+        axes,
+        ("cont_soiling", "cont_occluder"),
+        ("continuous soiling, 1 Jul – 15 Aug", "permanent occluder, from 1 Sep"),
+        strict=True,
+    ):
+        g = w[w.stream == stream]
+        ax2 = ax.twinx()
+        d = g[g.arm == "gated"].sort_values("week")
+        ax2.bar(d.week, d.withheld_pct, color=SERIES[1], alpha=0.15, width=0.8, label="withheld by E (%)")
+        ax2.set_ylim(0, 100)
+        ax2.set_ylabel("faulty frames withheld (%)", fontsize=7, color=MUTED)
+        ax2.tick_params(labelsize=6, colors=MUTED)
+        ax2.spines["right"].set_visible(True)
+        for arm, color, label in (
+            ("static", GREY, "static"),
+            ("ungated", SERIES[0], "policy"),
+            ("gated", SERIES[1], "policy, gated by E"),
+        ):
+            d = g[g.arm == arm].sort_values("week")
+            if not d.empty:
+                ax.plot(d.week, d.mae_faulty, marker="o", ms=3, color=color, label=label, zorder=3)
+        ax.set_title(title, fontsize=8, color=INK)
+        ax.set_xlabel("ISO week")
+        ax.set_ylabel("MAE on faulty frames (W/m²)")
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="y", lw=0.4, color="#e6e6e6")
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+    handles, labels = {}, []
+    for ax in fig.axes:  # one entry per label across the twin axes
+        for h, lab in zip(*ax.get_legend_handles_labels(), strict=True):
+            if lab not in handles:
+                handles[lab], labels = h, labels + [lab]
+    fig.legend([handles[k] for k in labels], labels, loc="upper center", ncol=4, fontsize=7, bbox_to_anchor=(0.5, 1.09))
+    fig.tight_layout()
+    save(fig, "ch4_admissibility_continuous")
+
+
 def monitor_timeline() -> None:
     """§7: global score and 60-minute maintenance statistic around every persistent fault episode."""
     import json
@@ -623,5 +668,6 @@ if __name__ == "__main__":
         monitor_top,
         monitor_timeline,
         monitor_grid,
+        continuous,
     ):
         fn()
