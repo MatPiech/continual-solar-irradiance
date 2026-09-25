@@ -509,7 +509,7 @@ def monitor_top() -> None:
         save(fig, f"ch4_admissibility_monitor_top_{key}")
 
 
-def monitor_grid(n: int = 48, cols: int = 8) -> None:
+def monitor_grid(n: int = 24, cols: int = 8) -> None:
     """§7: the real 2016 frames the exclusion flag ranks highest, one per day, in a large grid.
 
     Rank = max(G / t_G, C / t_C), the score of the --anomaly-gate file.  Each title says
