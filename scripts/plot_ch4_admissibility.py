@@ -483,6 +483,61 @@ def monitor_top() -> None:
         save(fig, f"ch4_admissibility_monitor_top_{key}")
 
 
+def monitor_grid(n: int = 48, cols: int = 8) -> None:
+    """§7: the real 2016 frames the exclusion flag ranks highest, one per day, in a large grid.
+
+    Rank = max(G / t_G, C / t_C), the score of the --anomaly-gate file.  Each title says
+    which statistic fired (G = global median, frame-wide; C = core max, box = its cell).
+    """
+    import json
+
+    from matplotlib.patches import Rectangle
+
+    from cirr.evaluation.admissibility import _MEAN, _STD, LocalGate
+    from cirr.evaluation.campaign import load_campaign_days
+
+    gate_dir = ROOT / "results" / "adaptation" / "gate"
+    f = gate_dir / "monitor" / "scores_clean.csv"
+    if not f.exists():
+        return
+    thr = json.loads((gate_dir / "monitor" / "monitor.json").read_text())["thresholds"]
+    sc = pd.read_csv(f, dtype={"timestamp": str}).drop_duplicates("timestamp")
+    sc["g"], sc["c"] = sc["global"] / thr["global"], sc["core"] / thr["core"]
+    sc["rank"], sc["day"] = sc[["g", "c"]].max(1), sc.timestamp.str[:8]
+    top = sc.sort_values("rank", ascending=False).drop_duplicates("day").head(n)
+    top[["timestamp", "rank", "g", "c", "core_cell"]].to_csv(TABLES / "ch4_admissibility_monitor_grid.csv", index=False)
+
+    rows_cols = np.argwhere(LocalGate.load(gate_dir / "local" / "local_gate.npz").cells.numpy())
+    data = load_campaign_days(ROOT / "data" / "folsom_prepared")
+    where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
+    rows = (len(top) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.08 * rows + 0.3))
+    for ax, r in zip(axes.flat, top.itertuples(), strict=False):
+        img = data.dataset[where[r.timestamp]][0]
+        ax.imshow(((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
+        which = "G" if r.g >= r.c else "C"
+        if which == "C":
+            cy, cx = rows_cols[int(r.core_cell)]
+            ax.add_patch(Rectangle((cx * 8 - 0.5, cy * 8 - 0.5), 8, 8, fill=False, ec="#e34948", lw=1.0))
+        ax.set_title(
+            f"{r.timestamp[4:6]}-{r.timestamp[6:8]} {r.timestamp[9:11]}:{r.timestamp[11:13]} {which} {r.rank:.2f}",
+            fontsize=5,
+            color=INK,
+            pad=1.5,
+        )
+        ax.axis("off")
+    for ax in list(axes.flat)[len(top) :]:
+        ax.axis("off")
+    fig.suptitle(
+        f"The {len(top)} real 2016 frames the exclusion flag ranks highest (one per day); score / threshold, "
+        "G = global median fired, C = core max fired (box = cell)",
+        fontsize=6.5,
+        y=1.0,
+    )
+    fig.subplots_adjust(wspace=0.04, hspace=0.22, left=0.01, right=0.99, top=0.95, bottom=0.01)
+    save(fig, "ch4_admissibility_monitor_grid")
+
+
 def monitor_timeline() -> None:
     """§7: global score and 60-minute maintenance statistic around every persistent fault episode."""
     import json
@@ -539,5 +594,6 @@ if __name__ == "__main__":
         local_top,
         monitor_top,
         monitor_timeline,
+        monitor_grid,
     ):
         fn()
