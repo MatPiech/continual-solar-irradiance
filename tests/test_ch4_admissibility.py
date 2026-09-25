@@ -270,7 +270,8 @@ def test_dose_schedule_hits_its_budget_without_overlap():
         assert s.timestamp.is_unique
         assert set(s.kind) <= {"soiling", *[k for k, *_ in DOSE_MIX]}
         soil = (s.kind == "soiling").sum()
-        assert 0.3 <= soil / len(s) <= 0.7  # about half persistent, half short-term
+        if rate >= 5:  # at 1 % a single day block is most of the budget
+            assert 0.3 <= soil / len(s) <= 0.7  # about half persistent, half short-term
 
 
 def test_continuous_schedule_covers_exactly_the_window():
