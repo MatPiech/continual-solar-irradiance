@@ -107,7 +107,7 @@ def detection() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6), gridspec_kw={"width_ratios": [4, 3]})
     width = 0.84 / len(detectors)
     panels = [
-        ("flagged_pct", ["clean\n(false alarms)"] + faults, "frames flagged at the 1 % threshold (%)", 30),
+        ("flagged_pct", ["clean\n(false alarms)"] + faults, "frames flagged at the 1 % threshold (%)", 60),
         ("auroc", faults, "AUROC, faulty vs clean frames", 1.08),
     ]
     for panel, (col, groups, ylabel, ymax) in zip(axes, panels, strict=True):
@@ -327,19 +327,22 @@ def faults() -> None:
     data = load_campaign_days(ROOT / "data" / "folsom_prepared", "0415", 1)
     img, hist, *_, name = data.dataset[data.day_map[data.days[0]][300]]
     kinds = ("soiling", "droplets", "occlusion", "soiling_edge", "occlusion_edge", "banding", "insect", "wet_dome")
-    variants = [("clean", img)] + [(k.replace("_edge", " (rim)"), corrupt(img, k, 0, name)) for k in kinds]
-    fig, axes = plt.subplots(1, 9, figsize=(7.6, 1.3))
-    for ax, (label, x) in zip(axes, variants, strict=True):
+    variants = [("clean", img)] + [(k.replace("_edge", " (rim)").replace("_", " "), corrupt(img, k, 0, name)) for k in kinds]
+    fig, axes = plt.subplots(3, 3, figsize=(5.4, 6.0))
+    for ax, (label, x) in zip(axes.flat, variants, strict=True):
         with torch.no_grad():
             s = float(anomaly_score(forest, model.encode_fusion_features(x[None], hist[None]).numpy())[0])
         view = ((x * _STD + _MEAN).clamp(0, 1) * (x.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy()
         ax.imshow(view)
         ax.axis("off")
         verdict = "rejected" if s > meta["threshold"] else "admitted"
-        ax.set_title(f"{label}\nscore {s:.3f} — {verdict}", fontsize=7, color=INK)
+        ax.set_title(f"{label}\nIF score {s:.3f}, {verdict}", fontsize=7, color=INK)
     fig.suptitle(
-        f"Synthetic faults and the gate (threshold {meta['threshold']:.3f}, p{meta['percentile']:g})", fontsize=8, y=1.04
+        f"Synthetic faults and the embedding gate (threshold {meta['threshold']:.3f}, p{meta['percentile']:g})",
+        fontsize=8,
+        y=1.0,
     )
+    fig.tight_layout()
     save(fig, "ch4_admissibility_faults")
 
 
@@ -432,6 +435,109 @@ def local_top() -> None:
         save(fig, f"ch4_admissibility_local_top{'' if split == 'all' else '_' + split}")
 
 
+def monitor_top() -> None:
+    """§7: the real 2016 frames each monitor statistic ranks highest (one per day).
+
+    Global median and maintenance statistic are frame-wide, so no cell is marked; the
+    core max outlines the cell that attains it.
+    """
+    titles = {
+        "global": "global median cell score (exclusion, frame-wide)",
+        "core": "max over core cells (exclusion, compact objects); box = the cell",
+        "maint": "60-min median of the global score (maintenance alert)",
+    }
+    tables = {k: table(f"ch4_admissibility_monitor_top_{k}") for k in titles}
+    tables = {k: t for k, t in tables.items() if t is not None}
+    if not tables:
+        return
+    import json
+
+    from matplotlib.patches import Rectangle
+
+    from cirr.evaluation.admissibility import _MEAN, _STD, LocalGate
+    from cirr.evaluation.campaign import load_campaign_days
+
+    gate_dir = ROOT / "results" / "adaptation" / "gate"
+    thr = json.loads((gate_dir / "monitor" / "monitor.json").read_text())["thresholds"]
+    rows_cols = np.argwhere(LocalGate.load(gate_dir / "local" / "local_gate.npz").cells.numpy())
+    data = load_campaign_days(ROOT / "data" / "folsom_prepared")
+    where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
+    for key, t in tables.items():
+        t = t.astype({"timestamp": str})
+        fig, axes = plt.subplots(2, (len(t) + 1) // 2, figsize=(7.2, 2.9))
+        for ax, r in zip(axes.flat, t.itertuples(), strict=False):
+            img = data.dataset[where[r.timestamp]][0]
+            ax.imshow(((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
+            if int(r.cell) >= 0:
+                cy, cx = rows_cols[int(r.cell)]
+                ax.add_patch(Rectangle((cx * 8 - 0.5, cy * 8 - 0.5), 8, 8, fill=False, ec="#e34948", lw=1.2))
+            ax.set_title(
+                f"{r.timestamp[4:6]}-{r.timestamp[6:8]} {r.timestamp[9:11]}:{r.timestamp[11:13]}  {r.score:.2f}",
+                fontsize=6,
+                color=INK,
+            )
+            ax.axis("off")
+        for ax in list(axes.flat)[len(t) :]:
+            ax.axis("off")
+        fig.suptitle(f"Real 2016 frames ranked highest by the {titles[key]}; threshold {thr[key]:.2f}", fontsize=8, y=1.0)
+        save(fig, f"ch4_admissibility_monitor_top_{key}")
+
+
+def monitor_timeline() -> None:
+    """§7: global score and 60-minute maintenance statistic around every persistent fault episode."""
+    import json
+
+    d = ROOT / "results" / "adaptation" / "gate" / "monitor"
+    if not (d / "scores_corrupted.csv").exists():
+        return
+    thr = json.loads((d / "monitor.json").read_text())["thresholds"]
+    sc = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    sched = pd.read_csv(d / "schedule.csv", dtype={"timestamp": str})
+    sc = sc.merge(sched, on="timestamp", how="left").sort_values("timestamp").reset_index(drop=True)
+    sc["day"] = sc.timestamp.str[:8]
+    eps = sched[sched.kind.isin(("soiling", "wet_dome"))].groupby(["kind", "episode"]).timestamp.agg(["min", "max"])
+    eps = eps.reset_index().sort_values("min")
+    n = len(eps)
+    cols = 4
+    fig, axes = plt.subplots((n + cols - 1) // cols, cols, figsize=(7.6, 1.25 * ((n + cols - 1) // cols)), squeeze=False)
+    for ax, e in zip(axes.flat, eps.itertuples(), strict=False):
+        g = sc[sc.day == e.min[:8]] if e.kind == "wet_dome" else sc[sc.day.between(e.min[:8], e.max[:8])]
+        g = g.reset_index(drop=True)
+        x = np.arange(len(g))
+        on = (g.kind == e.kind) & (g.episode == e.episode)
+        ax.fill_between(x, 0, 1, where=on, transform=ax.get_xaxis_transform(), color="#f0e4d7", lw=0)
+        ax.plot(x, g["global"], color=GREY, lw=0.4)
+        ax.plot(x, g.maint_stat, color=SERIES[0], lw=1.2)
+        ax.axhline(thr["maint"], color=INK, lw=0.7, ls="--")
+        hit = bool((g.maint_alert & on).any())
+        label = "wet dome" if e.kind == "wet_dome" else "soiling"
+        ax.set_title(f"{label} {e.min[4:6]}-{e.min[6:8]} — {'alert' if hit else 'missed'}", fontsize=6.5, color=INK)
+        ax.set_ylim(0.4, 1.8)
+        ax.set_xticks([])
+        ax.tick_params(labelsize=6)
+    for ax in list(axes.flat)[n:]:
+        ax.axis("off")
+    fig.suptitle(
+        "Maintenance alert on the persistent faults (shaded): global score (grey), 60-min median (blue), threshold (dashed)",
+        fontsize=7.5,
+        y=1.0,
+    )
+    fig.tight_layout()
+    save(fig, "ch4_admissibility_monitor_timeline")
+
+
 if __name__ == "__main__":
-    for fn in (risk_coverage, detection, detection_split, geometry, crosssite, adaptation, faults, maintenance, local_top):
+    for fn in (
+        risk_coverage,
+        detection,
+        detection_split,
+        geometry,
+        crosssite,
+        adaptation,
+        faults,
+        maintenance,
+        local_top,
+        monitor_top,
+        monitor_timeline,
+    ):
         fn()
