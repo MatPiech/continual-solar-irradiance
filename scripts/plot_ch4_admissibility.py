@@ -346,6 +346,31 @@ def faults() -> None:
     save(fig, "ch4_admissibility_faults")
 
 
+def fault_mosaic() -> None:
+    """Every synthetic fault on three real base frames (rows: clear, cumulus, overcast), one random episode per row."""
+    from cirr.evaluation.admissibility import _MEAN, _STD, EDGE_KINDS, KINDS, MONITOR_KINDS, corrupt
+    from cirr.evaluation.campaign import load_campaign_days
+
+    picks = ["20160415_130000", "20161017_155700", "20160106_130200"]
+    kinds = KINDS + EDGE_KINDS + MONITOR_KINDS
+    label = {k: k.replace("_edge", "\n(at rim)").replace("_", " ") for k in kinds}
+    data = load_campaign_days(ROOT / "data" / "folsom_prepared")
+    where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
+    fig, axes = plt.subplots(len(picks), len(kinds) + 1, figsize=(7.6, 0.95 * len(picks) + 0.35))
+    for row, ts in enumerate(picks):
+        key = ts if ts in where else min(where, key=lambda t: abs(int(t[9:13]) - int(ts[9:13])) if t[:8] == ts[:8] else 9e9)
+        img = data.dataset[where[key]][0]
+        for ax, k in zip(axes[row], (None, *kinds), strict=True):
+            x = img if k is None else corrupt(img, k, row + 1, key)
+            ax.imshow(((x * _STD + _MEAN).clamp(0, 1) * (x.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
+            ax.axis("off")
+            if row == 0:
+                ax.set_title("clean" if k is None else label[k], fontsize=6, color=INK, pad=2)
+    fig.suptitle("Synthetic sensing-path faults rendered onto real Folsom 2016 frames", fontsize=7.5, y=1.0)
+    fig.subplots_adjust(wspace=0.03, hspace=0.03, left=0.005, right=0.995, top=0.86, bottom=0.005)
+    save(fig, "ch4_admissibility_fault_mosaic")
+
+
 def maintenance() -> None:
     """Each soiling episode: frame score and 30-minute alert statistic around it."""
     import json
@@ -590,6 +615,7 @@ if __name__ == "__main__":
         crosssite,
         adaptation,
         faults,
+        fault_mosaic,
         maintenance,
         local_top,
         monitor_top,
