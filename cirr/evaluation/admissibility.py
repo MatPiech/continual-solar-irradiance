@@ -295,6 +295,42 @@ class LocalGate:
         )
 
 
+@torch.no_grad()
+def iter_local_features(
+    model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
+):
+    """Yield per-cell features ``[B, cells, 128]`` batch by batch, for streams too large to hold."""
+    grabbed: dict[str, torch.Tensor] = {}
+    hook = model.image_encoder.layer2.register_forward_hook(lambda _m, _i, o: grabbed.__setitem__("f", o))
+    proj = local_projection().to(device)
+    flat = cells.flatten().to(device)
+    loader = DataLoader(Subset(dataset, indices), batch_size=batch, num_workers=workers, pin_memory=True)
+    try:
+        for image, history, *_ in tqdm(loader, desc="local", unit="batch"):
+            model.encode_fusion_features(image.to(device, non_blocking=True), history.to(device, non_blocking=True))
+            f = torch.nn.functional.avg_pool2d(grabbed["f"].float(), 3, 1, 1)
+            yield f.flatten(2).transpose(1, 2)[:, flat] @ proj
+    finally:
+        hook.remove()
+
+
+def local_scores(
+    model: Any, dataset: Any, indices: list[int], gate: LocalGate, device: str, workers: int = 8
+) -> tuple[np.ndarray, np.ndarray]:
+    """Frame score and blamed cell for every frame, scored batch by batch.
+
+    A full stream's features are ~11 GB (245k frames x 172 cells x 128); holding them
+    and then forking DataLoader workers from that process got the job killed, so a
+    stream is never materialised.
+    """
+    scores, cells = [], []
+    for feats in iter_local_features(model, dataset, indices, gate.cells, device, workers):
+        sc, c = gate.score(feats, device)
+        scores.append(sc)
+        cells.append(c)
+    return np.concatenate(scores), np.concatenate(cells)
+
+
 def alert_statistic(timestamps: pd.Series, scores: np.ndarray, minutes: int = 30) -> np.ndarray:
     """Causal rolling median of the frame score over the preceding ``minutes`` of the same day.
 

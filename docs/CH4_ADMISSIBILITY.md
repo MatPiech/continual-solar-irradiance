@@ -136,3 +136,48 @@ calibration days (every frame, so the 30-minute window is real time).
 Droplets are reported without a criterion: at 128 × 128 a droplet covers a few pixels, and they
 may be below the input resolution. The real 2016 stream is checked qualitatively: the frames it
 scores highest are rendered for inspection, and are reported as they come.
+
+### 5.1 Reproduction
+
+```bash
+python scripts/fit_local_gate.py            # ≈ 1.5 h; --resume reuses local_gate.npz and scores_clean.csv
+python scripts/admissibility_study.py detection --workers 2
+python scripts/admissibility_study.py maintenance
+python scripts/plot_ch4_admissibility.py    # maintenance + local_top figures
+```
+
+Outputs: `results/ch4/gate/local/` (bank, scores, `gate.json`), `tables/ch4_admissibility_maintenance_*`,
+`tables/ch4_admissibility_local_top.csv`, and the `local (layer2, per cell)` rows of
+`tables/ch4_admissibility_detection.csv`. Thresholds: frame 1.7527, alert 1.6356 (deterministic).
+
+### 5.2 Result against the pre-registered criteria: both FAIL
+
+`tables/ch4_admissibility_maintenance_verdict.json`.
+
+**Criterion 1 (frame level): FAIL.** At the 1 % threshold on the synthetic probe:
+
+| detector | clean | soiling | droplets | occlusion | AUROC soil. | AUROC occl. |
+|---|---|---|---|---|---|---|
+| local (layer2, per cell) | 1.8 % | **13.3 %** | 2.0 % | **50.5 %** | **0.894** | **0.960** |
+| Isolation Forest (embedding) | 1.2 % | 0.9 % | 1.0 % | 1.2 % | 0.690 | 0.623 |
+| Mahalanobis (embedding) | 0.6 % | 1.3 % | 0.7 % | 0.6 % | 0.714 | 0.620 |
+| dark-pixel fraction | 0.7 % | 0.6 % | 0.6 % | 22.9 % | 0.493 | 0.740 |
+
+Occlusion clears its bar (50.5 % ≥ 50 %, 2.2× the dark-pixel baseline); soiling does not (13.3 %).
+
+**Criterion 2 (maintenance level): FAIL, on both parts.** Soiling episodes alerted within 2 h:
+3 of 4 (episode 0 first alerts after 299 min). Two of the three "hits" have a 0-minute delay, i.e.
+the rolling median was already above threshold before the fault began — coincident false alerts,
+not detections. Alerts fire on 2.79 % of fault-free frames of the corrupted stream (bar: 1 %);
+on the clean 2016 stream 2.59 % of frames and **145 of 362 days** carry at least one alert.
+Occlusion: 36 of 60 episodes alert, typically 10–15 min after onset (the median window).
+
+**Reading.** The per-position detector *ranks* local faults far better than any pooled-embedding
+detector (AUROC 0.89 / 0.96 against ≤ 0.74), so the representation is not the bottleneck; the
+operating point is. Thresholds calibrated on 2014–15 flag 1.5 % of 2016 frames instead of 1 %
+(inter-year drift), and the 30-minute median amplifies rather than suppresses this because
+nominal exceedances are temporally clustered. The local score correlates only weakly with
+forecast error (Spearman 0.27, against 0.55 for the Isolation Forest score), consistent with a
+hardware signal rather than a difficulty signal. Under the pre-registration this is reported as a
+negative result; any re-calibration (e.g. drift-aware thresholds) is a new, separately
+pre-registered design, not a revision of this one.

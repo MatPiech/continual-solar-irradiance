@@ -30,7 +30,7 @@ TABLES = ROOT / "tables"
 OUT = ROOT / "figures" / "ch4"
 SITE = {"folsom": "#3a6fb0", "karpicko": "#d1670b", "poznan": "#1f8a70"}
 SITE_NAME = {"folsom": "Folsom", "karpicko": "Karpicko", "poznan": "Poznań"}
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]  # fixed categorical order (validated, 5 slots)
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]  # fixed order (validated, 6 slots)
 GREY, INK, MUTED = "#8c8c8c", "#222222", "#5a5a5a"
 
 plt.rcParams.update(
@@ -230,7 +230,7 @@ def faults() -> None:
     from cirr.evaluation.campaign import SOURCE_CHECKPOINT, load_campaign_days
     from cirr.evaluation.runner import load_eval_model
 
-    gate = ROOT / "results" / "ch4" / "gate" / "folsom"
+    gate = ROOT / "results" / "adaptation" / "gate" / "folsom"
     if not (gate / "gate.json").exists():
         return
     forest, meta = load_gate(gate)
@@ -253,6 +253,82 @@ def faults() -> None:
     save(fig, "ch4_admissibility_faults")
 
 
+def maintenance() -> None:
+    """Each soiling episode: frame score and 30-minute alert statistic around it."""
+    import json
+
+    gate_dir = ROOT / "results" / "adaptation" / "gate"
+    f = gate_dir / "local" / "scores_corrupted.csv"
+    if not f.exists():
+        return
+    meta = json.loads((gate_dir / "local" / "gate.json").read_text())
+    sc = pd.read_csv(f, dtype={"timestamp": str})
+    sched = pd.read_csv(gate_dir / "folsom_corrupted" / "schedule.csv", dtype={"timestamp": str})
+    sc = sc.merge(sched, on="timestamp", how="left")
+    sc["t"] = pd.to_datetime(sc.timestamp, format="%Y%m%d_%H%M%S")
+    sc["day"] = sc.timestamp.str[:8]
+    days = sorted(sc.day.unique())
+    soil = sched[sched.kind == "soiling"].assign(day=lambda x: x.timestamp.str[:8])
+    episodes = sorted(soil.episode.unique())
+    fig, axes = plt.subplots(len(episodes), 1, figsize=(7.2, 1.35 * len(episodes)), squeeze=False)
+    for ax, ep in zip(axes[:, 0], episodes, strict=True):
+        ep_days = sorted(soil[soil.episode == ep].day.unique())
+        first = days.index(ep_days[0])
+        show = days[max(0, first - 1) : days.index(ep_days[-1]) + 2]  # one clean day either side
+        g = sc[sc.day.isin(show)].sort_values("t").reset_index(drop=True)
+        x = np.arange(len(g))  # frame order: no overnight gaps
+        faulty = (g.kind == "soiling") & (g.episode == ep)
+        ax.fill_between(
+            x, 0, 1, where=faulty, transform=ax.get_xaxis_transform(), color="#f0e4d7", lw=0, label="soiling present"
+        )
+        ax.plot(x, g.score, color=GREY, lw=0.5, label="frame score")
+        ax.plot(x, g.alert_stat, color=SERIES[0], lw=1.4, label="30-min alert statistic")
+        ax.axhline(meta["alert_threshold"], color=INK, lw=0.8, ls="--", label="alert threshold")
+        starts = [0] + [i for i in range(1, len(g)) if g.day[i] != g.day[i - 1]]
+        ax.set_xticks(starts, [f"{g.day[i][4:6]}-{g.day[i][6:8]}" for i in starts])
+        ax.set_ylabel("score")
+        ax.set_ylim(0, max(g.score.quantile(0.995), meta["alert_threshold"]) * 1.2)
+        ax.grid(axis="y", lw=0.4, color="#e6e6e6")
+    axes[-1, 0].set_xlabel("daylight frames (day boundaries marked)")
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="upper center", ncol=4, fontsize=7, bbox_to_anchor=(0.5, 1.03))
+    fig.tight_layout()
+    save(fig, "ch4_admissibility_maintenance")
+
+
+def local_top() -> None:
+    """The real 2016 frames the local gate scores highest, one per day, with the blamed cell outlined."""
+    t = table("ch4_admissibility_local_top")
+    if t is None:
+        return
+    from matplotlib.patches import Rectangle
+
+    from cirr.evaluation.admissibility import _MEAN, _STD, LocalGate
+    from cirr.evaluation.campaign import load_campaign_days
+
+    gate = LocalGate.load(ROOT / "results" / "adaptation" / "gate" / "local" / "local_gate.npz")
+    rows_cols = np.argwhere(gate.cells.numpy())  # the order cells are scored in
+    data = load_campaign_days(ROOT / "data" / "folsom_prepared")
+    where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
+    n = len(t)
+    fig, axes = plt.subplots(2, (n + 1) // 2, figsize=(7.2, 2.9))
+    for ax, r in zip(axes.flat, t.itertuples(), strict=False):
+        img = data.dataset[where[r.timestamp]][0]
+        view = ((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy()
+        ax.imshow(view)
+        cy, cx = rows_cols[int(r.cell)]
+        ax.add_patch(Rectangle((cx * 8 - 0.5, cy * 8 - 0.5), 8, 8, fill=False, ec="#e34948", lw=1.2))
+        ax.set_title(
+            f"{r.timestamp[4:6]}-{r.timestamp[6:8]} {r.timestamp[9:11]}:{r.timestamp[11:13]}  {r.score:.1f}",
+            fontsize=6,
+            color=INK,
+        )
+        ax.axis("off")
+    for ax in list(axes.flat)[n:]:
+        ax.axis("off")
+    fig.suptitle("Real 2016 frames the local gate scores highest (one per day); box = the cell it blames", fontsize=8, y=1.0)
+    save(fig, "ch4_admissibility_local_top")
+
+
 if __name__ == "__main__":
-    for fn in (risk_coverage, detection, crosssite, adaptation, faults):
+    for fn in (risk_coverage, detection, crosssite, adaptation, faults, maintenance, local_top):
         fn()

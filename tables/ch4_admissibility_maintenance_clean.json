@@ -1,0 +1,9 @@
+{
+  "frames": 245538,
+  "flagged_pct": 1.5073023320219274,
+  "alert_pct": 2.591452239571879,
+  "days": 362,
+  "days_with_alert": 145,
+  "spearman_local_vs_error": 0.2691832309895041,
+  "spearman_iforest_vs_error": 0.5476340312764774
+}

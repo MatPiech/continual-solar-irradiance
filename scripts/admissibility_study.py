@@ -15,6 +15,7 @@ into figures; nothing is edited by hand.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -31,11 +32,13 @@ from cirr.evaluation.admissibility import (
     _MEAN,
     _STD,
     KINDS,
+    LocalGate,
     anomaly_score,
     build_schedule,
     corrupt,
     embed,
     load_gate,
+    local_features,
     nominal_split,
     stamp,
 )
@@ -46,14 +49,14 @@ from cirr.fl.analysis import contrast
 from cirr.physics.clear_sky import resolve_clear_sky_value
 
 ROOT = Path(__file__).resolve().parent.parent
-GATE = ROOT / "results" / "ch4" / "gate"
+GATE = ROOT / "results" / "adaptation" / "gate"
 RUNS = GATE / "runs"
 TABLES = ROOT / "tables"
 W = 1000.0
 SITES = ("folsom", "karpicko", "poznan")
 # the policy each site's forecasts come from: head-only, the stable policy of Section 4.3
-POLICY = {s: ROOT / "results" / "ch4" / "ablation" / s / "conditional_headonly" / "seed0" for s in SITES}
-STATIC = {s: ROOT / "results" / "ch4" / "tier1" / s / "baseline" / "seed0" for s in SITES}
+POLICY = {s: ROOT / "results" / "adaptation" / "ablation" / s / "conditional_headonly" / "seed0" for s in SITES}
+STATIC = {s: ROOT / "results" / "adaptation" / "tier1" / s / "baseline" / "seed0" for s in SITES}
 COVERAGE = list(range(50, 101))
 
 
@@ -325,6 +328,33 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
                     auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
                 )
             )
+    local = GATE / "local" / "local_gate.npz"
+    if local.exists():  # the pre-registered maintenance detector (docs/CH4_ADMISSIBILITY.md §5)
+        gate = LocalGate.load(local)
+        ls, _ = gate.score(
+            local_features(model, _Faulted(data.dataset, items), list(range(len(items))), gate.cells, device, workers), device
+        )
+        clean = ls[kind == "clean"]
+        rows.append(
+            dict(
+                detector="local (layer2, per cell)",
+                fault="none (clean 2016)",
+                n=int(clean.size),
+                flagged_pct=100 * float((clean > gate.threshold).mean()),
+                auroc=np.nan,
+            )
+        )
+        for k in KINDS:
+            f = ls[kind == k]
+            rows.append(
+                dict(
+                    detector="local (layer2, per cell)",
+                    fault=k,
+                    n=int(f.size),
+                    flagged_pct=100 * float((f > gate.threshold).mean()),
+                    auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                )
+            )
     out = pd.DataFrame(rows)
     out.to_csv(TABLES / "ch4_admissibility_detection.csv", index=False)
     print(out.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
@@ -410,7 +440,7 @@ def adaptation() -> None:
         "layer3+4, enc. LR 1e-6": (
             "last2_lowlr",
             "last2_lowlr_gated",
-            ROOT / "results" / "ch4" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
+            ROOT / "results" / "adaptation" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
         ),
     }
     rows, contrasts = [], []
@@ -461,6 +491,95 @@ def adaptation() -> None:
     pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_adaptation_contrasts.csv", index=False)
     print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
     print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+
+@cli.command()
+def maintenance() -> None:
+    """The pre-registered maintenance alert: soiling episodes, false alerts, what it flags for real."""
+    d = GATE / "local"
+    sched = pd.read_csv(GATE / "folsom_corrupted" / "schedule.csv", dtype={"timestamp": str})
+    cor = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cln = pd.read_csv(d / "scores_clean.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cor = cor.merge(sched, on="timestamp", how="left")
+    cor["kind"] = cor.kind.fillna("none")
+    cor["t"] = pd.to_datetime(cor.timestamp, format="%Y%m%d_%H%M%S")
+
+    # frame-level and alert-level rates by fault kind, on the stream itself
+    rates = cor.groupby("kind").agg(frames=("timestamp", "size"), flagged_pct=("flagged", "mean"), alert_pct=("alert", "mean"))
+    rates[["flagged_pct", "alert_pct"]] *= 100
+    rates = rates.reset_index()
+    rates.to_csv(TABLES / "ch4_admissibility_maintenance_rates.csv", index=False)
+
+    # every episode: does an alert fire, and how long after the fault appears?
+    eps = []
+    for (kind, ep), g in cor[cor.kind != "none"].groupby(["kind", "episode"]):
+        g = g.sort_values("t")
+        hit = g[g.alert]
+        delay = (hit.t.iloc[0] - g.t.iloc[0]).total_seconds() / 60 if len(hit) else np.nan
+        eps.append(
+            dict(
+                kind=kind,
+                episode=int(ep),
+                start=g.timestamp.iloc[0],
+                frames=len(g),
+                hours=(g.t.iloc[-1] - g.t.iloc[0]).total_seconds() / 3600,
+                alerted=bool(len(hit)),
+                first_alert_delay_min=delay,
+                frames_alerted_pct=100 * g.alert.mean(),
+                frames_flagged_pct=100 * g.flagged.mean(),
+            )
+        )
+    eps = pd.DataFrame(eps)
+    eps.to_csv(TABLES / "ch4_admissibility_maintenance_episodes.csv", index=False)
+
+    # the clean stream: how often would the operator be called out for nothing?
+    cln["day"] = cln.timestamp.str[:8]
+    alert_days = cln.groupby("day").alert.any()
+    x = frames("folsom")[["timestamp", "err", "score"]].rename(columns={"score": "if_score"})
+    x = x.merge(cln[["timestamp", "score"]], on="timestamp")
+    clean_summary = dict(
+        frames=len(cln),
+        flagged_pct=100 * cln.flagged.mean(),
+        alert_pct=100 * cln.alert.mean(),
+        days=int(alert_days.size),
+        days_with_alert=int(alert_days.sum()),
+        spearman_local_vs_error=float(spearmanr(x.score, x.err).statistic),
+        spearman_iforest_vs_error=float(spearmanr(x.if_score, x.err).statistic),
+    )
+    (TABLES / "ch4_admissibility_maintenance_clean.json").write_text(json.dumps(clean_summary, indent=2))
+    top = cln.sort_values("score", ascending=False).drop_duplicates("day").head(12)
+    top[["timestamp", "score", "cell"]].to_csv(TABLES / "ch4_admissibility_local_top.csv", index=False)
+
+    # the pre-registered verdict
+    det = pd.read_csv(TABLES / "ch4_admissibility_detection.csv")
+    loc = det[det.detector.str.startswith("local")].set_index("fault").flagged_pct
+    dark = det[det.detector == "dark-pixel fraction"].set_index("fault").flagged_pct
+    soil = eps[eps.kind == "soiling"]
+    fault_free_alert = float(rates.set_index("kind").loc["none", "alert_pct"])
+    c1 = all(loc[k] >= 50 and loc[k] > dark[k] for k in ("soiling", "occlusion"))
+    c2 = bool((soil.first_alert_delay_min <= 120).all()) and fault_free_alert <= 1.0
+    verdict = dict(
+        criterion_1_frame_level="PASS" if c1 else "FAIL",
+        soiling_flagged_pct=float(loc["soiling"]),
+        occlusion_flagged_pct=float(loc["occlusion"]),
+        dark_pixel_soiling_pct=float(dark["soiling"]),
+        dark_pixel_occlusion_pct=float(dark["occlusion"]),
+        criterion_2_maintenance="PASS" if c2 else "FAIL",
+        soiling_episodes_alerted_within_2h=int((soil.first_alert_delay_min <= 120).sum()),
+        soiling_episodes=len(soil),
+        fault_free_alert_pct=fault_free_alert,
+    )
+    (TABLES / "ch4_admissibility_maintenance_verdict.json").write_text(json.dumps(verdict, indent=2))
+
+    print(rates.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(soil.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+    for k in ("droplets", "occlusion"):
+        e = eps[eps.kind == k]
+        print(
+            f"{k}: {int(e.alerted.sum())} of {len(e)} episodes alerted; median frames flagged {e.frames_flagged_pct.median():.1f} %"
+        )
+    print(json.dumps(clean_summary, indent=2))
+    print(json.dumps(verdict, indent=2))
 
 
 if __name__ == "__main__":

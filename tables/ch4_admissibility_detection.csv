@@ -19,3 +19,7 @@ blur (low Laplacian variance),none (clean 2016),3070,0.03257328990228013,
 blur (low Laplacian variance),soiling,3070,0.03257328990228013,0.5475138197752761
 blur (low Laplacian variance),droplets,3070,0.0,0.5108481787605174
 blur (low Laplacian variance),occlusion,3070,0.03257328990228013,0.5151594711880232
+"local (layer2, per cell)",none (clean 2016),3070,1.8241042345276872,
+"local (layer2, per cell)",soiling,3070,13.257328990228013,0.8944334687901198
+"local (layer2, per cell)",droplets,3070,1.9543973941368076,0.6312358221307389
+"local (layer2, per cell)",occlusion,3070,50.52117263843648,0.9598951713015522
