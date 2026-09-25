@@ -181,3 +181,54 @@ forecast error (Spearman 0.27, against 0.55 for the Isolation Forest score), con
 hardware signal rather than a difficulty signal. Under the pre-registration this is reported as a
 negative result; any re-calibration (e.g. drift-aware thresholds) is a new, separately
 pre-registered design, not a revision of this one.
+
+## 6. Spatial split of the local detector — pre-registered design (fixed 2026-09-25, before any scoring)
+
+**Motivation (post hoc, stated as such).** Inspecting the §5 outputs after the verdict showed that
+91 % of the frames the local detector flags on the clean 2016 stream are blamed on one of the 40
+cells that touch the border of the field of view (23 % of the 172 cells), and that those flags
+cluster around sunrise and sunset. Mateusz's reading of the top-scoring real frames
+(`ch4_admissibility_local_top.pdf`) sorted them into sensing-path events (acquisition faults, a
+bird, insects, droplets) and illumination events (sunrise, sunset, sun reflection, heavy rain),
+with the illumination events at the rim. The §5 verdict (FAIL on both criteria) stands; this is a
+second design, evaluated the same way. No annotated frames exist and none will be made: every
+test below is unsupervised, on synthetic faults and on geometry.
+
+**What is unchanged.** Features, projection, per-cell bank, per-cell normalisation, the
+calibration frames and days, the 99th-percentile rule and the 30-minute causal median are those
+of §5. Re-fitting must reproduce the §5 thresholds (frame 1.7527, alert 1.6356) for the unsplit
+score; that reproduction is a check, not a result.
+
+**Split.** *Edge* cells are the valid cells with at least one 4-neighbour outside the field-of-view
+mask (40 cells); *interior* cells are the rest (132). Three frame scores: the §5 score (max over all
+cells), the interior score (max over interior cells) and the edge score (max over edge cells), each
+with the cell attaining it. Each split score gets its own frame threshold, the 99th percentile on
+the same 3,000 calibration frames. The alert statistic is the 30-minute causal median of the
+*interior* score, thresholded at its 99th percentile on the same 30 calibration days. Per-cell
+normalised distances of the 2016 streams are saved (float16) so that any further split can be
+computed without re-scoring.
+
+**Pass criteria** — §5's two criteria, applied to the interior detector:
+
+1. *Frame level*: at the interior 1 % threshold, at least 50 % of soiling frames and 50 % of
+   occlusion frames flagged, and more than the dark-pixel baseline for each.
+2. *Maintenance level*: every one of the 4 soiling episodes raises an interior alert within its
+   first 2 hours, and interior alerts fire on at most 1 % of fault-free frames.
+
+**Cost of the split (reported, not a criterion).** Two additional synthetic faults place the same
+soiling patches and occlusion disc with centres in the annulus 0.72–0.92 of the field-of-view
+radius (`soiling_edge`, `occlusion_edge`). The interior detector is expected to miss them; its
+recall on them, against the edge detector's and the dark-pixel baseline's, is the price of
+discarding the rim. Faults at the rim are plausible (dirt settling at the dome base, birds on the
+housing), so this number bounds what the split gives up.
+
+**Geometric hypothesis (unsupervised, reported, not a criterion).** On the clean 2016 stream, for
+every flagged frame the solar elevation and the distance in cells between the blamed cell and the
+projected sun position (`cirr/physics/sun.py`, Folsom camera model) are computed. Stated
+expectation: among edge flags, at least half have solar elevation below 20° or the blamed cell
+within 2 cells of the sun; among interior flags, fewer than half do. This is the proxy for
+"illumination event"; it cannot show that interior flags are sensing faults.
+
+**Reporting.** Detection table rows `local, interior cells` and `local, edge cells` beside the §5
+row, for the five synthetic faults; maintenance rates, episodes and verdict for the interior
+alert; the geometry summary; the top frame per day for each split rendered as in §5.
