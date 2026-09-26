@@ -1,0 +1,131 @@
+"""Board power sampling for the edge benchmarks (Raspberry Pi 5 PMIC, Jetson tegrastats).
+
+    from edge_power import PowerSampler
+    with PowerSampler() as ps:            # backend chosen automatically
+        idle_w = ps.idle(10.0)            # seconds of idle sampling
+        t0 = ps.now(); work(); t1 = ps.now()
+        joules = ps.energy(t0, t1)        # integrated over the samples in [t0, t1]
+        net = joules - idle_w * (t1 - t0) # energy above idle
+
+Backends
+  pmic        Raspberry Pi 5: ``vcgencmd pmic_read_adc``; power = sum over rails of current x voltage for
+              every rail reporting both.  This is the PMIC's view of the board rails: it omits the 5 V input
+              converter losses and USB peripherals, so it reads below an inline meter on the supply.  Verify
+              one run against the meter and report which instrument each number comes from.
+  tegrastats  Jetson: ``tegrastats --interval <ms>``, the VDD_IN rail (module input power).  Module telemetry
+              excludes carrier-board losses; the same caveat applies.
+  none        no sensor: every energy value is NaN.
+
+Samples are (monotonic time, watts); energy is the trapezoidal integral between two timestamps.  A phase shorter
+than about two sampling intervals cannot be resolved; time many repetitions inside one window instead.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import threading
+import time
+
+_PMIC_LINE = re.compile(r"^\s*(\S+)_([AV])\s+(?:current|volt)\(\d+\)=([\d.]+)[AV]\s*$")
+_VDD_IN = re.compile(r"VDD_IN (\d+)mW")
+
+
+def detect_backend() -> str:
+    if shutil.which("vcgencmd"):
+        try:
+            out = subprocess.run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True, timeout=2).stdout
+            if "current(" in out:
+                return "pmic"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if shutil.which("tegrastats"):
+        return "tegrastats"
+    return "none"
+
+
+def pmic_watts() -> float:
+    """One PMIC reading: sum of I x V over rails that report both."""
+    out = subprocess.run(["vcgencmd", "pmic_read_adc"], capture_output=True, text=True, timeout=2).stdout
+    amps, volts = {}, {}
+    for line in out.splitlines():
+        m = _PMIC_LINE.match(line)
+        if m:
+            (amps if m[2] == "A" else volts)[m[1]] = float(m[3])
+    return sum(a * volts[r] for r, a in amps.items() if r in volts)
+
+
+class PowerSampler:
+    def __init__(self, backend: str = "auto", interval_s: float = 0.1):
+        self.backend = detect_backend() if backend == "auto" else backend
+        self.interval_s = interval_s
+        self.samples: list[tuple[float, float]] = []
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+
+    @staticmethod
+    def now() -> float:
+        return time.monotonic()
+
+    def __enter__(self) -> PowerSampler:
+        if self.backend == "pmic":
+            self._thread = threading.Thread(target=self._pmic_loop, daemon=True)
+            self._thread.start()
+        elif self.backend == "tegrastats":
+            self._proc = subprocess.Popen(["tegrastats", "--interval", str(int(self.interval_s * 1000))],
+                                          stdout=subprocess.PIPE, text=True)
+            self._thread = threading.Thread(target=self._tegra_loop, daemon=True)
+            self._thread.start()
+        time.sleep(3 * self.interval_s)  # first samples before any timed work
+        return self
+
+    def _pmic_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.samples.append((time.monotonic(), pmic_watts()))
+            except (OSError, subprocess.SubprocessError, ValueError):
+                pass
+            self._stop.wait(self.interval_s)
+
+    def _tegra_loop(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+            m = _VDD_IN.search(line)
+            if m:
+                self.samples.append((time.monotonic(), int(m[1]) / 1000.0))
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        if self._proc is not None:
+            self._proc.terminate()
+        if self.backend != "none":
+            self._thread.join(timeout=2.0)
+
+    def energy(self, t0: float, t1: float) -> float:
+        """Joules between t0 and t1 (trapezoidal over the samples, clipped to the window)."""
+        pts = [(t, w) for t, w in list(self.samples) if t0 <= t <= t1]
+        if self.backend == "none" or len(pts) < 2:
+            return float("nan")
+        e = sum((b[0] - a[0]) * (a[1] + b[1]) / 2 for a, b in zip(pts, pts[1:]))
+        span = pts[-1][0] - pts[0][0]
+        return e * (t1 - t0) / span if span > 0 else float("nan")  # extend to the window edges
+
+    def mean_w(self, t0: float, t1: float) -> float:
+        e = self.energy(t0, t1)
+        return e / (t1 - t0) if t1 > t0 else float("nan")
+
+    def idle(self, seconds: float = 10.0) -> float:
+        """Mean power over an idle window (nothing else should run)."""
+        t0 = self.now()
+        time.sleep(seconds)
+        return self.mean_w(t0, self.now())
+
+
+if __name__ == "__main__":
+    with PowerSampler() as ps:
+        print(f"backend: {ps.backend}")
+        w = ps.idle(5.0)
+        print(f"idle over 5 s: {w:.3f} W from {len(ps.samples)} samples")

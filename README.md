@@ -73,8 +73,10 @@ continual-solar-irradiance/
 | `scripts/local_gated_training.py` | Per-day local continual training with delayed prototype gating |
 | **Federated & benchmarks** | |
 | `scripts/fl_benchmark.py` | Multi-site FL benchmark |
-| `scripts/fl_edge_overhead_benchmark.py` | FL round platform cost (edge devices) |
-| `scripts/edge_adaptation_benchmark.py` | Adaptation latency / throughput |
+| `scripts/edge_adaptation_benchmark.py` | Ch4 per-action latency, energy and memory on the device |
+| `scripts/edge_admissibility_cost.py` | Ch4 exclusion-flag cost per frame and per day |
+| `scripts/edge_collaboration_benchmark.py` | Ch5 isolated / FedAvg / prototype client cost per phase |
+| `scripts/bash_scripts/run_edge_device.sh` | Runs the three edge benchmarks on a Pi 5 or Jetson |
 | `scripts/run_baselines.py` | Orchestrate static / OGD / gated / FL runs |
 | `scripts/smart_persistence_model.py` | Smart-persistence baseline |
 | **Batch wrappers** (`scripts/bash_scripts/`) | |
@@ -450,24 +452,13 @@ python scripts/run_baselines.py \
   --baseline static --baseline ungated_ogd --baseline gated
 ```
 
-### Edge latency benchmark
+### Edge benchmarks
+
+Run on the device (Raspberry Pi 5 or Jetson Orin Nano); energy comes from the Pi 5 PMIC or `tegrastats`
+(`scripts/edge_power.py`). See the header of `scripts/bash_scripts/run_edge_device.sh` for the files to copy.
 
 ```bash
-python scripts/edge_adaptation_benchmark.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --methods baseline,memo,note,paper_ogd,sliding,sm_rls \
-  --num-samples 512
-```
-
-Use `--input-source random` to profile compute without dataset I/O.
-
-FL platform overhead (payload size, aggregation latency):
-
-```bash
-python scripts/fl_edge_overhead_benchmark.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --device-profile raspberry-pi
+bash scripts/bash_scripts/run_edge_device.sh pi5     # or: orin
 ```
 
 ---
