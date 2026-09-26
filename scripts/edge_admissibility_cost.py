@@ -33,7 +33,7 @@ import torch
 
 from cirr.evaluation.admissibility import LocalGate, local_projection
 from cirr.evaluation.runner import load_eval_model
-from edge_power import PowerSampler
+from edge_power import PowerSampler, cooldown, thermal_state
 
 HW, HISTORY = 128, 4
 FRAMES_PER_DAY = 245538 / 362  # Folsom 2016 scored daylight frames per day (tab:ch4-solar-benchmark)
@@ -80,14 +80,16 @@ def timed(fn, n: int, warmup: int, cuda: bool) -> tuple[list[float], float, floa
 @click.option("--warmup", default=20, show_default=True)
 @click.option("--threads", type=int, default=None)
 @click.option("--idle-seconds", default=20.0, show_default=True)
+@click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each timed block.")
 @click.option("--overhead-json", type=click.Path(exists=True, path_type=Path), default=None,
               help="Output of edge_adaptation_benchmark.py on the same device, for the avoided-update cost.")
 @click.option("--out", type=click.Path(path_type=Path), default=None)
 @torch.no_grad()
-def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_seconds, overhead_json, out) -> None:
+def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_seconds, cool_to, overhead_json, out) -> None:
     if threads:
         torch.set_num_threads(threads)
     cuda = device == "cuda"
+    thermal = {"before_idle": cooldown(cool_to, label="before idle baseline")}
     with PowerSampler() as ps:
         idle_w = ps.idle(idle_seconds)
         print(f"power backend: {ps.backend}; idle {idle_w:.3f} W", flush=True)
@@ -117,10 +119,12 @@ def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_se
             _s = max(float(d.median()), float(d[core].max()))                          # G and C statistics
 
         res = {}
+        thermal["before_inference"] = cooldown(cool_to, label="before inference")
         ms, t0, t1 = timed(infer, samples, warmup, cuda)
         e = ps.energy(t0, t1)
         res["inference"] = dict(mean=float(np.mean(ms)), std=float(np.std(ms)), p95=float(np.percentile(ms, 95)),
                                 energy_mj=1e3 * (e - idle_w * (t1 - t0)) / len(ms))
+        thermal["before_flag"] = cooldown(cool_to, label="before inference + flag")
         hook = model.image_encoder.layer2.register_forward_hook(lambda _m, _i, o: grabbed.__setitem__("f", o))
         ms, t0, t1 = timed(infer_and_flag, samples, warmup, cuda)
         hook.remove()
@@ -158,7 +162,8 @@ def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_se
         meta = dict(host=platform.node(), machine=platform.machine(), device=device, torch=torch.__version__,
                     threads=torch.get_num_threads(), bank_dtype=bank_dtype, samples=samples, warmup=warmup,
                     power_backend=backend, idle_w=idle_w, checkpoint=str(checkpoint), gate=str(gate))
-        rec = dict(meta=meta, results=res, flag_marginal=dict(ms=flag_ms, mj=flag_mj), memory=memory,
+        thermal["end"] = thermal_state()
+        rec = dict(meta=meta, thermal=thermal, results=res, flag_marginal=dict(ms=flag_ms, mj=flag_mj), memory=memory,
                    per_day=per_day, avoided_updates=avoided)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(json.loads(json.dumps(rec), parse_constant=lambda _c: None), indent=2))

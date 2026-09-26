@@ -10,9 +10,9 @@
 # Before starting:
 #   - repository at the same commit as the host, conda env with torch (set PY=... otherwise)
 #   - checkpoints/resnet50_epoch_015.ckpt and results/adaptation/gate/local/local_gate.npz copied over
-#   - Folsom subset for step 2 (on the host):
-#       python scripts/edge_dataset_subset.py --dataset data/folsom_prepared --days 7 > logs/edge_subset.txt
-#       rsync -a --files-from=logs/edge_subset.txt data/folsom_prepared/ <device>:<repo>/data/folsom_prepared/
+#   - Folsom subset for step 2: data/edge/folsom_edge_subset.tar.gz (461 MB; periods.pickle, folsom_clear_sky.csv
+#     and the 5622 images of the 8 selected days), unpacked on the device with
+#       tar -C data -xzf folsom_edge_subset.tar.gz      # -> data/folsom_prepared/
 #   - Orin: max power mode set and fan on; Pi 5: active cooler fitted, nothing else running
 #   - inline meter logging (optional cross-check of the PMIC / tegrastats energy)
 #
@@ -30,6 +30,7 @@ PY=${PY:-$HOME/.conda/envs/irr/bin/python}
 SOAK=${SOAK:-600}           # thermal soak before timing, seconds
 SAMPLES=${SAMPLES:-200}     # timed repetitions per per-action measurement
 DAYS=${DAYS:-7}             # timed days per Chapter 5 arm
+COOL_TO=${COOL_TO:-50}      # chip temperature (C) waited for before every method, arm, timed block and step
 OUT=results/edge/$DEV
 LOG=logs/edge/$DEV
 mkdir -p "$OUT" "$LOG"
@@ -37,6 +38,7 @@ export OMP_NUM_THREADS=$THREADS
 
 step() {  # step <name> <command...>
   local name=$1; shift
+  [[ $name != environment && $name != soak ]] && "$PY" scripts/edge_power.py cooldown "$COOL_TO"
   echo "=== $name  $(date -Is)"
   "$@" 2>&1 | tee "$LOG/$name.log"
   local rc=${PIPESTATUS[0]}
@@ -62,13 +64,14 @@ print(f"soak: {n} forward passes in $SOAK s")
 EOF
 
 step adaptation "$PY" scripts/edge_adaptation_benchmark.py --checkpoint checkpoints/resnet50_epoch_015.ckpt \
-  --device "$DEVICE" --threads "$THREADS" --samples "$SAMPLES" --out "$OUT/adaptation.json"
+  --device "$DEVICE" --threads "$THREADS" --samples "$SAMPLES" --cool-to "$COOL_TO" --out "$OUT/adaptation.json"
 
 step collaboration "$PY" scripts/edge_collaboration_benchmark.py --dataset data/folsom_prepared --days "$DAYS" \
-  --device "$DEVICE" --threads "$THREADS" --out "$OUT/collaboration.json"
+  --device "$DEVICE" --threads "$THREADS" --cool-to "$COOL_TO" --out "$OUT/collaboration.json"
 
 step admissibility "$PY" scripts/edge_admissibility_cost.py --device "$DEVICE" --threads "$THREADS" \
-  --samples "$SAMPLES" --overhead-json "$OUT/adaptation.json" --out "$OUT/admissibility.json"
+  --samples "$SAMPLES" --cool-to "$COOL_TO" --overhead-json "$OUT/adaptation.json" --out "$OUT/admissibility.json"
 
+(command -v vcgencmd >/dev/null && echo "throttling flags at end: $(vcgencmd get_throttled)") || true
 echo "=== done $(date -Is); results in $OUT/, logs in $LOG/"
 [[ -s "$LOG/failures.log" ]] && cat "$LOG/failures.log" || echo "no failures"

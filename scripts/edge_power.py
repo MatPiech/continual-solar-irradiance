@@ -16,14 +16,20 @@ Backends
               excludes carrier-board losses; the same caveat applies.
   none        no sensor: every energy value is NaN.
 
+Thermal control: ``cooldown()`` waits until the hottest thermal zone is below a target temperature (with a minimum
+and maximum wait) so every measurement starts from the same thermal state, and ``thermal_state()`` records the
+temperature and, on a Pi, the firmware throttling flags; both are stored with each result.
+
 Samples are (monotonic time, watts); energy is the trapezoidal integral between two timestamps.  A phase shorter
 than about two sampling intervals cannot be resolved; time many repetitions inside one window instead.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 import re
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -54,6 +60,49 @@ def pmic_watts() -> float:
         if m:
             (amps if m[2] == "A" else volts)[m[1]] = float(m[3])
     return sum(a * volts[r] for r, a in amps.items() if r in volts)
+
+
+def chip_temp_c() -> float:
+    """Hottest thermal zone in deg C (Pi: cpu-thermal; Jetson: max over CPU/GPU/SoC zones); NaN if none."""
+    temps = []
+    for z in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
+        try:
+            v = int(z.read_text().strip())
+            if 0 < v < 150_000:  # millidegrees; skip disabled or bogus zones
+                temps.append(v / 1000.0)
+        except (OSError, ValueError):
+            pass
+    return max(temps) if temps else float("nan")
+
+
+def throttled() -> str | None:
+    """Pi firmware throttling flags (``vcgencmd get_throttled``): 0x0 means none now and none since boot."""
+    if not shutil.which("vcgencmd"):
+        return None
+    try:
+        out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2).stdout
+        return out.strip().split("=")[-1] or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def thermal_state() -> dict:
+    return {"temp_c": chip_temp_c(), "throttled": throttled()}
+
+
+def cooldown(target_c: float = 50.0, min_s: float = 30.0, max_s: float = 300.0, label: str = "") -> dict:
+    """Idle at least *min_s*, then until the chip is at or below *target_c* (at most *max_s*); report the state."""
+    t0 = time.monotonic()
+    time.sleep(min_s)
+    while time.monotonic() - t0 < max_s:
+        t = chip_temp_c()
+        if t != t or t <= target_c:  # NaN (no sensor) or cool enough
+            break
+        time.sleep(5)
+    state = thermal_state() | {"waited_s": round(time.monotonic() - t0, 1)}
+    print(f"  cooldown{' ' + label if label else ''}: {state['temp_c']:.1f} C after {state['waited_s']:.0f} s"
+          + (f", throttled={state['throttled']}" if state["throttled"] else ""), flush=True)
+    return state
 
 
 class PowerSampler:
@@ -125,6 +174,10 @@ class PowerSampler:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["cooldown"]:  # used by run_edge_device.sh between steps
+        cooldown(float(sys.argv[2]) if len(sys.argv) > 2 else 50.0, label="between steps")
+        sys.exit(0)
+    print(f"temperature: {chip_temp_c():.1f} C, throttled: {throttled()}")
     with PowerSampler() as ps:
         print(f"backend: {ps.backend}")
         w = ps.idle(5.0)

@@ -43,7 +43,7 @@ import click
 import numpy as np
 import torch
 
-from edge_power import PowerSampler
+from edge_power import PowerSampler, cooldown, thermal_state
 
 HISTORY, HW = 4, 128
 METHODS = ("static", "head", "damped", "full", "window", "rls", "memo", "note")
@@ -179,19 +179,23 @@ def _run_isolated(*args) -> dict:
 @click.option("--warmup", default=20, show_default=True)
 @click.option("--threads", type=int, default=None, help="torch CPU threads (default: torch's choice).")
 @click.option("--idle-seconds", default=20.0, show_default=True, help="Idle window for the idle-power baseline.")
+@click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each method.")
 @click.option("--out", type=click.Path(path_type=Path), default=None, help="Write the results as JSON.")
-def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int, threads: int | None, idle_seconds: float, out: Path | None) -> None:
+def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int, threads: int | None, idle_seconds: float, cool_to: float, out: Path | None) -> None:
     chosen = [m.strip() for m in methods.split(",") if m.strip()]
     if unknown := set(chosen) - set(METHODS):
         raise click.BadParameter(f"unknown methods {sorted(unknown)}; choose from {METHODS}")
+    cooldown(cool_to, label="before idle baseline")
     with PowerSampler() as ps:
         idle_w = ps.idle(idle_seconds)
         backend = ps.backend
     print(f"power backend: {backend}; idle {idle_w:.3f} W over {idle_seconds:.0f} s", flush=True)
     res: dict[str, dict] = {}
     for m in chosen:
+        start = cooldown(cool_to, label=f"before {m}")
         print(f"measuring {m} ...", flush=True)
         res[m] = _run_isolated(m, str(checkpoint), device, samples, warmup, threads, idle_w)
+        res[m]["thermal"] = {"start": start, "end": thermal_state()}
 
     for m, r in res.items():  # per-sample stream cost
         upd = r.get("update", {}).get("mean", 0.0)
@@ -204,7 +208,7 @@ def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int,
     meta = {"checkpoint": str(checkpoint), "input_channels": next(iter(res.values()))["input_channels"], "device": device,
             "host": platform.node(), "machine": platform.machine(), "torch": torch.__version__,
             "threads": threads or torch.get_num_threads(), "samples": samples, "warmup": warmup,
-            "power_backend": backend, "idle_w": idle_w}
+            "power_backend": backend, "idle_w": idle_w, "cool_to_c": cool_to}
     print(f"\n{meta['host']} ({meta['machine']}, {device}, {meta['input_channels']}-channel input, {meta['threads']} threads)")
     print(f"{'method':<32} {'infer ms':>9} {'update ms':>17} {'per-sample ms':>28} {'Tput/s':>7} {'peak RSS MB':>12} {'infer mJ':>9} {'update mJ':>10}")
     for m, r in res.items():

@@ -175,19 +175,25 @@ def _median(v: list[float]) -> float:
 @click.option("--device", type=click.Choice(["cpu", "cuda"]), default="cuda" if torch.cuda.is_available() else "cpu")
 @click.option("--threads", type=int, default=None)
 @click.option("--idle-seconds", default=20.0, show_default=True)
+@click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each arm.")
 @click.option("--progress/--no-progress", default=False, help="Show the per-batch progress bars.")
 @click.option("--out", type=click.Path(path_type=Path), default=None)
-def main(dataset, checkpoint, days, arms, device, threads, idle_seconds, progress, out) -> None:
-    from edge_power import PowerSampler
+def main(dataset, checkpoint, days, arms, device, threads, idle_seconds, cool_to, progress, out) -> None:
+    from edge_power import PowerSampler, cooldown, thermal_state
 
     chosen = [a.strip() for a in arms.split(",") if a.strip()]
     assert set(chosen) <= set(ARMS), f"arms must be among {ARMS}"
     sel = select_days(dataset, days)
+    cooldown(cool_to, label="before idle baseline")
     with PowerSampler() as ps:
         idle_w = ps.idle(idle_seconds)
         backend = ps.backend
     print(f"power backend: {backend}; idle {idle_w:.3f} W | days (first is warm-up): {sel}", flush=True)
-    res = {a: _isolated(a, str(dataset), str(checkpoint), sel, device, threads, idle_w, not progress) for a in chosen}
+    res = {}
+    for a in chosen:
+        start = cooldown(cool_to, label=f"before {a}")
+        res[a] = _isolated(a, str(dataset), str(checkpoint), sel, device, threads, idle_w, not progress)
+        res[a]["thermal"] = {"start": start, "end": thermal_state()}
 
     summary = {}
     for a, r in res.items():
@@ -213,7 +219,7 @@ def main(dataset, checkpoint, days, arms, device, threads, idle_seconds, progres
     if out:
         meta = dict(host=platform.node(), machine=platform.machine(), device=device, torch=torch.__version__,
                     threads=threads or torch.get_num_threads(), dataset=str(dataset), checkpoint=str(checkpoint),
-                    days=sel, power_backend=backend, idle_w=idle_w)
+                    days=sel, power_backend=backend, idle_w=idle_w, cool_to_c=cool_to)
         rec = json.loads(json.dumps(dict(meta=meta, summary=summary, arms=res)), parse_constant=lambda _c: None)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(rec, indent=2))
