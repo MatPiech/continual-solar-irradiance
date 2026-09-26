@@ -138,9 +138,9 @@ def measure(method: str, checkpoint: str, device: str, samples: int, warmup: int
         def update() -> None:
             memo.model.load_state_dict(memo._initial_model_state, strict=True)
             memo.configure_model()
-            memo._adapt_single(image, history.unsqueeze(0), torch.device(device))
+            memo._adapt_single(x[0], h, torch.device(device))  # inputs on the device, as in MEMOReg.forward
 
-        infer = lambda: memo._predict_single(image, history.unsqueeze(0), torch.device(device))  # noqa: E731
+        infer = lambda: memo._predict_single(x[0], h, torch.device(device))  # noqa: E731
     elif method == "note":
         note = NOTEReg(model=model, lr=1e-5, weight_decay=0.01, update_every_x=64, niter=1, adapt_mode="all",
                        use_learned_stats=False, bn_momentum=0.1).to(device)
