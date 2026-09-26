@@ -66,11 +66,11 @@ def chip_temp_c() -> float:
     """Hottest thermal zone in deg C (Pi: cpu-thermal; Jetson: max over CPU/GPU/SoC zones); NaN if none."""
     temps = []
     for z in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
-        try:
-            v = int(z.read_text().strip())
+        try:  # offline Jetson zones fail on read (EAGAIN surfaces as TypeError in text mode)
+            v = int(z.read_bytes().strip())
             if 0 < v < 150_000:  # millidegrees; skip disabled or bogus zones
                 temps.append(v / 1000.0)
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             pass
     return max(temps) if temps else float("nan")
 
