@@ -1,5 +1,0 @@
-site,variant,reference,frozen_mae,adapted_mae,change_pct,n_days
-karpicko,Conditional (full model),source (Folsom),46.860877225390276,140.59410762272418,200.02448939762297,30
-karpicko,Conditional (layer3+4),source (Folsom),46.860877225390276,137.84404726765487,194.15592585827196,30
-poznan,Conditional (full model),source (Folsom),46.860888222658055,147.85296593689134,215.5146467441517,30
-poznan,Conditional (layer3+4),source (Folsom),46.860877225390276,144.8905536227331,209.19300320786175,30
