@@ -35,22 +35,26 @@ python scripts/evaluate.py \\
 from pathlib import Path
 import random
 import sys
+import time
 from typing import Any
 
 import click
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from cirr.evaluation.campaign import SOURCE_CHECKPOINT, CampaignData, load_campaign_days, write_campaign
+from cirr.evaluation.online import OnlineEvalResult
 from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
-from cirr.evaluation.results import save_metrics_report, save_predictions_csv
-from cirr.evaluation.runner import load_eval_days
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
+from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.replay import build_folsom_replay_buffer
 from cirr.tta import MEMOReg, NOTEReg
 from cirr.utils.metrics import compute_metrics
+from cirr.utils.provenance import set_determinism
 
 # ---------------------------------------------------------------------------
 # Shared evaluation loop (day-by-day, works for baseline and all TTA methods)
@@ -98,6 +102,7 @@ def evaluate(
     all_targets: list[float] = []
     predictions_data: list[dict[str, Any]] = []
     per_day_metrics: dict[str, dict[str, float]] = {}
+    events_seen = 0
 
     print_metrics_header()
 
@@ -134,6 +139,12 @@ def evaluate(
             all_predictions.extend(pred_np)
             all_targets.extend(target_np)
 
+            # TTA wrappers count their own update events, so the campaign
+            # action mix is what the method actually did, not what it declares.
+            events_now = getattr(tta_model, "adapt_events", 0) if tta_model is not None else 0
+            adapted = events_now > events_seen
+            events_seen = events_now
+
             timestamp = image_name if isinstance(image_name, str) else None
             predictions_data.append(
                 {
@@ -143,6 +154,11 @@ def evaluate(
                     "target": target_np[0] if len(target_np) == 1 else target_np,
                     "error": float(pred_np[0] - target_np[0]),
                     "absolute_error": float(abs(pred_np[0] - target_np[0])),
+                    "update_considered": tta_model is not None,
+                    "adapted": adapted,
+                    # TTA backpropagates into the encoder in both adapt modes,
+                    # so its update events report as the full-model action.
+                    "adaptation_scope": "whole" if adapted else "none",
                 }
             )
 
@@ -178,6 +194,51 @@ def _fewshot_compute_loss(model: Forecaster, pred_mean: torch.Tensor, target: to
     return F.mse_loss(pred_mean, target)
 
 
+class _PairDataset(torch.utils.data.Dataset):
+    """Indexes a list of ``(dataset, index)`` pairs as one dataset.
+
+    The few-shot fit pools the deployment site with a Folsom replay buffer, so its
+    samples come from two datasets.  Wrapping the pairs lets a DataLoader decode
+    and transform them in worker processes; before this the fit indexed the
+    datasets inline and spent about 1.5 s per batch of 64 with the GPU idle.
+    """
+
+    def __init__(self, pairs: list[tuple[Any, int]]):
+        self._pairs = pairs
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+    def __getitem__(self, i: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ds, idx = self._pairs[i]
+        image, history, _ghi_clear, target, _name = ds[idx]
+        return image, history, target
+
+
+def _worker_init(_worker_id: int) -> None:
+    # Each worker decodes with OpenCV; leaving its thread pool enabled makes the
+    # workers fight each other for the same cores.
+    cv2.setNumThreads(0)
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def _fewshot_loader(pairs: list[tuple[Any, int]], batch_size: int, workers: int, shuffle: bool, seed: int):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return torch.utils.data.DataLoader(
+        _PairDataset(pairs),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=workers,
+        pin_memory=workers > 0,
+        persistent_workers=workers > 0,
+        worker_init_fn=_worker_init if workers > 0 else None,
+        generator=generator,
+    )
+
+
 @torch.enable_grad()
 def _fewshot_fit(
     model: Forecaster,
@@ -193,6 +254,7 @@ def _fewshot_fit(
     val_ratio: float,
     seed: int,
     device: str,
+    workers: int = 0,
 ) -> dict[str, float]:
     """Fit model once on adaptation data with early stopping."""
     pooled_samples: list[tuple[Any, int]] = [(dataset, idx) for idx in adaptation_indices] + replay_samples
@@ -220,6 +282,11 @@ def _fewshot_fit(
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # Built once: persistent workers survive the epoch loop, and the seeded
+    # generator keeps the shuffle reproducible, which S3 asserts.
+    train_loader = _fewshot_loader(train_samples, batch_size, workers, shuffle=True, seed=seed)
+    val_loader = _fewshot_loader(val_samples, batch_size, workers, shuffle=False, seed=seed) if val_samples else None
+
     best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     best_monitor = float("inf")
     best_epoch = 0
@@ -235,22 +302,19 @@ def _fewshot_fit(
 
     for epoch_idx in range(epochs):
         model.train()
-        rng.shuffle(train_samples)
         train_losses: list[float] = []
 
-        train_starts = list(range(0, len(train_samples), batch_size))
         with tqdm(
-            train_starts,
+            train_loader,
             desc=f"Few-shot epoch {epoch_idx + 1}/{epochs}",
             unit="batch",
             leave=False,
             file=sys.stderr,
         ) as batch_bar:
-            for start in batch_bar:
-                batch = train_samples[start : start + batch_size]
-                images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
-                histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
+            for images, histories, targets in batch_bar:
+                images = images.to(device, non_blocking=True)
+                histories = histories.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
 
                 optimizer.zero_grad()
                 pred_mean = _predict_single(model, images, histories)
@@ -264,14 +328,13 @@ def _fewshot_fit(
                 batch_bar.set_postfix(train=f"{running_train:.4f}")
 
         model.eval()
-        if val_samples:
+        if val_loader is not None:
             with torch.no_grad():
                 val_losses: list[float] = []
-                for start in range(0, len(val_samples), batch_size):
-                    batch = val_samples[start : start + batch_size]
-                    images = torch.stack([sample_ds[sample_idx][0] for sample_ds, sample_idx in batch]).to(device)
-                    histories = torch.stack([sample_ds[sample_idx][1] for sample_ds, sample_idx in batch]).to(device)
-                    targets = torch.stack([sample_ds[sample_idx][3] for sample_ds, sample_idx in batch]).to(device)
+                for images, histories, targets in val_loader:
+                    images = images.to(device, non_blocking=True)
+                    histories = histories.to(device, non_blocking=True)
+                    targets = targets.to(device, non_blocking=True)
                     pred_mean = _predict_single(model, images, histories)
                     val_loss = _fewshot_compute_loss(model, pred_mean, targets)
                     val_losses.append(float(val_loss.item()))
@@ -279,7 +342,7 @@ def _fewshot_fit(
         else:
             monitor = float(np.mean(train_losses)) if train_losses else float("inf")
         train_mean = float(np.mean(train_losses)) if train_losses else float("nan")
-        val_mean = monitor if val_samples else float("nan")
+        val_mean = monitor if val_loader is not None else float("nan")
 
         epochs_trained += 1
         if monitor + min_delta < best_monitor:
@@ -292,7 +355,7 @@ def _fewshot_fit(
             stale_epochs += 1
             improved = "no"
 
-        monitor_name = "val" if val_samples else "train"
+        monitor_name = "val" if val_loader is not None else "train"
         print(
             f"Few-shot epoch {epoch_idx + 1:>3}/{epochs}: "
             f"train_loss={train_mean:.6f} "
@@ -305,8 +368,7 @@ def _fewshot_fit(
 
         if stale_epochs >= patience:
             print(
-                f"Few-shot early stopping at epoch {epoch_idx + 1} "
-                f"(best_epoch={best_epoch}, best_monitor={best_monitor:.6f})",
+                f"Few-shot early stopping at epoch {epoch_idx + 1} (best_epoch={best_epoch}, best_monitor={best_monitor:.6f})",
                 flush=True,
             )
             break
@@ -338,6 +400,7 @@ def evaluate_fewshot(
     fewshot_min_delta: float,
     fewshot_val_ratio: float,
     fewshot_seed: int,
+    fewshot_workers: int,
     fewshot_replay_ratio: float,
     fewshot_replay_buffer_size: int,
     folsom_path: Path,
@@ -357,8 +420,7 @@ def evaluate_fewshot(
         effective_replay_count = min(desired_replay_count, fewshot_replay_buffer_size)
         if effective_replay_count < desired_replay_count:
             print(
-                f"Few-shot replay capped by buffer size: requested={desired_replay_count} "
-                f"cap={fewshot_replay_buffer_size}",
+                f"Few-shot replay capped by buffer size: requested={desired_replay_count} cap={fewshot_replay_buffer_size}",
                 flush=True,
             )
         try:
@@ -402,6 +464,7 @@ def evaluate_fewshot(
         min_delta=fewshot_min_delta,
         val_ratio=fewshot_val_ratio,
         seed=fewshot_seed,
+        workers=fewshot_workers,
         device=device,
     )
 
@@ -453,8 +516,31 @@ def evaluate_fewshot(
 @click.option(
     "--checkpoint",
     type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to model checkpoint file.",
+    default=str(SOURCE_CHECKPOINT),
+    show_default=True,
+    help="Source model. The default is the checkpoint Chapter 5 uses.",
+)
+@click.option(
+    "--out-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Run folder. Defaults to results/ch4/<site>/<method>/seed<k>.",
+)
+@click.option(
+    "--min-ghi-clear",
+    type=float,
+    default=DEFAULT_MIN_GHI_CLEAR,
+    show_default=True,
+    help="Daylight filter (kW/m^2), shared with the federated benchmark. 0 disables it.",
+)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option(
+    "--fewshot-workers",
+    type=click.IntRange(min=0),
+    default=8,
+    show_default=True,
+    help="DataLoader workers for the few-shot fit. The fit decodes and transforms every image, "
+    "so at 0 it is data-loading bound with the GPU idle.",
 )
 @click.option(
     "--dataset-path",
@@ -616,11 +702,11 @@ def evaluate_fewshot(
     help="Device to use ('cuda' or 'cpu').",
 )
 @click.option(
-    "--save-results",
-    "--save-result",
-    is_flag=True,
-    default=False,
-    help="Save evaluation results and predictions CSV to disk.",
+    "--horizon-steps",
+    type=click.IntRange(min=1),
+    default=15,
+    show_default=True,
+    help="Supervision lag, recorded with the run and used for the buffer accounting.",
 )
 @click.option(
     "--reset-per-day",
@@ -649,19 +735,25 @@ def main(
     fewshot_min_delta: float,
     fewshot_val_ratio: float,
     fewshot_seed: int,
+    fewshot_workers: int,
     fewshot_replay_ratio: float,
     num_days: int,
     start_day: str,
     device: str,
-    save_results: bool,
+    horizon_steps: int,
     reset_per_day: bool,
+    out_dir: Path | None,
+    min_ghi_clear: float,
+    seed: int,
 ) -> None:
     """Evaluate solar irradiance forecasting (baseline or TTA)."""
 
+    set_determinism(seed)
     if device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU.")
         device = "cpu"
 
+    checkpoint = Path(checkpoint)
     dataset_name = dataset_path.name.split("_")[0]
     if method == "none":
         method_tag = "baseline"
@@ -725,13 +817,12 @@ def main(
     # Load dataset and determine days to evaluate
     # ------------------------------------------------------------------
     print(f"Loading dataset from {dataset_path}...")
-    test_dataset, day_index_map, days_to_eval, _dataset_name = load_eval_days(dataset_path, start_day, num_days)
-    print(f"Test set size: {len(test_dataset)} samples")
-    print(f"Number of unique days: {len(day_index_map)}\n")
-
-    total_samples = sum(len(day_index_map[d]) for d in days_to_eval)
-    print(f"Evaluating {len(days_to_eval)} days starting from {start_day}")
-    print(f"Total samples: {total_samples}\n")
+    data: CampaignData = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
+    test_dataset, day_index_map, days_to_eval = data.dataset, data.day_map, data.days
+    print(
+        f"{data.site}: {len(data.days)} days, {data.n_samples} lit samples "
+        f"({data.dropped_total} dark samples dropped at min_ghi_clear={min_ghi_clear})\n"
+    )
 
     # ------------------------------------------------------------------
     # Run evaluation
@@ -745,6 +836,7 @@ def main(
     print(f"Running {method_labels[method]} evaluation...\n")
 
     adaptation_stats: dict[str, float] | None = None
+    started = time.perf_counter()
     if method == "fewshot":
         folsom_path = dataset_path.parent / "folsom_prepared"
         computed_replay_buffer_size = max(0, int(round(fewshot_days * fewshot_replay_ratio * 1000)))
@@ -767,6 +859,7 @@ def main(
             fewshot_min_delta=fewshot_min_delta,
             fewshot_val_ratio=fewshot_val_ratio,
             fewshot_seed=fewshot_seed,
+            fewshot_workers=fewshot_workers,
             fewshot_replay_ratio=fewshot_replay_ratio,
             fewshot_replay_buffer_size=computed_replay_buffer_size,
             folsom_path=folsom_path,
@@ -783,53 +876,53 @@ def main(
             reset_per_day=reset_per_day,
         )
 
+    wall_time_s = time.perf_counter() - started
     print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
 
-    if save_results:
-        csv_path = f"{dataset_name}_{method_tag}_predictions.csv"
-        txt_path = f"{dataset_name}_{method_tag}_results.txt"
-        save_predictions_csv(predictions_data, csv_path)
-        print(f"\nPredictions saved to {csv_path}")
-        extra: list[str] = []
-        if method == "memo":
-            extra.append(
-                f"TTA: MEMOReg  adapt_mode={adapt_mode}  n_aug={n_augmentations}"
-                f"  niter={niter}  lr={lr}  reset_per_day={reset_per_day}"
-            )
-        elif method == "note":
-            extra.append(
-                f"TTA: NOTEReg  adapt_mode={adapt_mode}  update_every_x={update_every_x}"
-                f"  niter={niter}  lr={lr}  use_learned_stats={use_learned_stats}"
-                f"  bn_momentum={bn_momentum}  reset_per_day={reset_per_day}"
-            )
-        elif method == "fewshot" and adaptation_stats is not None:
-            extra.append(
-                f"Fewshot: fit_days={fewshot_days}  epochs={fewshot_epochs} "
-                f"batch_size={fewshot_batch_size}  lr={fewshot_lr}  wd={fewshot_weight_decay}"
-            )
-            extra.append(
-                f"EarlyStopping: patience={fewshot_patience}  min_delta={fewshot_min_delta} " f"val_ratio={fewshot_val_ratio}"
-            )
-            extra.append(
-                f"Replay: ratio={fewshot_replay_ratio} "
-                f"buffer_size={max(0, int(round(fewshot_days * fewshot_replay_ratio * 1000)))} "
-                f"samples={int(adaptation_stats['replay_samples'])}"
-            )
-            extra.append(
-                f"Fewshot result: epochs_trained={int(adaptation_stats['epochs_trained'])} "
-                f"best_monitor={adaptation_stats['best_monitor']:.6f}"
-            )
-        save_metrics_report(
-            tag=method_tag,
-            dataset_name=dataset_name,
-            checkpoint=checkpoint,
-            dataset_path=dataset_path,
-            overall_metrics=overall_metrics,
-            per_day_metrics=per_day_metrics,
-            path=txt_path,
-            extra_lines=extra,
+    config: dict[str, Any] = {
+        "method": method_tag,
+        "seed": seed,
+        "start_day": start_day,
+        "num_days": num_days,
+        "reset_per_day": reset_per_day,
+        "dataset_path": str(dataset_path),
+    }
+    if method in ("memo", "note"):
+        config.update(adapt_mode=adapt_mode, niter=niter, lr=lr, weight_decay=weight_decay)
+        config["adapt_events"] = int(getattr(tta_model, "adapt_events", 0))
+    if method == "memo":
+        config["n_augmentations"] = n_augmentations
+    if method == "note":
+        config.update(update_every_x=update_every_x, use_learned_stats=use_learned_stats, bn_momentum=bn_momentum)
+    if method == "fewshot":
+        config.update(
+            fewshot_days=fewshot_days,
+            fewshot_epochs=fewshot_epochs,
+            fewshot_batch_size=fewshot_batch_size,
+            fewshot_lr=fewshot_lr,
+            fewshot_weight_decay=fewshot_weight_decay,
+            fewshot_patience=fewshot_patience,
+            fewshot_val_ratio=fewshot_val_ratio,
+            fewshot_seed=fewshot_seed,
+            fewshot_workers=fewshot_workers,
+            fewshot_replay_ratio=fewshot_replay_ratio,
         )
-        print(f"Results saved to {txt_path}")
+        if adaptation_stats is not None:
+            config["fewshot_result"] = {k: float(v) for k, v in adaptation_stats.items()}
+
+    out_dir = Path(out_dir) if out_dir else Path("results/ch4") / data.site / method_tag / f"seed{seed}"
+    write_campaign(
+        out_dir,
+        result=OnlineEvalResult(overall_metrics, per_day_metrics, predictions_data, {}, {}),
+        data=data,
+        config=config,
+        checkpoint=checkpoint,
+        horizon_steps=horizon_steps,
+        min_ghi_clear=min_ghi_clear,
+        wall_time_s=wall_time_s,
+        device=device,
+    )
+    print(f"\nRun written to {out_dir}")
 
 
 if __name__ == "__main__":

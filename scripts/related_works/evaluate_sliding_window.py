@@ -33,43 +33,43 @@ Reference:
 
 from collections import deque
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 import click
 import torch
 import torch.nn as nn
 
-from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, run_delayed_online_eval
+from cirr.evaluation.campaign import SOURCE_CHECKPOINT, CampaignData, load_campaign_days, write_campaign
+from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, OnlineEvalResult, run_delayed_online_eval
 from cirr.evaluation.printing import print_overall_metrics
-from cirr.evaluation.runner import load_eval_days, load_eval_model, print_eval_plan, resolve_device, save_online_eval_results
+from cirr.evaluation.runner import load_eval_model, resolve_device
 from cirr.models.forecaster import Forecaster
+from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.ogd import make_regression_loss, sliding_minibatch_step
+from cirr.utils.provenance import set_determinism
+
+# Comparators report actions in the same vocabulary as the conditional policy, so
+# events.csv means the same thing for every method in the campaign.
+SCOPE_TO_ACTION = {"head_only": "head", "head_and_encoder": "whole"}
 
 
 def evaluate(
     model: Forecaster,
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.Module,
-    dataset: Any,
-    day_index_map: dict[str, list[int]],
-    days_to_eval: list[str],
+    data: CampaignData,
     device: str,
     horizon_steps: int,
     buffer_size: int,
     scope: Literal["head_only", "head_and_encoder"],
-) -> tuple[
-    dict[str, float],
-    dict[str, dict[str, float]],
-    list[dict[str, Any]],
-    dict[str, dict[str, int]],
-    dict[str, int],
-]:
+) -> OnlineEvalResult:
     adapt_buffer: deque[dict[str, Any]] = deque(maxlen=buffer_size)
 
     def on_day_end(_day: str, ctx: OnlineEvalContext) -> None:
         adapt_buffer.clear()
         print(
-            f"       adapt: revealed={ctx.day_update_stats['revealed']} " f"adapted={ctx.day_update_stats['adapted']}",
+            f"       adapt: revealed={ctx.day_update_stats['revealed']} adapted={ctx.day_update_stats['adapted']}",
             flush=True,
         )
 
@@ -78,6 +78,7 @@ def evaluate(
         ctx.day_update_stats["revealed"] += 1
         row = ctx.predictions_data[oldest.pred_row_idx]
         row["gt_revealed"] = True
+        row["update_considered"] = True
         item = {
             "image": oldest.image,
             "history": oldest.history,
@@ -97,20 +98,22 @@ def evaluate(
             ctx.update_stats["adapted"] += 1
             ctx.day_update_stats["adapted"] += 1
             row["adapted"] = True
+            row["adaptation_scope"] = SCOPE_TO_ACTION[scope]
 
     result = run_delayed_online_eval(
         model,
-        dataset,
-        day_index_map,
-        days_to_eval,
+        data.dataset,
+        data.day_map,
+        data.days,
         device,
         horizon_steps,
         on_revealed,
         update_stats_init={"revealed": 0, "adapted": 0},
         extra_pred_fields={
             "gt_revealed": False,
+            "update_considered": False,
             "adapted": False,
-            "adaptation_scope": scope,
+            "adaptation_scope": "none",
         },
         on_day_end=on_day_end,
     )
@@ -122,13 +125,7 @@ def evaluate(
         f"  scope={scope}",
         flush=True,
     )
-    return (
-        result.overall_metrics,
-        result.per_day_metrics,
-        result.predictions_data,
-        result.per_day_adaptation,
-        result.update_stats,
-    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +137,28 @@ def evaluate(
 @click.option(
     "--checkpoint",
     type=click.Path(exists=True, path_type=Path),
-    required=True,
-    help="Path to model checkpoint file.",
+    default=str(SOURCE_CHECKPOINT),
+    show_default=True,
+    help="Source model. The default is the checkpoint Chapter 5 uses.",
 )
 @click.option(
     "--dataset-path",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="Path to prepared dataset directory (e.g. data/poznan_prepared).",
+    help="Prepared dataset directory (e.g. data/poznan_prepared).",
+)
+@click.option(
+    "--out-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Run folder. Defaults to results/ch4/<site>/sliding_window/seed<k>.",
+)
+@click.option(
+    "--min-ghi-clear",
+    type=float,
+    default=DEFAULT_MIN_GHI_CLEAR,
+    show_default=True,
+    help="Daylight filter (kW/m^2), shared with the federated benchmark. 0 disables it.",
 )
 @click.option(
     "--horizon-steps",
@@ -161,59 +172,26 @@ def evaluate(
     type=click.IntRange(min=1),
     default=4,
     show_default=True,
-    help="Number of recent GT-confirmed samples in the sliding adaptation window.",
+    help="Recent GT-confirmed samples in the sliding adaptation window.",
 )
 @click.option(
     "--scope",
-    type=click.Choice(["head_only", "head_and_encoder"], case_sensitive=False),
+    type=click.Choice(["head_only", "head_and_encoder"]),
     default="head_only",
     show_default=True,
-    help="Which parameters to update: head_only or head_and_encoder.",
+    help="Which parameters to update.",
 )
-@click.option(
-    "--lr",
-    type=float,
-    default=1e-5,
-    show_default=True,
-    help="AdamW learning rate.",
-)
-@click.option(
-    "--loss",
-    type=click.Choice(["berhu", "huber", "mse"], case_sensitive=False),
-    default="mse",
-    show_default=True,
-    help="Supervised loss used during adaptation.",
-)
-@click.option(
-    "--num-days",
-    type=int,
-    default=-1,
-    show_default=True,
-    help="Number of days to evaluate. -1 means all available days.",
-)
-@click.option(
-    "--start-day",
-    type=str,
-    default="0101",
-    show_default=True,
-    help="Starting day in MMDD format (e.g. 0101).",
-)
-@click.option(
-    "--device",
-    type=str,
-    default="cuda",
-    show_default=True,
-    help="Device to run on ('cuda' or 'cpu').",
-)
-@click.option(
-    "--save-results",
-    is_flag=True,
-    default=False,
-    help="Save per-day metrics report and predictions CSV to disk.",
-)
+@click.option("--lr", type=float, default=1e-5, show_default=True)
+@click.option("--loss", type=click.Choice(["berhu", "huber", "mse"]), default="mse", show_default=True)
+@click.option("--num-days", type=int, default=-1, show_default=True, help="-1 means all available days.")
+@click.option("--start-day", type=str, default="0101", show_default=True)
+@click.option("--seed", type=int, default=0, show_default=True)
+@click.option("--device", type=str, default="cuda", show_default=True)
 def main(
     checkpoint: Path,
     dataset_path: Path,
+    out_dir: Path | None,
+    min_ghi_clear: float,
     horizon_steps: int,
     buffer_size: int,
     scope: str,
@@ -221,70 +199,63 @@ def main(
     loss: str,
     num_days: int,
     start_day: str,
+    seed: int,
     device: str,
-    save_results: bool,
 ) -> None:
     """Evaluate forecasting with sliding-window mini-batch gradient adaptation."""
-
+    set_determinism(seed)
     device = resolve_device(device)
-    dataset_name = dataset_path.name.split("_")[0]
-    method_tag = "sliding_window"
+    checkpoint = Path(checkpoint)
 
-    print(f"Loading model from {checkpoint}...")
+    data = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
+    print(
+        f"{data.site}: {len(data.days)} days, {data.n_samples} lit samples "
+        f"({data.dropped_total} dark samples dropped at min_ghi_clear={min_ghi_clear})"
+    )
+
     model = load_eval_model(checkpoint, device)
     loss_fn = make_regression_loss(loss).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    print(f"Sliding-window:  buffer_size={buffer_size}  scope={scope}  lr={lr}  loss={loss!r}  seed={seed}\n")
 
-    print(f"Sliding-window:  buffer_size={buffer_size}  scope={scope}  lr={lr}  loss={loss!r}  horizon_steps={horizon_steps}")
-
-    test_dataset, day_index_map, days_to_eval, _ = load_eval_days(dataset_path, start_day, num_days)
-    print_eval_plan(dataset_path, test_dataset, day_index_map, days_to_eval, start_day)
-
-    # ------------------------------------------------------------------
-    # Run evaluation
-    # ------------------------------------------------------------------
-    print("Running sliding-window buffer adaptation evaluation...\n")
-    overall_metrics, per_day_metrics, predictions_data, per_day_adaptation, update_stats = evaluate(
+    started = time.perf_counter()
+    result = evaluate(
         model=model,
         optimizer=optimizer,
         loss_fn=loss_fn,
-        dataset=test_dataset,
-        day_index_map=day_index_map,
-        days_to_eval=days_to_eval,
+        data=data,
         device=device,
         horizon_steps=horizon_steps,
         buffer_size=buffer_size,
         scope=scope,  # type: ignore[arg-type]
     )
+    wall_time_s = time.perf_counter() - started
 
-    print_overall_metrics(overall_metrics, tag=f"{dataset_name}  [{method_tag}]")
+    print_overall_metrics(result.overall_metrics, tag=f"{data.site}  [sliding_window]")
 
-    if save_results:
-        extra = [
-            "Method: Sliding-window mini-batch gradient adaptation",
-            f"horizon_steps={horizon_steps}",
-            f"buffer_size={buffer_size}",
-            f"scope={scope}",
-            f"lr={lr}",
-            f"loss={loss}",
-            "Adaptation summary:",
-            f"revealed={update_stats['revealed']}",
-            f"adapted={update_stats['adapted']}",
-            "Per-day adaptation:",
-        ]
-        for day_key in sorted(per_day_adaptation.keys()):
-            s = per_day_adaptation[day_key]
-            extra.append(f"{day_key}: revealed={s['revealed']} adapted={s['adapted']}")
-        save_online_eval_results(
-            method_tag=method_tag,
-            dataset_name=dataset_name,
-            checkpoint=checkpoint,
-            dataset_path=dataset_path,
-            overall_metrics=overall_metrics,
-            per_day_metrics=per_day_metrics,
-            predictions_data=predictions_data,
-            extra_lines=extra,
-        )
+    out_dir = Path(out_dir) if out_dir else Path("results/ch4") / data.site / "sliding_window" / f"seed{seed}"
+    write_campaign(
+        out_dir,
+        result=result,
+        data=data,
+        config={
+            "method": "sliding_window",
+            "buffer_size": buffer_size,
+            "scope": scope,
+            "lr": lr,
+            "loss": loss,
+            "seed": seed,
+            "start_day": start_day,
+            "num_days": num_days,
+            "dataset_path": str(dataset_path),
+        },
+        checkpoint=checkpoint,
+        horizon_steps=horizon_steps,
+        min_ghi_clear=min_ghi_clear,
+        wall_time_s=wall_time_s,
+        device=device,
+    )
+    print(f"\nRun written to {out_dir}")
 
 
 if __name__ == "__main__":

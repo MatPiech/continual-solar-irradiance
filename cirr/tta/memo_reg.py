@@ -174,6 +174,8 @@ class MEMOReg(nn.Module):
         self.n_augmentations = n_augmentations
         self.niter = niter
         self.adapt_mode = adapt_mode
+        # Update events, so a campaign run can report what adaptation cost.
+        self.adapt_events: int = 0
         self.max_rotation = max_rotation
         self.translate_percent = translate_percent
         self.scale_min = scale_min
@@ -263,6 +265,7 @@ class MEMOReg(nn.Module):
 
             # Gradient adaptation step(s)
             self._adapt_single(img_i, hist_i, device)
+            self.adapt_events += 1
 
             # Final prediction on original unaugmented image
             mean_i, var_i = self._predict_single(img_i, hist_i, device)
@@ -315,8 +318,7 @@ class MEMOReg(nn.Module):
             has_bn = any(isinstance(m, nn.BatchNorm2d | nn.BatchNorm1d) for m in self.model.modules())
             if not has_bn:
                 raise AssertionError(
-                    "MEMOReg with adapt_mode='bn_only' requires BatchNorm layers. "
-                    "Use adapt_mode='all' for models without BN."
+                    "MEMOReg with adapt_mode='bn_only' requires BatchNorm layers. Use adapt_mode='all' for models without BN."
                 )
 
     # ------------------------------------------------------------------

@@ -12,7 +12,6 @@ from cirr.models.forecaster import Forecaster
 
 TrainScope = Literal["head_only", "head_and_encoder"]
 Algorithm1Scope = Literal["none", "head_only", "head_and_encoder"]
-EncoderUnfreeze = Literal["last_blocks", "full"]
 
 
 def pred_mean(output: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -37,26 +36,39 @@ def algorithm1_scope(delayed_abs_error: float, t1: float, t2: float) -> Algorith
     return "head_and_encoder"
 
 
-def set_trainable(
-    model: Forecaster,
-    scope: TrainScope,
-    *,
-    encoder_unfreeze: EncoderUnfreeze = "last_blocks",
-) -> None:
+def set_trainable(model: Forecaster, scope: TrainScope, *, encoder_blocks: int | None = None) -> None:
+    """Select the trainable parameter subspace.
+
+    The policy of thesis Section 4.3 has exactly two update actions, so there are
+    exactly two subspaces:
+
+    ``head_only``
+        S = {0}^|theta_b| x R^|theta_h|, the frozen-encoder action.
+    ``head_and_encoder``
+        S = R^P, the full-model action.
+
+    Historical note.  Until this fix the encoder branch unfroze
+    ``encoder_children[-2:]`` instead of the whole encoder.  For a timm backbone
+    built with ``num_classes=0`` those two children are ``SelectAdaptivePool2d``
+    and ``Identity``, which hold no parameters, so the high-error action trained
+    the head and nothing else — it was indistinguishable from the low-error
+    action.  Every Chapter 4 result published before this commit was produced
+    that way, and none of them exercised a full-model update.
+
+    ``encoder_blocks`` is an ablation of the second action, not a third policy
+    action: ``None`` (the default) is the full encoder; ``k`` unfreezes only the
+    last ``k`` encoder children that hold parameters.  ``k = 2`` is what the
+    original code meant by its last two blocks — ResNet50's layer3 and layer4.
+    """
     for param in model.parameters():
         param.requires_grad_(False)
     for param in model.network_head.parameters():
         param.requires_grad_(True)
     if scope == "head_and_encoder":
-        if encoder_unfreeze == "full":
-            for param in model.image_encoder.parameters():
+        children = [c for c in model.image_encoder.children() if any(p.numel() for p in c.parameters())]
+        for child in children if encoder_blocks is None else children[-encoder_blocks:]:
+            for param in child.parameters():
                 param.requires_grad_(True)
-        else:
-            encoder_children = list(model.image_encoder.children())
-            if encoder_children:
-                for child in encoder_children[-2:]:
-                    for param in child.parameters():
-                        param.requires_grad_(True)
 
 
 def freeze_all(model: Forecaster) -> None:
@@ -95,13 +107,38 @@ def ogd_step(
     slope_penalty: bool = False,
     volatility_multiplier: float = 0.01,
     max_grad_norm: float = 1.0,
-    encoder_unfreeze: EncoderUnfreeze = "last_blocks",
+    encoder_blocks: int | None = None,
+    replay: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    anchor: dict[str, torch.Tensor] | None = None,
+    anchor_pull: float = 0.0,
 ) -> None:
-    set_trainable(model, scope, encoder_unfreeze=encoder_unfreeze)
+    """One lagged update on the buffered sample, with the parameters in force now.
+
+    The encoder-reaching action takes two optional stabilisers; the head action
+    never uses them, because freezing the encoder already bounds its trajectory.
+
+    ``replay``
+        ``(images, histories, targets)`` from the source domain, appended to the
+        batch so the step also fits data the model was trained on.
+    ``anchor`` / ``anchor_pull``
+        Decoupled L2-SP: after the optimiser step, every trainable encoder weight
+        is pulled a fraction ``anchor_pull`` of the way back to its source value.
+        Decoupled for the same reason AdamW decouples weight decay: a penalty
+        added to the loss would be rescaled away by Adam's normalisation, which
+        is exactly why each step moves every weight by about ``lr`` regardless of
+        its gradient.  Against a walk of step ``lr`` the pull bounds the
+        stationary displacement near ``lr / sqrt(2 * anchor_pull)``.
+    """
+    set_trainable(model, scope, encoder_blocks=encoder_blocks)
     model.eval()
     imgs = image.unsqueeze(0).to(device) if image.dim() == 3 else image.to(device)
     hist = history.unsqueeze(0).to(device) if history.dim() == 1 else history.to(device)
-    target = gt.to(device)
+    target = gt.to(device).view(-1, 1)
+    if replay is not None and scope == "head_and_encoder":
+        r_img, r_hist, r_gt = replay
+        imgs = torch.cat([imgs, r_img.to(device)])
+        hist = torch.cat([hist, r_hist.to(device)])
+        target = torch.cat([target, r_gt.to(device).view(-1, 1)])
     optimizer.zero_grad()
     pred = pred_mean(model(imgs, hist))
     loss = loss_fn(pred, target.view_as(pred))
@@ -110,6 +147,11 @@ def ogd_step(
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
     optimizer.step()
+    if anchor is not None and anchor_pull > 0.0 and scope == "head_and_encoder":
+        with torch.no_grad():
+            for name, param in model.image_encoder.named_parameters():
+                if param.requires_grad:
+                    param.sub_(anchor_pull * (param - anchor[name]))
     freeze_all(model)
 
 

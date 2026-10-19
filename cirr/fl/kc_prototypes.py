@@ -8,7 +8,10 @@ import torch
 
 from cirr.fl.prototypes import extract_binned_prototypes
 from cirr.models.forecaster import Forecaster
+from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.physics.csi import CSI_CLEAR, CSI_OVERCAST, compute_csi
+
+__all__ = ["DEFAULT_MIN_GHI_CLEAR"]  # re-exported: defined with the filter it belongs to
 
 PROTO_OVERCAST = 0
 PROTO_TRANSIENT = 1
@@ -23,19 +26,6 @@ PROTO_CLASS_NAMES = {
     PROTO_TRANSIENT: "transient",
     PROTO_CLEAR: "clear",
 }
-
-# Minimum clear-sky GHI (kW/m^2) for a sample to carry a sky regime at all.
-# Below this the clear-sky index is meaningless: compute_csi clamps the
-# denominator at 1e-3 kW/m^2, so a night frame with ghi_clear == 0 yields
-# CSI = target/0.001, and any sensor noise above 0.85 W/m^2 was being labelled
-# "clear".  That put ~40 % night frames into the clear prototype at Karpicko and
-# Poznan while leaving daylight-only Folsom untouched — exactly the cross-site
-# incomparability the clear-sky label exists to remove.
-#
-# The floor is set to the clamp itself (1 W/m^2 = 1e-3 kW/m^2): every sample that
-# survives it has ghi_clear >= the clamp, so the clamp can never bind on an
-# eligible sample and CSI is always a true ratio rather than a division by eps.
-DEFAULT_MIN_GHI_CLEAR = 0.001
 
 # Physics-informed default KC/Kt regime boundaries:
 #   overcast  : < 0.30

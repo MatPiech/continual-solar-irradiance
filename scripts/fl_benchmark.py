@@ -76,10 +76,8 @@ import copy
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import random
-import subprocess
 import time
 from typing import Any
 
@@ -107,11 +105,12 @@ from cirr.fl.server import AGGREGATION_FNS, _compute_weight_change, is_bn_key, i
 from cirr.losses import BerHuLoss
 from cirr.models.forecaster import Forecaster
 from cirr.models.loading import load_forecaster_from_checkpoint
-from cirr.physics.clear_sky import load_clear_sky_lookup, resolve_clear_sky_value
+from cirr.physics.clear_sky import filter_lit_days, load_clear_sky_lookup
 from cirr.training.day_loop import ALIGN_LOSSES, predict_day, train_day
 from cirr.training.replay import RecentBuffer, build_folsom_replay_buffer, sample_replay_for_day
 from cirr.utils.dataset_utils import generate_year_days, group_indices_by_day
 from cirr.utils.metrics import compute_metrics
+from cirr.utils.provenance import git_commit, set_determinism, sha256_file
 
 # Algorithms that exchange prototypes rather than weights.
 PROTO_ALGORITHMS = ("fedproto",)
@@ -124,67 +123,12 @@ ALIGN_TARGETS = ("global", "own", "shuffled", "random")
 # ---------------------------------------------------------------------------
 
 
-def filter_lit_days(
-    day_map: dict[str, list[int]],
-    periods: list[dict[str, Any]],
-    lookup: dict[str, float],
-    min_ghi_clear: float,
-) -> tuple[dict[str, list[int]], int]:
-    """Drop samples whose clear-sky GHI is below *min_ghi_clear* (kW/m^2).
-
-    Applied once, where the day index map is built, so local training, evaluation,
-    prototype extraction and the Smart-Persistence denominator all score exactly the
-    same population — there is no second place for the filter to disagree with itself.
-
-    Night samples are trivially predictable (target and prediction are both ~0) and
-    their share differs sharply by site: 0 % at Folsom, whose camera records 06-20 h,
-    against 19 % at Karpicko and 31 % at Poznan, which record around the clock.
-    Leaving them in depresses the Polish sites' error for *every* method and makes
-    cross-site comparison meaningless.  0 disables the filter.
-
-    Days left with no lit sample are dropped entirely, which is the same state the
-    simulation already uses for a day a client has no data for.
-    """
-    if min_ghi_clear <= 0.0:
-        return day_map, 0
-    kept: dict[str, list[int]] = {}
-    dropped = 0
-    for day, idxs in day_map.items():
-        lit = []
-        for j in idxs:
-            stamp = periods[j]["history"][-1]["image_name"].rsplit(".", 1)[0]
-            ghi = resolve_clear_sky_value(lookup, stamp)
-            if ghi is not None and ghi >= min_ghi_clear:
-                lit.append(j)
-            else:
-                dropped += 1
-        if lit:
-            kept[day] = lit
-    return kept, dropped
-
-
-def set_determinism(seed: int) -> None:
-    """Pin every RNG the day loop touches, and ask torch for deterministic kernels."""
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    # warn_only: some timm kernels have no deterministic implementation; a warning
-    # is more useful than refusing to run the benchmark at all.
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def git_commit() -> str:
-    try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    except Exception:  # provenance is best-effort, never fatal
-        return "unknown"
+# filter_lit_days, set_determinism, sha256_file and git_commit now live in the
+# library so Chapter 4's evaluation path uses the same population filter and the
+# same provenance record as this benchmark.  Re-exported here because callers
+# (scripts/compute_sp_metrics.py, scripts/edge_hw_benchmark.py) import them from
+# this module.
+__all__ = ["filter_lit_days", "set_determinism", "sha256_file", "git_commit"]
 
 
 def parse_edges(spec: str | None, label: str) -> tuple[float, ...]:
