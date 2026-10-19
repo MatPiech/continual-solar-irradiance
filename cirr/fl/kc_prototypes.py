@@ -107,7 +107,6 @@ def make_regime_labeller(
         if label == "proxy"
         else (lambda target, ghi: classify_value(compute_csi(target, ghi), edges))
     )
-    n_sky = len(edges) + 1
     if elevation_bins > 1:
         sky = base
         base = lambda target, ghi: sky(target, ghi) * elevation_bins + elevation_bin(ghi, elevation_bins)  # noqa: E731
@@ -121,11 +120,13 @@ def regime_names(n_classes: int, elevation_bins: int = 1) -> dict[int, str]:
     names = {PROTO_UNLIT: "unlit"}
     if elevation_bins > 1:
         sky = regime_names(n_classes // elevation_bins)
-        names.update({
-            c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
-            for c in range(n_classes // elevation_bins)
-            for e in range(elevation_bins)
-        })
+        names.update(
+            {
+                c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
+                for c in range(n_classes // elevation_bins)
+                for e in range(elevation_bins)
+            }
+        )
         return names
     if n_classes == 3:
         names.update(PROTO_CLASS_NAMES)

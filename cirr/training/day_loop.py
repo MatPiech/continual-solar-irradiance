@@ -227,9 +227,7 @@ def train_day(
                 loss = loss + (mu / 2.0) * prox
 
             if use_proto and img_feats is not None:
-                classes = [
-                    classify_fn(float(tgts[b].item()), (ghis or [0.0])[b]) for b in range(imgs.size(0))
-                ]
+                classes = [classify_fn(float(tgts[b].item()), (ghis or [0.0])[b]) for b in range(imgs.size(0))]
                 if align_loss == "prototypical":
                     # Centroid-level prototypical cross-entropy.  Each regime present in
                     # the batch contributes one centroid, scored against every available
@@ -249,9 +247,7 @@ def train_day(
                         )
                         bank = F.normalize(torch.stack([proto_on_device[c] for c in proto_ids]), dim=1)
                         logits = cents @ bank.T / align_temperature
-                        target = torch.tensor(
-                            [proto_ids.index(c) for c in present], device=device, dtype=torch.long
-                        )
+                        target = torch.tensor([proto_ids.index(c) for c in present], device=device, dtype=torch.long)
                         # Scale by the detached task loss so lambda keeps its
                         # documented meaning (a fraction of the task-loss magnitude)
                         # and transfers across sites whose error scales differ.  Unlike

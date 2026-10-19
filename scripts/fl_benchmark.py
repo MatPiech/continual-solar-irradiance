@@ -94,12 +94,11 @@ from cirr.data.loading import load_dataset
 from cirr.evaluation.smart_persistence import predict_periods
 from cirr.fl.kc_prototypes import (
     DEFAULT_KC_EDGES,
-    PROTO_CLASS_NAMES,
+    DEFAULT_MIN_GHI_CLEAR,
     REGIME_LABELS,
     aggregate_global_prototypes,
     default_edges,
     extract_day_prototypes,
-    DEFAULT_MIN_GHI_CLEAR,
     make_regime_labeller,
     regime_names,
 )
@@ -892,13 +891,13 @@ def run_fl_benchmark(
     # --align-gate rolling: per client, keep the 7-day rolling MAE observed at the last
     # round boundary and whether the alignment is currently allowed.  If a client's
     # rolling error got worse across a round in which the alignment was active, the
-    # alignment is switched off for that client and retried after _GATE_RETRY rounds.
+    # alignment is switched off for that client and retried after _gate_retry rounds.
     # The evaluation is free: predict_day already scores each day on pre-update weights.
     _gate_on: list[bool] = [True] * len(clients)
     _gate_prev: list[float] = [float("nan")] * len(clients)
     _gate_wait: list[int] = [0] * len(clients)
     _gate_hist: list[list[float]] = [[] for _ in clients]
-    _GATE_RETRY = 5
+    _gate_retry = 5
 
     # Latest collapse diagnostics per client, refreshed by each day's prototype pass.
     _collapse_stats: dict[int, dict[str, float]] = {}
@@ -1331,17 +1330,11 @@ def run_fl_benchmark(
                                     # Collapse diagnostics: a representation collapse
                                     # shows up as feature_norm_mean falling while
                                     # pairwise_cos_mean rises toward 1.
-                                    "feature_norm_mean": _collapse_stats.get(i, {}).get(
-                                        "feature_norm_mean", float("nan")
-                                    ),
-                                    "pairwise_cos_mean": _collapse_stats.get(i, {}).get(
-                                        "pairwise_cos_mean", float("nan")
-                                    ),
+                                    "feature_norm_mean": _collapse_stats.get(i, {}).get("feature_norm_mean", float("nan")),
+                                    "pairwise_cos_mean": _collapse_stats.get(i, {}).get("pairwise_cos_mean", float("nan")),
                                 }
                             )
-                _cos = [
-                    s.get("pairwise_cos_mean", float("nan")) for s in _collapse_stats.values()
-                ]
+                _cos = [s.get("pairwise_cos_mean", float("nan")) for s in _collapse_stats.values()]
                 _cos = [c for c in _cos if c == c]
                 if _cos and max(_cos) > 0.95 and not _collapse_warned:
                     _collapse_warned = True
@@ -1542,7 +1535,7 @@ def run_fl_benchmark(
                     cur = float(np.mean(_gate_hist[i][-7:])) if len(_gate_hist[i]) >= 3 else float("nan")
                     if _gate_on[i] and cur == cur and _gate_prev[i] == _gate_prev[i] and cur > _gate_prev[i]:
                         _gate_on[i] = False
-                        _gate_wait[i] = _GATE_RETRY
+                        _gate_wait[i] = _gate_retry
                     elif not _gate_on[i]:
                         _gate_wait[i] -= 1
                         if _gate_wait[i] <= 0:
