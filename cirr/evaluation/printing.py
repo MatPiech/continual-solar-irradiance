@@ -1,0 +1,70 @@
+"""Console helpers for printing per-day and summary evaluation metrics."""
+
+import numpy as np
+
+from cirr.utils.metrics import compute_metrics
+
+# ---------------------------------------------------------------------------
+# Table layout
+# ---------------------------------------------------------------------------
+
+_HEADER = "Day    MAE        RMSE       WAPE       SMAPE      Samples "
+_SEPARATOR = "-" * len(_HEADER)
+
+
+def print_metrics_header() -> None:
+    """Print the column header and separator line for the per-day table."""
+    print(_HEADER)
+    print(_SEPARATOR)
+
+
+def print_day_metrics(day: str, preds: list[float], targets: list[float]) -> None:
+    """Compute metrics for *preds* / *targets* and print a single table row.
+
+    Parameters
+    ----------
+    day : str
+        Day label in MMDD format (e.g. ``"0315"``).
+    preds : list[float]
+        Model predictions for this day.
+    targets : list[float]
+        Ground-truth values for this day.
+    """
+    m = compute_metrics(np.array(preds), np.array(targets))
+
+    # Handle NaN values for percentage metrics
+    wape_str = f"{m['wape']:<10.2f}%" if not np.isnan(m["wape"]) else f"{'N/A':<11}"
+    smape_str = f"{m['smape']:<10.2f}%" if not np.isnan(m["smape"]) else f"{'N/A':<11}"
+
+    print(f"{day:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} {wape_str} {smape_str} {m['count']:<8}")
+
+
+def print_overall_metrics(overall_metrics: dict[str, float], tag: str = "") -> None:
+    """Print an overall metrics summary block.
+
+    Parameters
+    ----------
+    overall_metrics : dict
+        Dictionary as returned by :func:`~cirr.utils.metrics.compute_metrics`.
+    tag : str
+        Optional label appended to the section header (e.g. dataset name or
+        method tag).
+    """
+    width = 60
+    header = f"Evaluation Results{': ' + tag if tag else ''}"
+    print(f"\n{'=' * width}")
+    print(header)
+    print(f"{'=' * width}\n")
+    print("Overall Metrics:")
+    print(f"  MAE:   {overall_metrics['mae']:.8f}")
+    print(f"  RMSE:  {overall_metrics['rmse']:.8f}")
+
+    # Handle NaN values for percentage metrics
+    wape_val = overall_metrics["wape"]
+    smape_val = overall_metrics["smape"]
+    wape_str = f"{wape_val:.2f}%" if not np.isnan(wape_val) else "N/A"
+    smape_str = f"{smape_val:.2f}%" if not np.isnan(smape_val) else "N/A"
+
+    print(f"  WAPE:  {wape_str}")
+    print(f"  SMAPE: {smape_str}")
+    print(f"  Samples: {overall_metrics['count']}")

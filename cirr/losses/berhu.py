@@ -1,0 +1,75 @@
+"""
+The BerHu penalty and the grouped effect
+https://arxiv.org/abs/1207.6868
+"""
+
+import torch.nn
+
+
+class MeanAdaptiveBerHuLoss(torch.nn.Module):
+    def __init__(self, l1_thresh_factor=0.2, scale: int = 1000):
+        super().__init__()
+        self.l1_thresh_factor = l1_thresh_factor
+        self.scale = scale
+
+    def forward(self, pred, target):
+        """Computes BerHu loss function
+
+        l1_thresh = l1_thresh_factor * maximum difference in a batch
+
+        L1 distance when the error is less than or equal to l1_thresh, otherwise (error^2 + l1_thresh^2) / 2 * l1_thresh
+        """
+        assert pred.dim() == target.dim(), f"inconsistent dimensions, {pred.dim()} is not equal to {target.dim()}"
+
+        error = torch.subtract(pred * self.scale, target * self.scale)
+        abs_error = torch.abs(error)
+
+        l1_thresh = torch.max(abs_error) * self.l1_thresh_factor
+
+        # Case 1: |x| <= l1_thresh
+        case1_error = abs_error
+        # Case 2: (x^2 + l1_thresh^2) / (2 * l1_thresh)
+        case2_error = (error**2 + l1_thresh**2) / (2 * l1_thresh)
+
+        condition = torch.less_equal(abs_error, l1_thresh)
+        loss = torch.where(condition, case1_error, case2_error)
+
+        return (loss / self.scale).mean()
+
+
+class BerHuLoss(torch.nn.Module):
+    """Classic BerHu loss function.
+    Acts as L1 loss when absolute error is <= threshold.
+    Acts as L2 loss when absolute error is > threshold.
+    Perfect for instance-based online learning where batch-adaptive thresholds fail.
+    """
+
+    def __init__(self, threshold: float = 100, scale: int = 1000):
+        """Initializes the BerHuLoss.
+
+        Parameters
+        ----------
+        threshold : float, optional
+            The static transition point 'c' between L1 and L2 behavior.
+        """
+        super().__init__()
+        self.threshold = threshold
+        self.scale = scale
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        assert pred.shape == target.shape, f"Shape mismatch: {pred.shape} vs {target.shape}"
+
+        error = torch.subtract(pred * self.scale, target * self.scale)
+        abs_error = torch.abs(error)
+
+        # Case 1: |e| <= c (L1 behavior)
+        case1_loss = abs_error
+
+        # Case 2: |e| > c (L2 behavior)
+        case2_loss = (error**2 + self.threshold**2) / (2.0 * self.threshold)
+
+        # Route the losses based on the static threshold
+        condition = abs_error <= self.threshold
+        loss = torch.where(condition, case1_loss, case2_loss)
+
+        return (loss / self.scale).mean()

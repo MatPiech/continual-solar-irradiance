@@ -1,19 +1,19 @@
-import os
 from pathlib import Path
 
 import click
-from dotenv import find_dotenv, load_dotenv
 import dvc.api
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, ModelSummary
-from lightning.pytorch.loggers import NeptuneLogger
+from lightning.pytorch.loggers import MLFlowLogger
 from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import OmegaConf
 import torch
 from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 
-from cirr.datamodules.forecasting import ForecastingDataModule
+from cirr.data.forecasting import ForecastingDataModule
+from cirr.data.transforms import input_channels, normalize_optical_flow
 from cirr.models.forecaster import Forecaster
+from cirr.models.loading import load_image_encoder_checkpoint
 from cirr.utils import utils
 
 log = utils.get_logger(__name__)
@@ -22,15 +22,15 @@ log = utils.get_logger(__name__)
 @click.command()
 @click.option("--data-root", type=click.Path(exists=True, path_type=Path), required=True)
 def train_forecaster(data_root: Path):
-    load_dotenv(find_dotenv(".env"))
-
     cfg = OmegaConf.create(dvc.api.params_show()["train_forecaster"])
 
     pl.seed_everything(seed=cfg.seed)
 
+    optical_flow = normalize_optical_flow(cfg.datamodule.optical_flow)
+
     datamodule = ForecastingDataModule(
         root_data_path=data_root,
-        periods_path=data_root / "periods.pickle",
+        periods_path=data_root / "train_periods.pickle",
         augment=cfg.datamodule.augment,
         image_size=cfg.datamodule.image_size,
         image_mean=cfg.datamodule.image_mean,
@@ -38,16 +38,24 @@ def train_forecaster(data_root: Path):
         batch_size=cfg.datamodule.batch_size,
         workers=cfg.datamodule.workers,
         seed=cfg.seed,
+        optical_flow=optical_flow,
     )
+
+    encoder_ckpt = cfg.model.get("encoder_checkpoint")
+    use_pretrained = cfg.model.pretrained and not encoder_ckpt
 
     model = Forecaster(
         model_name=cfg.model.model_name,
-        pretrained=cfg.model.pretrained,
-        input_channels=cfg.model.channels,
+        pretrained=use_pretrained,
+        input_channels=input_channels(optical_flow=optical_flow),
         loss_function=cfg.model.loss_function,
         lr=cfg.model.lr,
         lr_patience=cfg.model.lr_patience,
     )
+
+    if encoder_ckpt:
+        load_image_encoder_checkpoint(model, encoder_ckpt)
+        log.info(f"Loaded image encoder weights from {encoder_ckpt}")
 
     checkpoint_callback = ModelCheckpoint(**cfg.callbacks.model_checkpoint)
     model_summary_callback = ModelSummary(max_depth=1)
@@ -60,15 +68,15 @@ def train_forecaster(data_root: Path):
         early_stopping_callback,
     ]
 
-    if not cfg.debug:
-        logger = NeptuneLogger(
-            api_key=os.environ["NEPTUNE_API_TOKEN"],
-            project=os.environ["NEPTUNE_PROJECT"],
-            log_model_checkpoints=False,
+    mlflow_cfg = cfg.get("mlflow", {})
+    if mlflow_cfg.get("enabled", False):
+        logger = MLFlowLogger(
+            experiment_name=mlflow_cfg.get("experiment_name", "forecaster"),
+            tracking_uri=mlflow_cfg.get("tracking_uri", "mlruns"),
+            run_name=mlflow_cfg.get("run_name") or None,
         )
         callbacks.append(lr_monitor)
-
-        logger.log_hyperparams(cfg.datamodule)
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))
     else:
         logger = None
 
