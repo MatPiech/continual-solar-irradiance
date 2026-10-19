@@ -2,19 +2,40 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from cirr.fl.prototypes import extract_binned_prototypes
 from cirr.models.forecaster import Forecaster
+from cirr.physics.csi import CSI_CLEAR, CSI_OVERCAST, compute_csi
 
 PROTO_OVERCAST = 0
 PROTO_TRANSIENT = 1
 PROTO_CLEAR = 2
+# Samples with no usable clear-sky irradiance get this id and are excluded from
+# prototype extraction and from the alignment loss.  They are still predicted and
+# still counted in the error metrics — this is about what defines a sky regime,
+# not about which samples are evaluated.
+PROTO_UNLIT = -1
 PROTO_CLASS_NAMES = {
     PROTO_OVERCAST: "overcast",
     PROTO_TRANSIENT: "transient",
     PROTO_CLEAR: "clear",
 }
+
+# Minimum clear-sky GHI (kW/m^2) for a sample to carry a sky regime at all.
+# Below this the clear-sky index is meaningless: compute_csi clamps the
+# denominator at 1e-3 kW/m^2, so a night frame with ghi_clear == 0 yields
+# CSI = target/0.001, and any sensor noise above 0.85 W/m^2 was being labelled
+# "clear".  That put ~40 % night frames into the clear prototype at Karpicko and
+# Poznan while leaving daylight-only Folsom untouched — exactly the cross-site
+# incomparability the clear-sky label exists to remove.
+#
+# The floor is set to the clamp itself (1 W/m^2 = 1e-3 kW/m^2): every sample that
+# survives it has ghi_clear >= the clamp, so the clamp can never bind on an
+# eligible sample and CSI is always a true ratio rather than a division by eps.
+DEFAULT_MIN_GHI_CLEAR = 0.001
 
 # Physics-informed default KC/Kt regime boundaries:
 #   overcast  : < 0.30
@@ -22,6 +43,98 @@ PROTO_CLASS_NAMES = {
 #   clear     : >= 0.65
 DEFAULT_KC_EDGES = (0.30, 0.65)
 DEFAULT_EDGE_QUANTILES = (1.0 / 3.0, 2.0 / 3.0)
+
+# Clear-sky-index regime boundaries, reusing the physics module's cut points so
+# gating and prototype stratification label the sky the same way.
+DEFAULT_CSI_EDGES = (CSI_OVERCAST, CSI_CLEAR)
+
+# Regime label sources.  "proxy" normalises by a fixed 1000 W/m^2 (the target is
+# already stored in kW/m^2), so the same label means different sky states at
+# different latitudes; "clear_sky" divides by the site-and-time Ineichen-Perez
+# clear-sky irradiance and does not.
+REGIME_LABELS = ("proxy", "clear_sky")
+
+# Optional second stratification axis: clear-sky irradiance (kW/m^2), which is a
+# monotone proxy for solar elevation.  Crossing it with the sky-condition bin turns
+# C = 3 mean vectors per round into C = 3 x n_elevation, so the exchange can carry
+# structure instead of three points.
+#
+# Fixed physical edges rather than per-client quantiles or k-means: a cluster index
+# only means something in aggregation if it means the SAME thing at every site.
+# Data-driven clusters would have to be matched across clients before averaging,
+# and mismatched indices would silently average unrelated regions of feature space.
+DEFAULT_ELEVATION_EDGES = (0.15, 0.35, 0.60)
+
+
+def elevation_bin(ghi_clear: float, n_bins: int) -> int:
+    """Bin clear-sky irradiance into *n_bins* fixed levels; 1 disables the axis."""
+    if n_bins <= 1:
+        return 0
+    edges = DEFAULT_ELEVATION_EDGES[: n_bins - 1]
+    return classify_value(ghi_clear, edges)
+
+
+def classify_value(value: float, edges: tuple[float, ...]) -> int:
+    """Bin *value* against ascending *edges*; no edges means a single regime."""
+    for idx, edge in enumerate(edges):
+        if value < edge:
+            return idx
+    return len(edges)
+
+
+def default_edges(label: str) -> tuple[float, float]:
+    return DEFAULT_KC_EDGES if label == "proxy" else DEFAULT_CSI_EDGES
+
+
+def make_regime_labeller(
+    label: str,
+    edges: tuple[float, ...],
+    min_ghi_clear: float = DEFAULT_MIN_GHI_CLEAR,
+    elevation_bins: int = 1,
+) -> Callable[[float, float], int]:
+    """Return ``fn(target, ghi_clear) -> regime id`` for the chosen label source.
+
+    Returns ``PROTO_UNLIT`` when the clear-sky irradiance is below *min_ghi_clear*,
+    so that one function decides both eligibility and label and the two call sites
+    (prototype extraction and the alignment loss) cannot drift apart.  The floor is
+    applied for both label sources, so the proxy and clear_sky arms differ only in
+    the label and not in which samples build a prototype.
+    """
+    if label not in REGIME_LABELS:
+        raise ValueError(f"Unknown regime label {label!r}. Choose from {REGIME_LABELS}.")
+    base = (
+        (lambda target, _ghi: classify_value(target, edges))
+        if label == "proxy"
+        else (lambda target, ghi: classify_value(compute_csi(target, ghi), edges))
+    )
+    if elevation_bins > 1:
+        sky = base
+        base = lambda target, ghi: sky(target, ghi) * elevation_bins + elevation_bin(ghi, elevation_bins)  # noqa: E731
+    if min_ghi_clear <= 0.0:
+        return base
+    return lambda target, ghi: base(target, ghi) if ghi >= min_ghi_clear else PROTO_UNLIT
+
+
+def regime_names(n_classes: int, elevation_bins: int = 1) -> dict[int, str]:
+    """Human-readable regime names; the physical triple keeps its usual names."""
+    names = {PROTO_UNLIT: "unlit"}
+    if elevation_bins > 1:
+        sky = regime_names(n_classes // elevation_bins)
+        names.update(
+            {
+                c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
+                for c in range(n_classes // elevation_bins)
+                for e in range(elevation_bins)
+            }
+        )
+        return names
+    if n_classes == 3:
+        names.update(PROTO_CLASS_NAMES)
+    elif n_classes == 1:
+        names[0] = "all"
+    else:
+        names.update({i: f"regime{i}" for i in range(n_classes)})
+    return names
 
 
 def classify_irradiance(norm_irradiance: float, edges: tuple[float, float] = DEFAULT_KC_EDGES) -> int:
@@ -64,21 +177,29 @@ def fit_kc_bin_edges(
     return low, high
 
 
+def _sample_ghi_clear(sample: tuple[torch.Tensor, ...]) -> float:
+    ghi = sample[2]
+    return float(ghi.item() if isinstance(ghi, torch.Tensor) else ghi)
+
+
 def extract_day_prototypes(
     model: Forecaster,
     day_samples: list[tuple[torch.Tensor, ...]],
     device: str,
     batch_size: int,
     edges: tuple[float, float] | None = None,
-) -> dict[int, tuple[torch.Tensor, int]]:
-    # Runtime adaptation uses fixed physics defaults unless caller overrides.
-    bin_edges = edges if edges is not None else DEFAULT_KC_EDGES
+    labeller: Callable[[float, float], int] | None = None,
+) -> tuple[dict[int, tuple[torch.Tensor, int]], dict[str, float]]:
+    """Extract per-regime prototypes; *labeller* must match the one used in training."""
+    if labeller is None:
+        bin_edges = edges if edges is not None else DEFAULT_KC_EDGES
+        labeller = make_regime_labeller("proxy", bin_edges)
     return extract_binned_prototypes(
         model,
         day_samples,
         device,
         batch_size,
-        lambda sample: classify_irradiance(_sample_target(sample), bin_edges),
+        lambda sample: labeller(_sample_target(sample), _sample_ghi_clear(sample)),
     )
 
 
@@ -93,13 +214,18 @@ def _zscore(values: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def aggregate_global_prototypes(
     client_protos: list[dict[int, tuple[torch.Tensor, int]]],
+    attention: bool = True,
+    temperature: float | None = None,
 ) -> tuple[list[dict[int, torch.Tensor]], dict[int, list[list[float]]]]:
     """Aggregate class prototypes with adaptive attention.
 
     Attention logits combine:
     - cosine similarity between client prototypes (content relevance)
     - support-count prior (prototype reliability)
-    Similarity scaling is data-driven (pairwise std), avoiding static temperature.
+    Similarity scaling is data-driven (pairwise std) by default.  Passing
+    *temperature* replaces that adaptive scale with a fixed tau, which is what the
+    thesis text describes (tau = 0.5); everything else, including the support-count
+    prior, is held identical so the two differ only in the scale.
     """
     n_clients = len(client_protos)
 
@@ -114,7 +240,8 @@ def aggregate_global_prototypes(
     per_client_protos: list[dict[int, torch.Tensor]] = [{} for _ in range(n_clients)]
     attention_weights: dict[int, list[list[float]]] = {}
 
-    for cls in (PROTO_OVERCAST, PROTO_TRANSIENT, PROTO_CLEAR):
+    all_classes = sorted({cls for means in client_means for cls in means})
+    for cls in all_classes:
         present = [i for i in range(n_clients) if cls in client_means[i]]
         if not present:
             continue
@@ -132,19 +259,30 @@ def aggregate_global_prototypes(
         normed = proto_stack / norms
         sim_matrix = normed @ normed.T
 
-        # Adaptive similarity scale (temperature): use matrix std over present clients.
-        sim_scale = sim_matrix.std(unbiased=False).clamp(min=1e-4)
+        # Similarity scale (temperature): adaptive by default (matrix std over the present clients), or a fixed tau when one is given.
+        if temperature is None:
+            sim_scale = sim_matrix.std(unbiased=False).clamp(min=1e-4)
+        else:
+            sim_scale = torch.tensor(float(temperature)).clamp(min=1e-4)
         sim_logits = sim_matrix / sim_scale
 
-        # Reliability prior: larger support count -> stronger contribution.
-        count_logits = _zscore(torch.log1p(count_vec))
-        attn_logits = sim_logits + count_logits.unsqueeze(0)
-        attn = torch.softmax(attn_logits, dim=1)
+        if attention:
+            # Reliability prior: larger support count -> stronger contribution.
+            count_logits = _zscore(torch.log1p(count_vec))
+            attn_logits = sim_logits + count_logits.unsqueeze(0)
+            attn = torch.softmax(attn_logits, dim=1)
+        else:
+            # Ablation: plain unweighted consensus, every peer counted equally.
+            attn = torch.full((len(present), len(present)), 1.0 / len(present))
         weighted = attn @ proto_stack
 
         cls_attn: list[list[float]] = [[0.0] * n_clients for _ in range(n_clients)]
         for ki, i in enumerate(present):
-            per_client_protos[i][cls] = weighted[ki]
+            # .clone(): `weighted[ki]` is a row VIEW of the (n_present, d) stack, and
+            # torch.save serialises a view's whole backing storage — which made the
+            # logged prototype payload scale with the number of participating peers
+            # (3x at three clients) instead of being a single d-vector per regime.
+            per_client_protos[i][cls] = weighted[ki].clone()
             for kj, j in enumerate(present):
                 cls_attn[i][j] = attn[ki, kj].item()
         attention_weights[cls] = cls_attn

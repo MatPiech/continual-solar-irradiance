@@ -22,6 +22,8 @@ dependencies = [
     "opencv-contrib-python",
     "pandas",
     "pvlib",
+    "scipy",
+    "statsmodels",
     "tqdm",
     "scikit-learn",
     "python-dotenv",

@@ -12,8 +12,39 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, classify_irradiance
+from cirr.fl.kc_prototypes import DEFAULT_KC_EDGES, make_regime_labeller
 from cirr.models.forecaster import Forecaster
+
+# Default upper bound on the adaptive task-loss/prototype-loss ratio (see its use
+# in `train_day`).  0 disables the cap, which is the default.
+#
+# A cap of 100 was in force from 2026-09-17 to 2026-09-19 and silently switched the
+# alignment term off: the natural scale is task_loss/avg_proto, and with embeddings
+# sitting ~1e-4 from their class mean that ratio is 4e6-1e7, so the cap bound on
+# every batch and cut the term to ~1e-6 of the task loss instead of the documented
+# lambda (0.1 = 10 %).  Measured gradient contribution fell to 2.5e-7 of the task
+# gradient, which is why own / shuffled / random / lambda x30 were all
+# indistinguishable.  Gradient clipping (--adapt-max-grad-norm, 1.0 by default)
+# already bounds the update, so the cap's stated purpose is covered without it.
+_DEFAULT_PROTO_SCALE_CAP = 0.0
+
+# Alignment objectives.
+#   mse           — the original: pull every embedding onto its regime centroid.
+#                   Minimised by making all embeddings identical, and the target is
+#                   the model's own (shrinking) class mean recomputed each round, so
+#                   nothing anchors against that.  Measured outcome: feature norm
+#                   fell 1.8x, mean pairwise cosine rose 0.88 -> 0.999, within-regime
+#                   spread fell 43x, and the dominant feature direction stopped
+#                   tracking irradiance (corr 0.69 -> 0.16).  Representation collapse.
+#   prototypical  — cosine similarity of each regime's batch CENTROID against ALL
+#                   regime prototypes, through a cross-entropy.  Two differences that
+#                   matter: it is computed on centroids, so within-regime spread (the
+#                   signal a continuous target needs) is left free; and it pushes away
+#                   from other regimes, so the collapsed solution maximises the loss
+#                   instead of minimising it.  Bounded and scale-free, so lambda has a
+#                   stable meaning and needs no adaptive rescaling.
+ALIGN_LOSSES = ("mse", "prototypical")
+_DEFAULT_ALIGN_TEMPERATURE = 0.1
 
 
 def predict_day(
@@ -83,7 +114,10 @@ def train_day(
     client_name: str = "",
     global_prototypes: dict[int, torch.Tensor] | None = None,
     proto_lambda: float = 0.0,
-    proto_bin_edges: tuple[float, float] | None = None,
+    proto_scale_cap: float = _DEFAULT_PROTO_SCALE_CAP,
+    align_loss: str = "mse",
+    align_temperature: float = _DEFAULT_ALIGN_TEMPERATURE,
+    classify_fn: Callable[[float, float], int] | None = None,
     optimizer: torch.optim.Optimizer | None = None,
     extra_loss_fn: Callable[[torch.Tensor, Forecaster], torch.Tensor] | None = None,
     shuffle_each_epoch: bool = True,
@@ -124,8 +158,10 @@ def train_day(
     proto_on_device: dict[int, torch.Tensor] = {}
     if use_proto:
         proto_on_device = {cls: proto.detach().to(device) for cls, proto in global_prototypes.items()}
-        if proto_bin_edges is None:
-            proto_bin_edges = DEFAULT_KC_EDGES
+        if classify_fn is None:
+            # Same default as prototype extraction, so the alignment target of a
+            # sample is always the prototype of the regime it was counted into.
+            classify_fn = make_regime_labeller("proxy", DEFAULT_KC_EDGES)
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -150,7 +186,7 @@ def train_day(
 
         _pbar = tqdm(
             batches,
-            desc=f"  [{client_name}] train e{ep+1}/{epochs}",
+            desc=f"  [{client_name}] train e{ep + 1}/{epochs}",
             leave=False,
             unit="batch",
             file=sys.stdout,
@@ -161,10 +197,13 @@ def train_day(
                 imgs = torch.stack([item[0] for item in batch]).to(device)
                 hist = torch.stack([item[1] for item in batch]).to(device)
                 tgts = torch.stack([item[3] for item in batch]).to(device)
+                ghis = [float(item[2]) for item in batch] if use_proto else None
             else:
-                imgs = torch.stack([ds[idx][0] for ds, idx in batch]).to(device)  # type: ignore[index]
-                hist = torch.stack([ds[idx][1] for ds, idx in batch]).to(device)  # type: ignore[index]
-                tgts = torch.stack([ds[idx][3] for ds, idx in batch]).to(device)  # type: ignore[index]
+                rows = [ds[idx] for ds, idx in batch]  # type: ignore[index]
+                imgs = torch.stack([r[0] for r in rows]).to(device)
+                hist = torch.stack([r[1] for r in rows]).to(device)
+                tgts = torch.stack([r[3] for r in rows]).to(device)
+                ghis = [float(r[2]) for r in rows] if use_proto else None
 
             optimizer.zero_grad()
 
@@ -188,18 +227,50 @@ def train_day(
                 loss = loss + (mu / 2.0) * prox
 
             if use_proto and img_feats is not None:
-                proto_loss = torch.tensor(0.0, device=device)
-                n_proto = 0
-                for b in range(imgs.size(0)):
-                    cls = classify_irradiance(float(tgts[b].item()), proto_bin_edges or DEFAULT_KC_EDGES)
-                    if cls in proto_on_device:
-                        proto_loss = proto_loss + F.mse_loss(img_feats[b], proto_on_device[cls])
-                        n_proto += 1
-                if n_proto > 0:
-                    avg_proto = proto_loss / n_proto
-                    task_loss_val = loss.detach()
-                    scale = task_loss_val / (avg_proto.detach() + 1e-8)
-                    loss = loss + proto_lambda * scale * avg_proto
+                classes = [classify_fn(float(tgts[b].item()), (ghis or [0.0])[b]) for b in range(imgs.size(0))]
+                if align_loss == "prototypical":
+                    # Centroid-level prototypical cross-entropy.  Each regime present in
+                    # the batch contributes one centroid, scored against every available
+                    # prototype: the own-regime term pulls, the rest push.  Needs at
+                    # least two prototypes for the push to mean anything.
+                    proto_ids = sorted(proto_on_device)
+                    present = [c for c in sorted(set(classes)) if c in proto_on_device]
+                    if len(proto_ids) >= 2 and present:
+                        cents = torch.stack(
+                            [
+                                F.normalize(
+                                    img_feats[[b for b, c in enumerate(classes) if c == cls_id]].mean(0),
+                                    dim=0,
+                                )
+                                for cls_id in present
+                            ]
+                        )
+                        bank = F.normalize(torch.stack([proto_on_device[c] for c in proto_ids]), dim=1)
+                        logits = cents @ bank.T / align_temperature
+                        target = torch.tensor([proto_ids.index(c) for c in present], device=device, dtype=torch.long)
+                        # Scale by the detached task loss so lambda keeps its
+                        # documented meaning (a fraction of the task-loss magnitude)
+                        # and transfers across sites whose error scales differ.  Unlike
+                        # the mse variant this divides by nothing, so there is no
+                        # blow-up as embeddings approach their prototype: the
+                        # cross-entropy is bounded.
+                        loss = loss + proto_lambda * loss.detach() * F.cross_entropy(logits, target)
+                else:
+                    proto_loss = torch.tensor(0.0, device=device)
+                    n_proto = 0
+                    for b in range(imgs.size(0)):
+                        cls = classes[b]
+                        # cls < 0 marks a sample with no usable clear-sky value; it is
+                        # trained on as usual but pulled toward no prototype.
+                        if cls >= 0 and cls in proto_on_device:
+                            proto_loss = proto_loss + F.mse_loss(img_feats[b], proto_on_device[cls])
+                            n_proto += 1
+                    if n_proto > 0:
+                        avg_proto = proto_loss / n_proto
+                        scale = loss.detach() / (avg_proto.detach() + 1e-8)
+                        if proto_scale_cap > 0:
+                            scale = scale.clamp(max=proto_scale_cap)
+                        loss = loss + proto_lambda * scale * avg_proto
 
             if extra_loss_fn is not None:
                 loss = loss + extra_loss_fn(loss, model)

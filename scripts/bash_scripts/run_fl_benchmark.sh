@@ -35,37 +35,48 @@ fi
 
 # FL algorithms to run for every dataset pair (comment out any you want to skip).
 ALGORITHMS=(
-    # static    # inference-only baseline — no training, no aggregation
-    # isolated   # lower bound — no federation
-    # fedavg     # standard weight averaging
-    # fedbn      # FedAvg, BatchNorm layers kept local
-    # fedper     # backbone aggregated, head kept local
-    # fedprox    # FedAvg + proximal term in local training
-    # ditto      # dual-model with personalised proximal anchor
-    # fedema     # FedAvg + EMA interpolation at distribution
-    fedproto   # prototype exchange, no weight sharing
+    static     # inference-only baseline — no training, no aggregation
+    isolated   # do-no-harm reference — no federation
+    fedavg     # standard weight averaging
+    fedbn      # FedAvg, BatchNorm layers kept local
+    fedper     # backbone aggregated, head kept local
+    fedprox    # FedAvg + proximal term in local training
+    fedema     # FedAvg + EMA interpolation at distribution
+    fedproto   # prototype exchange, no weight sharing (the proposed method)
 )
 
-CHECKPOINT="checkpoints/epoch_024.ckpt"
+# Chapter 5 runs on the explicitly named ResNet50 checkpoint so that the model
+# matches the architecture described in the thesis.  Switch to
+# checkpoints/efficientvit_b2_epoch_012.ckpt only together with the text.
+CHECKPOINT="checkpoints/resnet50_epoch_015.ckpt"
 
 # Shared local-training hyperparameters (naive fine-tuning — intentionally
 # minimal so that FL aggregation does the heavy lifting).
-WARMUP_DAYS=0
+WARMUP_DAYS=30
 WARMUP_CACHE_DIR="warmup_cache"
 ADAPT_LR=1e-5
 ADAPT_WEIGHT_DECAY=1e-4
 ADAPT_GRAD_NORM=1.0
 ADAPT_BATCH=32
 ADAPT_EPOCHS=1
-REPLAY_BUFFER_SIZE=10000   # reservoir buffer capacity (0 = disabled)
+# The Folsom reservoir buffer is OFF: it placed source-site raw samples on every
+# client, which contradicts the premise that measurements never leave a site.
+# Only each client's own recent history is replayed.
+REPLAY_BUFFER_SIZE=0       # reservoir buffer capacity (0 = disabled)
 REPLAY_RATIO=0.5           # reservoir samples as fraction of current-day count
 RECENT_BUFFER_SIZE=1000    # FIFO recent buffer capacity (0 = disabled)
 RECENT_REPLAY_RATIO=0.5    # recent-buffer samples as fraction of current-day count
-FEDPROX_MU=1.0             # proximal strength for FedProx
-DITTO_LAMBDA=1.0           # personalised proximal strength for Ditto
-FEDEMA_ALPHA=0.1           # EMA interpolation coefficient for FedEMA
+# Baseline strength parameters.  A negative result about parameter-space
+# federation is only as strong as the effort spent making those baselines work,
+# so each is set to its registered / published-default value rather than to the
+# most restrictive end of its range.  Tier 3 sweeps them; the main table reports
+# each baseline at its best setting.
+FEDPROX_MU=0.01            # proximal strength for FedProx  (sweep: 0.001 0.01 0.1 1.0)
+DITTO_LAMBDA=0.1           # personalised proximal strength (sweep: 0.01 0.1 1.0)
+FEDEMA_ALPHA=0.5           # EMA coefficient, higher keeps more local (sweep: 0.1 0.5 0.9)
 FEDPROTO_LAMBDA=0.1        # prototype regularisation strength for FedProto
 SEED=42
+REGIME_LABEL="clear_sky"   # clear-sky index rather than the fixed-1000 proxy
 DEVICE="cuda"
 PARALLEL_CLIENTS="${#DATASETS[@]}"  # number of datasets
 
@@ -114,6 +125,7 @@ run_algorithm() {
         --ditto-lambda        "${DITTO_LAMBDA}" \
         --fedema-alpha        "${FEDEMA_ALPHA}" \
         --fedproto-lambda     "${FEDPROTO_LAMBDA}" \
+        --regime-label        "${REGIME_LABEL}" \
         --device              "${DEVICE}" \
         --seed                "${SEED}" \
         --parallel-clients    "${PARALLEL_CLIENTS:-${#DATASETS[@]}}" \
