@@ -1,478 +1,111 @@
 # Continual Solar Irradiance Forecasting
 
-Online and federated adaptation for sky-image solar irradiance forecasting. The `cirr` library implements forecasting models, physics-guided gating, test-time adaptation (TTA), and federated learning (FL) for deployment at sites where ground truth arrives with a causal delay.
+**Sky-image solar forecasting that keeps learning after deployment**: on edge devices, from labels that arrive late, and across sites that never share their data.
 
----
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Project objective
+<table align="center">
+  <tr>
+    <td align="center"><img src="notebooks/data/folsom_20141114_201400.jpg" width="250" alt="All-sky image from Folsom with broken cumulus clouds"></td>
+    <td align="center"><img src="notebooks/data/karpicko_20240813_100000.jpg" width="250" style="width: 250px; height: 250px; object-fit: cover;" alt="All-sky image from Karpicko under a clear sky"></td>
+    <td align="center"><img src="notebooks/data/poznan_20241020_100000.jpg" width="250" style="width: 250px; height: 250px; object-fit: cover;" alt="All-sky image from Poznań under an overcast sky"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Folsom, USA</b><br>source site<br></td>
+    <td align="center"><b>Karpicko, Poland</b><br>target site</td>
+    <td align="center"><b>Poznań, Poland</b><br>target site</td>
+  </tr>
+</table>
 
-Forecast short-horizon global horizontal irradiance (GHI) from sky images and recent irradiance history at the edge:
+## What it does
 
-| Concern | What the codebase does |
-|---------|-------------------------|
-| **Delayed feedback** | Predict at *t*; ground truth usable after `horizon_steps` (default 15 samples) |
-| **Online adaptation** | OGD, sliding window, SM-RLS, CSI gating, TTA — update only when triggers fire |
-| **Federated learning** | Multi-site aggregation (FedAvg, FedBN, FedPer, …) on a sync interval decoupled from daily noise |
+The `cirr` package forecasts global horizontal irradiance (GHI) **15 minutes ahead** from an all-sky image and the last four irradiance readings. A model trained at one site (Folsom, 2014–2015) is deployed at new sites and has to keep adapting there, under three constraints:
 
-Benchmark sites: **Folsom** (US source), **Karpicko**, **Poznan**.
+- **Lagged labels.** The ground truth for a forecast made at *t* only arrives at *t* + 15 min, so every update is causal.
+- **Unreliable frames.** Soiling, occlusions or banding on the camera dome must not drive adaptation.
+- **Private data.** Sites collaborate by exchanging model weights or compact per-regime prototypes, never images.
 
----
-
-## Architecture (library vs scripts)
-
-```
-scripts/*.py          CLI: argparse/click, paths, result files
-        │
-        ▼
-cirr/evaluation/      load_eval_model, load_eval_days, run_delayed_online_eval
-cirr/training/        ogd, sm_rls, day_loop, replay
-cirr/continual/       gating, horizon FIFO buffer
-cirr/fl/              server aggregation, prototypes
-cirr/tta/             MEMO, NOTE, dual-phase
-cirr/models/          Forecaster, checkpoint loading
-cirr/data/            datasets, transforms, load_dataset()
-cirr/physics/         clear-sky GHI, CSI, thresholds
-```
-
-**Design rule:** adaptation behavior lives in `cirr/`; scripts wire checkpoints, datasets, and `--save-results`. Online eval scripts share `run_delayed_online_eval()` and `cirr/evaluation/runner.py` bootstrap helpers.
-
----
-
-## Repository layout
-
-```
-continual-solar-irradiance/
-├── cirr/                 # Installable package
-├── scripts/              # Experiment CLIs (see table below)
-├── tests/                # Smoke tests (ogd, sm_rls, gating)
-├── params.yaml           # DVC pipeline parameters
-├── CONTEXT.md            # Domain glossary + module index
-└── WACV.md               # Research checklist
+```mermaid
+flowchart LR
+    subgraph site["Each site · edge device"]
+        direction LR
+        X["Sky image +<br>irradiance history"] --> F["Forecaster<br>ResNet50 + MLP head"]
+        F --> Y(["GHI forecast<br>t + 15 min"])
+        F -->|embedding| G{"Admissibility<br>gate"}
+        G -->|admitted| A["Conditional adaptation<br>OGD · SM-RLS · sliding window · TTA"]
+        L(["Ground truth<br>arrives 15 min later"]) --> A
+        A -.->|update| F
+    end
+    F <-.->|"weights or regime prototypes<br>periodic sync (default 7 days)"| S["Federated server<br>FedAvg · FedBN · FedPer · FedProx<br>Ditto · FedEMA · prototype exchange"]
 ```
 
-### Scripts inventory
-
-| Script | Purpose |
-|--------|---------|
-| **Data & training** | |
-| `scripts/dvc/get_data.sh` | Download Folsom raw data (Zenodo) |
-| `scripts/dvc/convert_timestamps.py` | Rename images to UTC timestamps |
-| `scripts/dvc/clean_dataframe.py` | Merge irradiance + image paths |
-| `scripts/dvc/export_periods.py` | Build `train_periods.pickle` |
-| `scripts/dvc/train_forecaster.py` | Train Forecaster (Lightning) |
-| `scripts/pretrain_supcon.py` | SupCon encoder pretraining |
-| `scripts/clear_sky.py` | Generate site `*_clear_sky.csv` files |
-| **Evaluation & adaptation** | |
-| `scripts/evaluate.py` | Baseline + MEMO/NOTE TTA |
-| `scripts/evaluate_dual_phase.py` | Dual-phase OGD + TTA |
-| `scripts/evaluate_paper_lagged_ogd.py` | Paper Algorithm 1 OGD |
-| `scripts/evaluate_sliding_window.py` | Sliding-window OGD |
-| `scripts/evaluate_sm_rls.py` | Sherman–Morrison RLS head |
-| `scripts/evaluate_gated.py` | CSI prototype gating |
-| `scripts/local_training.py` | Per-day local continual training |
-| `scripts/local_gated_training.py` | Per-day local continual training with delayed prototype gating |
-| **Federated & benchmarks** | |
-| `scripts/fl_benchmark.py` | Multi-site FL benchmark |
-| `scripts/fl_edge_overhead_benchmark.py` | FL round platform cost (edge devices) |
-| `scripts/edge_adaptation_benchmark.py` | Adaptation latency / throughput |
-| `scripts/run_baselines.py` | Orchestrate static / OGD / gated / FL runs |
-| `scripts/smart_persistence_model.py` | Smart-persistence baseline |
-| **Batch wrappers** (`scripts/bash_scripts/`) | |
-| `run_fl_benchmark.sh` | Sweep FL algorithms |
-| `generate_clear_sky_all.sh` | Clear-sky CSVs for all sites |
-| `calculate_smart_persistence_all.sh` | Smart persistence for all sites |
-
-### Key APIs
-
-| Module | Functions |
-|--------|-----------|
-| `cirr/data/loading.py` | `load_dataset(path, split="test"\|"training")` |
-| `cirr/evaluation/runner.py` | `load_eval_model`, `load_eval_days`, `print_eval_plan`, `save_online_eval_results` |
-| `cirr/evaluation/online.py` | `run_delayed_online_eval`, `infer_one` |
-| `cirr/continual/buffer.py` | `reveal_after_horizon`, `DelayedFeedbackBuffer` |
-| `cirr/training/ogd.py` | Algorithm 1 OGD, sliding-window steps |
-| `cirr/continual/gating.py` | CSI prototype gating + `eval_gated_online` |
-
----
-
-## Datasets
-
-### Prepared directory
-
-Each site (e.g. `data/poznan_prepared/`) contains:
-
-| File / dir | Role |
-|------------|------|
-| `images/` | Sky images referenced by period records |
-| `periods.pickle` | Test split index |
-| `train_periods.pickle` | Training split index |
-| `cleaned_irradiance.csv` | Preprocessed irradiance series |
-
-Forecasting window: **15 min horizon**, **5 min history step**, **4 history samples** (`params.yaml`).
-
-### Sample tuple
-
-```python
-image, history, ghi_clear, target, timestamp = dataset[i]
-```
-
-| Field | Shape | Meaning |
-|-------|-------|---------|
-| `image` | `[C,H,W]` | RGB (3ch) or RGB+flow (5ch) |
-| `history` | `[4]` | Normalised past irradiance |
-| `ghi_clear` | scalar | Clear-sky GHI |
-| `target` | `[1]` | Normalised ground truth |
-| `timestamp` | str | `YYYYMMDD_HHMMSS` |
-
-```python
-from pathlib import Path
-from cirr.data.loading import load_dataset
-
-ds = load_dataset(Path("data/poznan_prepared"), split="test", optical_flow="none")
-```
-
-### Folsom download
-
-```bash
-dvc repro get_data convert_timestamps clean_dataframe export_periods
-cp data/folsom_prepared/train_periods.pickle data/folsom_prepared/periods.pickle
-```
-
-Or download raw data only: `bash scripts/dvc/get_data.sh`.
-
-Other sites use the same prepared layout after site-specific preprocessing. See [Start from scratch](#start-from-scratch) for the full Folsom pipeline.
-
----
+| Capability | What it provides | Code · entry point |
+|---|---|---|
+| **Forecasting** | ResNet50 sky-image forecaster with irradiance history, BerHu loss, optional SupCon encoder pretraining and LoRA | `cirr/models`, `cirr/losses` · `scripts/dvc/train_forecaster.py` |
+| **Delayed-feedback evaluation** | Online evaluation where each label is revealed only after the horizon; Smart Persistence baseline and forecast skill | `cirr/evaluation`, `cirr/continual` · `scripts/evaluate.py` |
+| **Online adaptation** | Error-triggered OGD, sliding window, Sherman–Morrison RLS head, few-shot, dual-phase | `cirr/training` · `scripts/related_works/`, `scripts/evaluate_dual_phase.py` |
+| **Test-time adaptation** | MEMO and NOTE, adapted for regression | `cirr/tta` · `scripts/evaluate.py --method memo\|note` |
+| **Input admissibility** | Isolation Forest gate on the forecaster embedding; two-channel monitor (exclude frame / maintenance alert); synthetic camera faults | `cirr/evaluation/admissibility.py` · `scripts/fit_anomaly_gate.py`, `scripts/fit_monitor.py` |
+| **Federated learning** | Weight aggregation baselines and regime-stratified prototype exchange (overcast / transient / clear) | `cirr/fl` · `scripts/fl_benchmark.py` |
+| **Physics-informed input** | 7-channel input: RGB, sun mask × irradiance, normalised blue/red ratio, optical flow; sun-camera calibration | `cirr/physics`, `cirr/data` · `scripts/fit_sun_camera.py`, [docs/IEP_SETUP.md](docs/IEP_SETUP.md) |
+| **Edge benchmarking** | Latency, memory, payload size and energy on Raspberry Pi / Jetson | `scripts/edge_hw_benchmark.py`, `scripts/edge_adaptation_benchmark.py`, `scripts/fl_edge_overhead_benchmark.py` |
 
 ## Installation
 
-**Prerequisites:** Python 3.10–3.12, CUDA optional (recommended for training), ~50 GB disk for Folsom raw images.
+Python 3.10–3.12; a CUDA GPU is recommended for training.
 
 ```bash
 git clone https://github.com/MatPiech/continual-solar-irradiance.git
 cd continual-solar-irradiance
 pip install -e ".[dev]"
-pytest tests/ -q
 ```
 
----
+## Data
 
-## Start from scratch
-
-End-to-end path from raw data to WACV-style evaluation. Steps map to [WACV.md](WACV.md) phases.
-
-| Step | WACV phase | Command / artifact |
-|------|------------|-------------------|
-| 1 Prepare data | Phase 1 | `dvc repro …` → `train_periods.pickle` |
-| 2 Clear-sky CSVs | Phase 1.3 / 4 | `generate_clear_sky_all.sh` |
-| 3 SupCon (optional) | Phase 3.1 | `pretrain_supcon.py` |
-| 4 Train Forecaster | Phase 2 | `train_forecaster.py` → `checkpoints/` |
-| 5 Static baseline | Phase 6.1 | `evaluate.py` |
-| 6 Online adaptation | Phases 4–5 | `evaluate_gated.py`, `evaluate_paper_lagged_ogd.py`, … |
-| 7 Federated | Phase 5 | `fl_benchmark.py` |
-| 8 Baseline suite | Phase 6.1 | `run_baselines.py` |
-
-```
-Install → Prepare data → Clear-sky CSVs → (optional SupCon) → Train Forecaster → Evaluate
-```
-
-### Step 1 — Prepare Folsom (source site)
-
-The DVC pipeline downloads Folsom from [Zenodo 2826939](https://zenodo.org/records/2826939), renames images, merges irradiance, and exports period indices.
+Folsom (source site) is downloaded from [Zenodo 2826939](https://zenodo.org/records/2826939) and prepared by the DVC pipeline (~50 GB of raw images):
 
 ```bash
 dvc repro get_data convert_timestamps clean_dataframe export_periods
-```
-
-This writes under `data/folsom_prepared/`:
-
-| Output | Role |
-|--------|------|
-| `images/` | Timestamped sky images |
-| `cleaned_irradiance.csv` | Aligned irradiance + image paths |
-| `train_periods.pickle` | Period index for training |
-
-Eval scripts load `periods.pickle` for the test split. After export, link the same index file:
-
-```bash
 cp data/folsom_prepared/train_periods.pickle data/folsom_prepared/periods.pickle
+bash scripts/bash_scripts/generate_clear_sky_all.sh   # *_clear_sky.csv for every site
 ```
 
-For **Folsom**, `ForecastingDataModule` splits years internally: 2014–2015 train/val, **2016 test** (matches WACV US Years 1–2 pretrain / Year 3 eval).
+Every site lives in `data/<site>_prepared/` with the same layout; Folsom 2014–2015 is used for training and 2016 for testing.
 
-**Other sites** (Poznan, Karpicko, …) must follow the same prepared layout (`images/`, `periods.pickle`, `train_periods.pickle`, `cleaned_irradiance.csv`) using your site-specific preprocessing. The DVC stages above are Folsom-only.
+| File | Role |
+|---|---|
+| `images/` | Sky images, named by UTC timestamp |
+| `cleaned_irradiance.csv` | Irradiance aligned with image names |
+| `train_periods.pickle`, `periods.pickle` | Training and test sample index (15-min horizon, 4 history samples at 5-min steps) |
+| `<site>_clear_sky.csv` | Clear-sky GHI, used for the clear-sky index, gating and Smart Persistence |
 
-Period geometry (fixed in `params.yaml`): **15 min** forecast horizon, **5 min** history step, **4** history samples.
-
-### Step 2 — Clear-sky reference (required for gating)
-
-Gated adaptation and CSI routing need `*_clear_sky.csv` per site (`cirr/physics/clear_sky.py` loads `*clear_sky.csv` from the dataset directory).
+## Quickstart
 
 ```bash
-bash scripts/bash_scripts/generate_clear_sky_all.sh
-```
-
-Or generate one site:
-
-```bash
-python scripts/clear_sky.py \
-  --latitude 52.42 --longitude 16.96 --timezone "Europe/Warsaw" \
-  --start "2024-01-01 00:00:00" --end "2024-12-31 23:59:00" \
-  --output-path data/poznan_prepared/poznan_clear_sky.csv
-```
-
-### Step 3 — Optional: SupCon encoder pretraining (WACV Phase 3)
-
-Physically-guided contrastive pretraining structures the vision encoder by CSI bin (`cirr/losses/supcon.py`). Trains on Folsom **training** split (years 1–2 after internal split):
-
-```bash
-python scripts/pretrain_supcon.py \
-  --data-root data/folsom_prepared \
-  --epochs 5 \
-  --batch-size 64 \
-  --output checkpoints/supcon_encoder.pt
-```
-
-Output: `checkpoints/supcon_encoder.pt`. Use it in forecaster training:
-
-```yaml
-# params.yaml
-train_forecaster:
-  model:
-    encoder_checkpoint: checkpoints/supcon_encoder.pt
-```
-
-When set, ImageNet init is skipped and the SupCon encoder is loaded before `train_forecaster.py` runs.
-
-### Step 4 — Train the Forecaster (WACV Phase 2)
-
-Hyperparameters live in `params.yaml` under `train_forecaster` (model, trainer, datamodule, callbacks). Training reads them via DVC params:
-
-```bash
+# 1. Train the forecaster on Folsom (hyperparameters in params.yaml)
 python scripts/dvc/train_forecaster.py --data-root data/folsom_prepared
+
+# 2. Static model and test-time adaptation at a target site
+python scripts/evaluate.py --checkpoint checkpoints/epoch_XXX.ckpt --dataset-path data/poznan_prepared
+python scripts/evaluate.py --checkpoint checkpoints/epoch_XXX.ckpt --dataset-path data/poznan_prepared --method memo
+
+# 3. Conditional online adaptation under 15-min lagged labels
+python scripts/related_works/evaluate_lagged_ogd.py --checkpoint checkpoints/epoch_XXX.ckpt --dataset-path data/poznan_prepared
+
+# 4. Federated learning across the three sites
+python scripts/fl_benchmark.py --checkpoint checkpoints/epoch_XXX.ckpt \
+  --dataset data/folsom_prepared --dataset data/karpicko_prepared --dataset data/poznan_prepared \
+  --algorithm fedproto --save-results results/fl/fedproto
 ```
 
-Checkpoints go to `checkpoints/epoch_XXX.ckpt` (best validation loss). Tune via `params.yaml`:
+Every script documents its options with `--help`.
 
-| Knob | Default | Notes |
-|------|---------|-------|
-| `model.model_name` | `timm-resnet50` | Vision backbone |
-| `model.loss_function` | `Berhu` | Regression loss |
-| `datamodule.optical_flow` | `none` | Set `farneback` for 5-channel RGB+flow |
-| `trainer.max_epochs` | `30` | Early stopping monitors `val_loss` |
-| `mlflow.enabled` | `false` | Set `true` to log metrics to local `mlruns/` |
+## Repository layout
 
-Enable MLflow in `params.yaml`:
-
-```yaml
-train_forecaster:
-  mlflow:
-    enabled: true
 ```
-
-View runs:
-
-```bash
-mlflow ui --backend-store-uri mlruns
+cirr/        installable package: data, models, physics, training, tta, continual, evaluation, fl
+scripts/     experiment CLIs; dvc/ data pipeline, related_works/ adaptation comparators,
+             skycam/ sky-camera data, bash_scripts/ batch wrappers
+notebooks/   figures and data exploration
+docs/        physics-informed input setup
 ```
-
-Then open http://127.0.0.1:5000. Optional knobs under `train_forecaster.mlflow`: `tracking_uri`, `experiment_name`, `run_name`.
-
-### Step 5 — Static baseline (WACV Phase 6.1)
-
-Verify the checkpoint before any adaptation:
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset-path data/folsom_prepared \
-  --num-days 30 \
-  --save-results
-```
-
-Smart-persistence lower bound (no model):
-
-```bash
-python scripts/smart_persistence_model.py \
-  --periods-path data/folsom_prepared/periods.pickle \
-  --clear-sky-path data/folsom_prepared/folsom_clear_sky.csv \
-  --num-days 30 \
-  --save-results
-```
-
-### Step 6 — Online adaptation eval (delayed ground truth)
-
-All scripts below assume **`horizon_steps=15`** (15-minute label delay) unless noted. They use `run_delayed_online_eval()` from `cirr/evaluation/online.py`.
-
-**Ungated OGD** (continuous adaptation baseline):
-
-```bash
-python scripts/evaluate_paper_lagged_ogd.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset-path data/folsom_prepared \
-  --horizon-steps 15 --save-results
-```
-
-**Gated adaptation** (WACV Phase 4 — CSI prototypes + dual threshold):
-
-```bash
-python scripts/evaluate_gated.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset-path data/folsom_prepared \
-  --fit-thresholds \
-  --horizon-steps 15 \
-  --save-results
-```
-
-Other methods: `evaluate_sliding_window.py`, `evaluate_sm_rls.py`, `evaluate_dual_phase.py`, TTA via `evaluate.py --method memo|note`.
-
-### Step 7 — Federated benchmark (WACV Phase 5)
-
-Multi-site FL with decoupled sync rounds (`scripts/fl_benchmark.py`):
-
-```bash
-python scripts/fl_benchmark.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset data/folsom_prepared \
-  --dataset data/karpicko_prepared \
-  --dataset data/poznan_prepared \
-  --algorithm fedavg \
-  --sync-interval 7 \
-  --num-days 90 \
-  --save-results results/fedavg_7day
-```
-
-Algorithms: `static`, `isolated`, `fedavg`, `fedbn`, `fedper`, `fedprox`, `ditto`, `fedema`, `fedproto`, `gated`.
-
-### Step 8 — Run the WACV baseline suite
-
-Orchestrates static, ungated OGD, gated, and optional FL runs ([WACV.md Phase 6.1](WACV.md)):
-
-```bash
-python scripts/run_baselines.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset-path data/poznan_prepared \
-  --baseline static \
-  --baseline ungated_ogd \
-  --baseline gated
-```
-
-Add `--dry-run` to print commands without executing.
-
-### Smoke test (no data download)
-
-With any `.ckpt` and a prepared dataset path:
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset-path data/poznan_prepared \
-  --num-days 3
-```
-
----
-
-## Usage reference
-
-Shared eval flags: `--device cuda`, `--start-day 0101`, `--num-days 30`, `--save-results`. Run `--help` on any script for full options.
-
-### Static eval and TTA
-
-```bash
-python scripts/evaluate.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared
-
-python scripts/evaluate.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --method memo --n-augmentations 4 --num-days 3
-```
-
-Dual-phase OGD+TTA: `scripts/evaluate_dual_phase.py`.
-
-### Online adaptation (delayed GT)
-
-These use `run_delayed_online_eval()` internally:
-
-```bash
-python scripts/evaluate_paper_lagged_ogd.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --horizon-steps 15 --t1 0.01 --t2 0.1
-
-python scripts/evaluate_sliding_window.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared
-
-python scripts/evaluate_sm_rls.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared
-
-python scripts/evaluate_gated.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --fit-thresholds
-```
-
-### Local and federated training
-
-```bash
-python scripts/local_training.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared
-
-python scripts/local_gated_training.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --gate-calibration-samples 300 \
-  --gate-horizon-steps 3
-
-python scripts/fl_benchmark.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --dataset data/folsom_prepared \
-  --dataset data/karpicko_prepared \
-  --dataset data/poznan_prepared \
-  --algorithm fedavg \
-  --sync-interval 7 \
-  --num-days 90 \
-  --save-results results/fedavg_7day
-```
-
-FL algorithms: `static`, `isolated`, `fedavg`, `fedbn`, `fedper`, `fedprox`, `ditto`, `fedema`, `fedproto`, `gated`.
-
-Run multiple baselines:
-
-```bash
-python scripts/run_baselines.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --baseline static --baseline ungated_ogd --baseline gated
-```
-
-### Edge latency benchmark
-
-```bash
-python scripts/edge_adaptation_benchmark.py \
-  --checkpoint checkpoints/epoch_024.ckpt \
-  --dataset-path data/poznan_prepared \
-  --methods baseline,memo,note,paper_ogd,sliding,sm_rls \
-  --num-samples 512
-```
-
-Use `--input-source random` to profile compute without dataset I/O.
-
-FL platform overhead (payload size, aggregation latency):
-
-```bash
-python scripts/fl_edge_overhead_benchmark.py \
-  --checkpoint checkpoints/epoch_007.ckpt \
-  --device-profile raspberry-pi
-```
-
----
-
-## Links
-
-- Repository: https://github.com/MatPiech/continual-solar-irradiance
-- Package: `cirr` (`pyproject.toml`)
