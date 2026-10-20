@@ -23,6 +23,7 @@ class ForecastingDataModule(LightningDataModule):
         workers: int,
         seed: int,
         optical_flow: str = "none",
+        physics: bool = False,
     ):
         super().__init__()
 
@@ -37,6 +38,7 @@ class ForecastingDataModule(LightningDataModule):
         self._workers = workers
         self._seed = seed
         self._optical_flow = optical_flow
+        self._physics = physics
         self._clear_sky_lookup = load_clear_sky_lookup(self._data_root)
 
         dataset_name_lower = self._dataset_name.lower()
@@ -51,6 +53,7 @@ class ForecastingDataModule(LightningDataModule):
                 "folsom, modena, poznan, karpicko, bern, alpnach, ne."
             )
 
+        self._crop_size = crop_size
         self._transforms = A.ReplayCompose(
             [
                 A.CenterCrop(height=crop_size, width=crop_size),
@@ -63,7 +66,9 @@ class ForecastingDataModule(LightningDataModule):
                 A.CenterCrop(height=crop_size, width=crop_size),
                 A.Resize(image_size[1], image_size[0]),
                 # geometry augmentations
-                A.Affine(rotate=(-10, 10), translate_percent=(-10, 10), scale=(0.9, 1.1)),
+                # translate_percent is a fraction of the image size: (-10, 10) shifted by up to 10x and
+                # blanked ~50 % of training frames.  IEP paper: up to 10 %.
+                A.Affine(rotate=(-10, 10), translate_percent=(-0.1, 0.1), scale=(0.9, 1.1)),
                 A.HorizontalFlip(),
                 A.VerticalFlip(),
             ]
@@ -107,6 +112,8 @@ class ForecastingDataModule(LightningDataModule):
             "image_std": self._image_std,
             "clear_sky_lookup": self._clear_sky_lookup,
             "optical_flow": self._optical_flow,
+            "physics": self._physics,
+            "crop_size": self._crop_size,
         }
 
         self._train_dataset = SkyImageDataset(

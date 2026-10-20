@@ -18,6 +18,7 @@ def load_dataset(
     workers: int = 0,
     seed: int = 42,
     optical_flow: str = "none",
+    physics: bool = False,
 ) -> Any:
     """Load a dataset split from a prepared directory."""
     if split == "test":
@@ -38,6 +39,7 @@ def load_dataset(
         workers=workers,
         seed=seed,
         optical_flow=optical_flow,
+        physics=physics,
     )
     dm.setup(None)
 

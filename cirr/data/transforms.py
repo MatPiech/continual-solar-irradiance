@@ -12,6 +12,7 @@ import torch
 
 RGB_CHANNELS = 3
 FLOW_CHANNELS = 2
+PHYSICS_CHANNELS = 4  # IEP: sun mask x irradiance, Norm B/R cloud, DIS flow (u, v)
 
 
 def normalize_optical_flow(value: str | bool | None) -> str:
@@ -27,7 +28,9 @@ def normalize_optical_flow(value: str | bool | None) -> str:
     raise ValueError(f"Unsupported optical_flow {value!r}. Use 'none' or 'farneback'.")
 
 
-def input_channels(*, optical_flow: str | bool | None = "none") -> int:
+def input_channels(*, optical_flow: str | bool | None = "none", physics: bool = False) -> int:
+    if physics:
+        return RGB_CHANNELS + PHYSICS_CHANNELS
     return RGB_CHANNELS + (FLOW_CHANNELS if normalize_optical_flow(optical_flow) != "none" else 0)
 
 
@@ -97,6 +100,7 @@ def early_fusion(
 def _demo() -> None:
     assert input_channels(optical_flow="none") == 3
     assert input_channels(optical_flow="farneback") == 5
+    assert input_channels(physics=True) == 7
     h, w = 32, 32
     fused = early_fusion(torch.randn(3, h, w), torch.randn(3, h, w), torch.randn(3, h, w))
     assert fused.shape == (5, h, w)

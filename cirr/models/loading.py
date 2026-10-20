@@ -35,6 +35,12 @@ def load_image_encoder_checkpoint(model: Forecaster, checkpoint_path: Path | str
     model.image_encoder.load_state_dict(state, strict=False)
 
 
+def checkpoint_physics(checkpoint_path: Path | str) -> bool:
+    """Whether *checkpoint_path* was trained on the IEP 7-channel input (datasets must match)."""
+    data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return bool(data.get("hyper_parameters", {}).get("physics", False))
+
+
 def load_forecaster_from_checkpoint(
     checkpoint_path: Path,
     device: str = "cpu",
@@ -71,6 +77,7 @@ def load_forecaster_from_checkpoint(
         loss_function=hp.get("loss_function", "MSE"),
         lr=hp.get("lr", 3e-4),
         lr_patience=hp.get("lr_patience", 5),
+        physics=hp.get("physics", False),
     ).to(device)
 
     model.load_state_dict(data["state_dict"], strict=False)
