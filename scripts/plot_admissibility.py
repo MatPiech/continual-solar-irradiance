@@ -11,7 +11,7 @@ dataviz palette validator: the site palette passes every check; in the five-slot
 signal / detector palette three slots are below 3:1 contrast, so every bar carries a
 direct value label, and the model-free detectors are hatched as a second encoding.
 
-    python scripts/plot_ch4_admissibility.py
+    python scripts/plot_admissibility.py
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def detection() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6), gridspec_kw={"width_ratios": [4, 3]})
     width = 0.84 / len(detectors)
     panels = [
-        ("flagged_pct", ["clean\n(false alarms)"] + faults, "frames flagged at the 1 % threshold (%)", 60),
+        ("flagged_pct", ["clean\n(false alarms)", *faults], "frames flagged at the 1 % threshold (%)", 60),
         ("auroc", faults, "AUROC, faulty vs clean frames", 1.08),
     ]
     for panel, (col, groups, ylabel, ymax) in zip(axes, panels, strict=True):
@@ -166,7 +166,7 @@ def detection_split() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6), gridspec_kw={"width_ratios": [6, 5]})
     width = 0.84 / len(keep)
     panels = [
-        ("flagged_pct", ["clean"] + faults, "frames flagged at the 1 % threshold (%)", 70),
+        ("flagged_pct", ["clean", *faults], "frames flagged at the 1 % threshold (%)", 70),
         ("auroc", faults, "AUROC, faulty vs clean frames", 1.08),
     ]
     for panel, (col, groups, ylabel, ymax) in zip(axes, panels, strict=True):

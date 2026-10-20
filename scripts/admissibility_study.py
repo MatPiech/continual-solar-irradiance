@@ -9,7 +9,7 @@ Subcommands, in the order the reproduction guide runs them
     crosssite    flag rate at the deployment sites under the Folsom-fitted gate
     adaptation   the policy on the corrupted stream, with and without the gate
 
-Each writes CSVs under tables/ that scripts/plot_ch4_admissibility.py turns
+Each writes CSVs under tables/ that scripts/plot_admissibility.py turns
 into figures; nothing is edited by hand.
 """
 
@@ -148,45 +148,47 @@ def reliability() -> None:
             ("kc_dev", "|1 - clear-sky index|"),
             ("combined", "score + history std"),
         ]:
-            sig.append(dict(site=site, signal=lab, spearman=float(spearmanr(x[k], x.err, nan_policy="omit").statistic)))
+            sig.append({"site": site, "signal": lab, "spearman": float(spearmanr(x[k], x.err, nan_policy="omit").statistic)})
         sig.append(
-            dict(
-                site=site,
-                signal="rank R^2: history + clear-sky index",
-                spearman=rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy()]),
-            )
+            {
+                "site": site,
+                "signal": "rank R^2: history + clear-sky index",
+                "spearman": rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy()]),
+            }
         )
         sig.append(
-            dict(
-                site=site,
-                signal="rank R^2: + anomaly score",
-                spearman=rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy(), x.score.to_numpy()]),
-            )
+            {
+                "site": site,
+                "signal": "rank R^2: + anomaly score",
+                "spearman": rank_r2(
+                    x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy(), x.score.to_numpy()]
+                ),
+            }
         )
         for k in ("score", "hist_std", "combined", "err"):
             for c, m in zip(COVERAGE, risk_coverage(x, k), strict=True):
-                curves.append(dict(site=site, signal=k, coverage=c, mae=m))
+                curves.append({"site": site, "signal": k, "coverage": c, "mae": m})
         for flag, g in x.groupby("flagged"):
             groups.append(
-                dict(
-                    site=site,
-                    group="flagged" if flag else "admitted",
-                    n=len(g),
-                    share_pct=100 * len(g) / len(x),
-                    model_mae=g.err.mean(),
-                    smart_persistence_mae=g.err_sp.mean(),
-                )
+                {
+                    "site": site,
+                    "group": "flagged" if flag else "admitted",
+                    "n": len(g),
+                    "share_pct": 100 * len(g) / len(x),
+                    "model_mae": g.err.mean(),
+                    "smart_persistence_mae": g.err_sp.mean(),
+                }
             )
         hybrid = np.where(x.flagged, x.err_sp, x.err).mean()
         groups.append(
-            dict(
-                site=site,
-                group="hybrid: Smart Persistence on flagged",
-                n=len(x),
-                share_pct=100.0,
-                model_mae=hybrid,
-                smart_persistence_mae=np.nan,
-            )
+            {
+                "site": site,
+                "group": "hybrid: Smart Persistence on flagged",
+                "n": len(x),
+                "share_pct": 100.0,
+                "model_mae": hybrid,
+                "smart_persistence_mae": np.nan,
+            }
         )
     pd.DataFrame(sig).to_csv(TABLES / "ch4_admissibility_signals.csv", index=False)
     pd.DataFrame(curves).to_csv(TABLES / "ch4_admissibility_risk_coverage.csv", index=False)
@@ -292,48 +294,48 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
         s = fn(x_probe)
         clean = s[kind == "clean"]
         rows.append(
-            dict(
-                detector=name,
-                fault="none (clean 2016)",
-                n=int(clean.size),
-                flagged_pct=100 * float((clean > thr).mean()),
-                auroc=np.nan,
-            )
+            {
+                "detector": name,
+                "fault": "none (clean 2016)",
+                "n": int(clean.size),
+                "flagged_pct": 100 * float((clean > thr).mean()),
+                "auroc": np.nan,
+            }
         )
         for k in PROBE_KINDS:
             f = s[kind == k]
             rows.append(
-                dict(
-                    detector=name,
-                    fault=k,
-                    n=int(f.size),
-                    flagged_pct=100 * float((f > thr).mean()),
-                    auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                )
+                {
+                    "detector": name,
+                    "fault": k,
+                    "n": int(f.size),
+                    "flagged_pct": 100 * float((f > thr).mean()),
+                    "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                }
             )
     for name, col in pixel.items():
         thr = float(np.percentile(px_cal[:, col], meta["percentile"]))
         sc = px_probe[:, col]
         clean = sc[kind == "clean"]
         rows.append(
-            dict(
-                detector=name,
-                fault="none (clean 2016)",
-                n=int(clean.size),
-                flagged_pct=100 * float((clean > thr).mean()),
-                auroc=np.nan,
-            )
+            {
+                "detector": name,
+                "fault": "none (clean 2016)",
+                "n": int(clean.size),
+                "flagged_pct": 100 * float((clean > thr).mean()),
+                "auroc": np.nan,
+            }
         )
         for k in PROBE_KINDS:
             f = sc[kind == k]
             rows.append(
-                dict(
-                    detector=name,
-                    fault=k,
-                    n=int(f.size),
-                    flagged_pct=100 * float((f > thr).mean()),
-                    auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                )
+                {
+                    "detector": name,
+                    "fault": k,
+                    "n": int(f.size),
+                    "flagged_pct": 100 * float((f > thr).mean()),
+                    "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                }
             )
     local = GATE / "local" / "local_gate.npz"
     if local.exists():  # the pre-registered maintenance detector (§5) and its spatial split (§6)
@@ -349,24 +351,24 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
             ls = s[split]
             clean = ls[kind == "clean"]
             rows.append(
-                dict(
-                    detector=name,
-                    fault="none (clean 2016)",
-                    n=int(clean.size),
-                    flagged_pct=100 * float((clean > thr).mean()),
-                    auroc=np.nan,
-                )
+                {
+                    "detector": name,
+                    "fault": "none (clean 2016)",
+                    "n": int(clean.size),
+                    "flagged_pct": 100 * float((clean > thr).mean()),
+                    "auroc": np.nan,
+                }
             )
             for k in PROBE_KINDS:
                 f = ls[kind == k]
                 rows.append(
-                    dict(
-                        detector=name,
-                        fault=k,
-                        n=int(f.size),
-                        flagged_pct=100 * float((f > thr).mean()),
-                        auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                    )
+                    {
+                        "detector": name,
+                        "fault": k,
+                        "n": int(f.size),
+                        "flagged_pct": 100 * float((f > thr).mean()),
+                        "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                    }
                 )
         mon = GATE / "monitor" / "monitor.json"
         if mon.exists():  # §7: global median, core max, and the exclusion flag they make
@@ -383,24 +385,24 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
             for name, (score, flag) in flags.items():
                 clean = score[kind == "clean"]
                 rows.append(
-                    dict(
-                        detector=name,
-                        fault="none (clean 2016)",
-                        n=int(clean.size),
-                        flagged_pct=100 * float(flag[kind == "clean"].mean()),
-                        auroc=np.nan,
-                    )
+                    {
+                        "detector": name,
+                        "fault": "none (clean 2016)",
+                        "n": int(clean.size),
+                        "flagged_pct": 100 * float(flag[kind == "clean"].mean()),
+                        "auroc": np.nan,
+                    }
                 )
                 for k in PROBE_KINDS:
                     f = score[kind == k]
                     rows.append(
-                        dict(
-                            detector=name,
-                            fault=k,
-                            n=int(f.size),
-                            flagged_pct=100 * float(flag[kind == k].mean()),
-                            auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                        )
+                        {
+                            "detector": name,
+                            "fault": k,
+                            "n": int(f.size),
+                            "flagged_pct": 100 * float(flag[kind == k].mean()),
+                            "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                        }
                     )
     out = pd.DataFrame(rows)
     out.to_csv(TABLES / "ch4_admissibility_detection.csv", index=False)
@@ -440,17 +442,17 @@ def crosssite() -> None:
         d["site"] = site
         daily.append(d)
         rows.append(
-            dict(
-                site=site,
-                frames=len(sc),
-                flag_rate_pct=100 * sc.flagged.mean(),
-                median_score=sc.score.median(),
-                spearman_daily_flag_vs_static_mae=float(spearmanr(d.flag_pct, d.static_mae).statistic),
-                spearman_daily_flag_vs_adaptation_gain=float(spearmanr(d.flag_pct, d.adaptation_gain).statistic),
-            )
+            {
+                "site": site,
+                "frames": len(sc),
+                "flag_rate_pct": 100 * sc.flagged.mean(),
+                "median_score": sc.score.median(),
+                "spearman_daily_flag_vs_static_mae": float(spearmanr(d.flag_pct, d.static_mae).statistic),
+                "spearman_daily_flag_vs_adaptation_gain": float(spearmanr(d.flag_pct, d.adaptation_gain).statistic),
+            }
         )
         for m, g in sc.groupby("month"):
-            monthly.append(dict(site=site, month=m, flag_rate_pct=100 * g.flagged.mean()))
+            monthly.append({"site": site, "month": m, "flag_rate_pct": 100 * g.flagged.mean()})
     pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_crosssite.csv", index=False)
     pd.DataFrame(monthly).to_csv(TABLES / "ch4_admissibility_crosssite_monthly.csv", index=False)
     if daily:
@@ -508,31 +510,31 @@ def adaptation() -> None:
             clean = p[p.fault == "none"]
             table[arm] = clean
             rows.append(
-                dict(
-                    policy=policy,
-                    arm=arm,
-                    mae_all=W * (p.prediction - p.target).abs().mean(),
-                    mae_clean_frames=W * (clean.prediction - clean.target).abs().mean(),
-                    mae_faulty_frames=W * (p[p.fault != "none"].prediction - p[p.fault != "none"].target).abs().mean(),
-                    updates=len(upd),
-                    updates_on_faulty_frames=int((upd.fault != "none").sum()),
-                    gated=int(p.get("gated", pd.Series(False, index=p.index)).sum()),
-                )
+                {
+                    "policy": policy,
+                    "arm": arm,
+                    "mae_all": W * (p.prediction - p.target).abs().mean(),
+                    "mae_clean_frames": W * (clean.prediction - clean.target).abs().mean(),
+                    "mae_faulty_frames": W * (p[p.fault != "none"].prediction - p[p.fault != "none"].target).abs().mean(),
+                    "updates": len(upd),
+                    "updates_on_faulty_frames": int((upd.fault != "none").sum()),
+                    "gated": int(p.get("gated", pd.Series(False, index=p.index)).sum()),
+                }
             )
         # the effect that matters: did learning from faulty frames damage forecasts on clean frames?
         for a, b in [("corrupted, no gate", "clean stream"), ("corrupted, gated", "corrupted, no gate")]:
             c = contrast(_daily_on(table[a]), _daily_on(table[b]), tag=f"adm-{policy}-{a}-{b}")
             contrasts.append(
-                dict(
-                    policy=policy,
-                    comparison=f"{a} vs {b}",
-                    frames="clean frames only",
-                    rel_mae_pct=c["rel"],
-                    ci90_lo=c["rel_lo"],
-                    ci90_hi=c["rel_hi"],
-                    dfs=c["dfs"],
-                    p=c["p"],
-                )
+                {
+                    "policy": policy,
+                    "comparison": f"{a} vs {b}",
+                    "frames": "clean frames only",
+                    "rel_mae_pct": c["rel"],
+                    "ci90_lo": c["rel_lo"],
+                    "ci90_hi": c["rel_hi"],
+                    "dfs": c["dfs"],
+                    "p": c["p"],
+                }
             )
     pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_adaptation.csv", index=False)
     pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_adaptation_contrasts.csv", index=False)
@@ -551,7 +553,7 @@ def _maintenance_for(split: str, cor: pd.DataFrame, cln: pd.DataFrame, det: pd.D
     """Rates, episodes, clean-stream summary, top frames and (where an alert exists) the verdict, for one split."""
     sc, ce, fl, al = _split_columns(split)
     sfx = "" if split == "all" else f"_{split}"
-    agg = dict(frames=("timestamp", "size"), flagged_pct=(fl, "mean"))
+    agg = {"frames": ("timestamp", "size"), "flagged_pct": (fl, "mean")}
     if al:
         agg["alert_pct"] = (al, "mean")
     rates = cor.groupby("kind").agg(**agg)
@@ -563,14 +565,14 @@ def _maintenance_for(split: str, cor: pd.DataFrame, cln: pd.DataFrame, det: pd.D
     eps = []
     for (kind, ep), g in cor[cor.kind != "none"].groupby(["kind", "episode"]):
         g = g.sort_values("t")
-        row = dict(
-            kind=kind,
-            episode=int(ep),
-            start=g.timestamp.iloc[0],
-            frames=len(g),
-            hours=(g.t.iloc[-1] - g.t.iloc[0]).total_seconds() / 3600,
-            frames_flagged_pct=100 * g[fl].mean(),
-        )
+        row = {
+            "kind": kind,
+            "episode": int(ep),
+            "start": g.timestamp.iloc[0],
+            "frames": len(g),
+            "hours": (g.t.iloc[-1] - g.t.iloc[0]).total_seconds() / 3600,
+            "frames_flagged_pct": 100 * g[fl].mean(),
+        }
         if al:
             hit = g[g[al]]
             row.update(
@@ -583,13 +585,13 @@ def _maintenance_for(split: str, cor: pd.DataFrame, cln: pd.DataFrame, det: pd.D
     eps.to_csv(TABLES / f"ch4_admissibility_maintenance_episodes{sfx}.csv", index=False)
 
     # the clean stream: how often would the operator be called out for nothing?
-    clean_summary = dict(
-        split=split,
-        frames=len(cln),
-        flagged_pct=100 * cln[fl].mean(),
-        spearman_local_vs_error=float(spearmanr(x[sc], x.err).statistic),
-        spearman_iforest_vs_error=float(spearmanr(x.if_score, x.err).statistic),
-    )
+    clean_summary = {
+        "split": split,
+        "frames": len(cln),
+        "flagged_pct": 100 * cln[fl].mean(),
+        "spearman_local_vs_error": float(spearmanr(x[sc], x.err).statistic),
+        "spearman_iforest_vs_error": float(spearmanr(x.if_score, x.err).statistic),
+    }
     if al:
         alert_days = cln.groupby("day")[al].any()
         clean_summary.update(alert_pct=100 * cln[al].mean(), days=int(alert_days.size), days_with_alert=int(alert_days.sum()))
@@ -611,18 +613,18 @@ def _maintenance_for(split: str, cor: pd.DataFrame, cln: pd.DataFrame, det: pd.D
     fault_free_alert = float(rates.set_index("kind").loc["none", "alert_pct"])
     c1 = all(loc[k] >= 50 and loc[k] > dark[k] for k in ("soiling", "occlusion"))
     c2 = bool((soil.first_alert_delay_min <= 120).all()) and fault_free_alert <= 1.0
-    verdict = dict(
-        split=split,
-        criterion_1_frame_level="PASS" if c1 else "FAIL",
-        soiling_flagged_pct=float(loc["soiling"]),
-        occlusion_flagged_pct=float(loc["occlusion"]),
-        dark_pixel_soiling_pct=float(dark["soiling"]),
-        dark_pixel_occlusion_pct=float(dark["occlusion"]),
-        criterion_2_maintenance="PASS" if c2 else "FAIL",
-        soiling_episodes_alerted_within_2h=int((soil.first_alert_delay_min <= 120).sum()),
-        soiling_episodes=len(soil),
-        fault_free_alert_pct=fault_free_alert,
-    )
+    verdict = {
+        "split": split,
+        "criterion_1_frame_level": "PASS" if c1 else "FAIL",
+        "soiling_flagged_pct": float(loc["soiling"]),
+        "occlusion_flagged_pct": float(loc["occlusion"]),
+        "dark_pixel_soiling_pct": float(dark["soiling"]),
+        "dark_pixel_occlusion_pct": float(dark["occlusion"]),
+        "criterion_2_maintenance": "PASS" if c2 else "FAIL",
+        "soiling_episodes_alerted_within_2h": int((soil.first_alert_delay_min <= 120).sum()),
+        "soiling_episodes": len(soil),
+        "fault_free_alert_pct": fault_free_alert,
+    }
     for k in EDGE_KINDS:  # the price of the split, reported beside the verdict
         if k in loc:
             verdict[f"{k}_flagged_pct"] = float(loc[k])
@@ -675,7 +677,7 @@ def geometry() -> None:
     hour = cln.timestamp.str[9:11].astype(int)
 
     rows, summary = [], {}
-    base = dict(frames=len(cln), low_sun_pct=100 * float((elevation < 20).mean()))
+    base = {"frames": len(cln), "low_sun_pct": 100 * float((elevation < 20).mean())}
     for split in LocalGate.SPLITS:
         sc, ce, fl, _ = _split_columns(split)
         if fl not in cln:
@@ -686,27 +688,27 @@ def geometry() -> None:
         el = elevation[f.index]
         rows.append(
             pd.DataFrame(
-                dict(
-                    split=split,
-                    timestamp=f.timestamp.to_numpy(),
-                    score=f[sc].to_numpy(),
-                    cell=f[ce].to_numpy(),
-                    on_edge=gate.edge.numpy()[f[ce].to_numpy()],
-                    hour=hour[f.index].to_numpy(),
-                    elevation_deg=el,
-                    sun_distance_cells=dist,
-                )
+                {
+                    "split": split,
+                    "timestamp": f.timestamp.to_numpy(),
+                    "score": f[sc].to_numpy(),
+                    "cell": f[ce].to_numpy(),
+                    "on_edge": gate.edge.numpy()[f[ce].to_numpy()],
+                    "hour": hour[f.index].to_numpy(),
+                    "elevation_deg": el,
+                    "sun_distance_cells": dist,
+                }
             )
         )
         low, near = el < 20, dist <= 2
-        summary[split] = dict(
-            flags=int(len(f)),
-            on_edge_pct=100 * float(gate.edge.numpy()[f[ce].to_numpy()].mean()),
-            median_elevation_deg=float(np.median(el)),
-            low_sun_pct=100 * float(low.mean()),
-            near_sun_pct=100 * float(np.nan_to_num(near, nan=False).mean()),
-            illumination_pct=100 * float((low | np.nan_to_num(near, nan=False)).mean()),
-        )
+        summary[split] = {
+            "flags": int(len(f)),
+            "on_edge_pct": 100 * float(gate.edge.numpy()[f[ce].to_numpy()].mean()),
+            "median_elevation_deg": float(np.median(el)),
+            "low_sun_pct": 100 * float(low.mean()),
+            "near_sun_pct": 100 * float(np.nan_to_num(near, nan=False).mean()),
+            "illumination_pct": 100 * float((low | np.nan_to_num(near, nan=False)).mean()),
+        }
     out = pd.concat(rows, ignore_index=True)
     out.to_csv(TABLES / "ch4_admissibility_geometry.csv", index=False)
     summary["all_frames"] = base
@@ -744,17 +746,17 @@ def monitor() -> None:
         before = day[(day.t < onset) & (day.t >= onset - pd.Timedelta(minutes=30))]
         hit = g[g.maint_alert]
         eps.append(
-            dict(
-                kind=kind,
-                episode=int(ep),
-                start=g.timestamp.iloc[0],
-                frames=len(g),
-                minutes=(g.t.iloc[-1] - onset).total_seconds() / 60 + 1,
-                excluded_pct=100 * g.excluded.mean(),
-                alert_already_on=bool(before.maint_alert.any()),
-                alerted=bool(len(hit)),
-                first_alert_delay_min=(hit.t.iloc[0] - onset).total_seconds() / 60 if len(hit) else np.nan,
-            )
+            {
+                "kind": kind,
+                "episode": int(ep),
+                "start": g.timestamp.iloc[0],
+                "frames": len(g),
+                "minutes": (g.t.iloc[-1] - onset).total_seconds() / 60 + 1,
+                "excluded_pct": 100 * g.excluded.mean(),
+                "alert_already_on": bool(before.maint_alert.any()),
+                "alerted": bool(len(hit)),
+                "first_alert_delay_min": (hit.t.iloc[0] - onset).total_seconds() / 60 if len(hit) else np.nan,
+            }
         )
     eps = pd.DataFrame(eps)
     eps.to_csv(TABLES / "ch4_admissibility_monitor_episodes.csv", index=False)
@@ -773,28 +775,28 @@ def monitor() -> None:
     short = eps[eps.kind.isin(SHORT_TERM)]
     short_alerted = 100 * float(short.alerted.mean())
     c2 = all(detected.values()) and fault_free <= 1.0 and short_alerted <= 10.0
-    verdict = dict(
-        criterion_1_exclusion="PASS" if c1 else "FAIL",
-        excluded_banding_pct=float(ex["banding"]),
-        excluded_occlusion_pct=float(ex["occlusion"]),
-        excluded_insect_pct=float(ex["insect"]),
-        excluded_clean_pct=float(ex["none (clean 2016)"]),
-        criterion_2_maintenance="PASS" if c2 else "FAIL",
-        wet_dome_episodes_detected=int(
+    verdict = {
+        "criterion_1_exclusion": "PASS" if c1 else "FAIL",
+        "excluded_banding_pct": float(ex["banding"]),
+        "excluded_occlusion_pct": float(ex["occlusion"]),
+        "excluded_insect_pct": float(ex["insect"]),
+        "excluded_clean_pct": float(ex["none (clean 2016)"]),
+        "criterion_2_maintenance": "PASS" if c2 else "FAIL",
+        "wet_dome_episodes_detected": int(
             ((eps.kind == "wet_dome") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 90)).sum()
         ),
-        wet_dome_episodes=int((eps.kind == "wet_dome").sum()),
-        soiling_episodes_detected=int(
+        "wet_dome_episodes": int((eps.kind == "wet_dome").sum()),
+        "soiling_episodes_detected": int(
             ((eps.kind == "soiling") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 120)).sum()
         ),
-        soiling_episodes=int((eps.kind == "soiling").sum()),
-        maint_alert_fault_free_pct=fault_free,
-        short_term_episodes_with_alert_pct=short_alerted,
-        clean_stream_exclusion_pct=float(100 * cln.excluded.mean()),
-        clean_stream_maint_alert_pct=float(100 * cln.maint_alert.mean()),
-        clean_days_with_maint_alert=int(cln.groupby("day").maint_alert.any().sum()),
-        thresholds=meta["thresholds"],
-    )
+        "soiling_episodes": int((eps.kind == "soiling").sum()),
+        "maint_alert_fault_free_pct": fault_free,
+        "short_term_episodes_with_alert_pct": short_alerted,
+        "clean_stream_exclusion_pct": float(100 * cln.excluded.mean()),
+        "clean_stream_maint_alert_pct": float(100 * cln.maint_alert.mean()),
+        "clean_days_with_maint_alert": int(cln.groupby("day").maint_alert.any().sum()),
+        "thresholds": meta["thresholds"],
+    }
     (TABLES / "ch4_admissibility_monitor_verdict.json").write_text(json.dumps(verdict, indent=2))
 
     for col, name in (("global", "global"), ("core", "core"), ("maint_stat", "maint")):
@@ -829,14 +831,14 @@ def monitor() -> None:
         upd = p[p.adapted == True]  # noqa: E712 -- pandas column
         table[arm] = p[p.fault == "none"]
         rows.append(
-            dict(
-                arm=arm,
-                mae_all=W * (p.prediction - p.target).abs().mean(),
-                mae_fault_free_frames=W * (table[arm].prediction - table[arm].target).abs().mean(),
-                updates=len(upd),
-                updates_on_faulty_frames=int((upd.fault != "none").sum()),
-                withheld=int(p.get("gated", pd.Series(False, index=p.index)).sum()),
-            )
+            {
+                "arm": arm,
+                "mae_all": W * (p.prediction - p.target).abs().mean(),
+                "mae_fault_free_frames": W * (table[arm].prediction - table[arm].target).abs().mean(),
+                "updates": len(upd),
+                "updates_on_faulty_frames": int((upd.fault != "none").sum()),
+                "withheld": int(p.get("gated", pd.Series(False, index=p.index)).sum()),
+            }
         )
     for a, b in [
         ("clean stream, exclusion", "clean stream, no exclusion"),
@@ -897,25 +899,25 @@ def dose() -> None:
         if missing:
             print(f"{stream}: runs missing {missing}, skipped")
             continue
-        P = {arm: load(r, sched) for arm, r in runs.items()}
-        C = {arm: load(r, sched) for arm, r in clean_runs.items() if (r / "predictions.csv").exists()}
-        for arm, p in P.items():
+        preds = {arm: load(r, sched) for arm, r in runs.items()}
+        clean_preds = {arm: load(r, sched) for arm, r in clean_runs.items() if (r / "predictions.csv").exists()}
+        for arm, p in preds.items():
             ff, fa = p[p.fault == "none"], p[p.fault != "none"]
             upd = p[p.adapted == True]  # noqa: E712 -- pandas column
             rows.append(
-                dict(
-                    stream=stream,
-                    arm=arm,
-                    faulty_pct=100 * len(fa) / len(p),
-                    mae_fault_free=_mae(ff),
-                    fs_fault_free=_fs(ff),
-                    mae_faulty=_mae(fa),
-                    fs_faulty=_fs(fa),
-                    withheld=int(p.gated_frame.sum()),
-                    withheld_faulty_pct=100 * float(p.gated_frame[p.fault != "none"].mean()) if len(fa) else np.nan,
-                    updates=len(upd),
-                    updates_on_faulty=int((upd.fault != "none").sum()),
-                )
+                {
+                    "stream": stream,
+                    "arm": arm,
+                    "faulty_pct": 100 * len(fa) / len(p),
+                    "mae_fault_free": _mae(ff),
+                    "fs_fault_free": _fs(ff),
+                    "mae_faulty": _mae(fa),
+                    "fs_faulty": _fs(fa),
+                    "withheld": int(p.gated_frame.sum()),
+                    "withheld_faulty_pct": 100 * float(p.gated_frame[p.fault != "none"].mean()) if len(fa) else np.nan,
+                    "updates": len(upd),
+                    "updates_on_faulty": int((upd.fault != "none").sum()),
+                }
             )
         pairs = [
             ("ungated", "static", "faulty"),
@@ -924,7 +926,7 @@ def dose() -> None:
             ("gated", "ungated", "fault-free"),
         ]
         for a, b, frames_ in pairs:
-            pa, pb = P[a], P[b]
+            pa, pb = preds[a], preds[b]
             m = (pa.fault != "none") if frames_ == "faulty" else (pa.fault == "none")
             mb = (pb.fault != "none") if frames_ == "faulty" else (pb.fault == "none")
             c = contrast(_daily_on(pa[m]), _daily_on(pb[mb]), tag=f"dose-{stream}-{a}-{b}-{frames_}")
@@ -937,8 +939,8 @@ def dose() -> None:
                     **{k: c[k] for k in ("dfs", "dfs_lo", "dfs_hi", "rel", "rel_lo", "rel_hi", "p", "n_days")},
                 )
             )
-        if "ungated" in C:  # contamination: ungated on this stream vs the clean-stream damped run, same frames
-            pa, pb = P["ungated"], C["ungated"]
+        if "ungated" in clean_preds:  # contamination: ungated on this stream vs the clean-stream damped run, same frames
+            pa, pb = preds["ungated"], clean_preds["ungated"]
             c = contrast(
                 _daily_on(pa[pa.fault == "none"]), _daily_on(pb[pb.fault == "none"]), tag=f"dose-{stream}-contamination"
             )
@@ -969,15 +971,15 @@ def dose() -> None:
             )
             for ph, g in sc.groupby(phase):
                 alerts.append(
-                    dict(
-                        stream=stream,
-                        phase=ph,
-                        frames=len(g),
-                        excluded_pct=100 * g.excluded.mean(),
-                        maint_alert_pct=100 * g.maint_alert.mean(),
-                    )
+                    {
+                        "stream": stream,
+                        "phase": ph,
+                        "frames": len(g),
+                        "excluded_pct": 100 * g.excluded.mean(),
+                        "maint_alert_pct": 100 * g.maint_alert.mean(),
+                    }
                 )
-            for arm, p in P.items():
+            for arm, p in preds.items():
                 fa = p[p.fault != "none"].copy()
                 if fa.empty:
                     continue
@@ -985,35 +987,35 @@ def dose() -> None:
                 fa["week"] = fa.date.dt.isocalendar().week.astype(int)
                 for wk, g in fa.groupby("week"):
                     weekly.append(
-                        dict(
-                            stream=stream,
-                            arm=arm,
-                            week=wk,
-                            frames=len(g),
-                            mae_faulty=_mae(g),
-                            fs_faulty=_fs(g),
-                            withheld_pct=100 * float(g.gated_frame.mean()),
-                        )
+                        {
+                            "stream": stream,
+                            "arm": arm,
+                            "week": wk,
+                            "frames": len(g),
+                            "mae_faulty": _mae(g),
+                            "fs_faulty": _fs(g),
+                            "withheld_pct": 100 * float(g.gated_frame.mean()),
+                        }
                     )
                 # first vs last two weeks of the fault, and the clean-stream run on the same dates
                 days = sorted(fa.timestamp.str[:8].unique())
                 first, last = fa[fa.timestamp.str[:8].isin(days[:14])], fa[fa.timestamp.str[:8].isin(days[-14:])]
-                cl = C.get(arm)
+                cl = clean_preds.get(arm)
                 ref_first = ref_last = np.nan
                 if cl is not None:
                     ref_first = _mae(cl[cl.timestamp.str[:8].isin(days[:14])])
                     ref_last = _mae(cl[cl.timestamp.str[:8].isin(days[-14:])])
                 phases.append(
-                    dict(
-                        stream=stream,
-                        arm=arm,
-                        mae_first_2wk=_mae(first),
-                        mae_last_2wk=_mae(last),
-                        clean_ref_first_2wk=ref_first,
-                        clean_ref_last_2wk=ref_last,
-                        withheld_first_2wk_pct=100 * float(first.gated_frame.mean()),
-                        withheld_last_2wk_pct=100 * float(last.gated_frame.mean()),
-                    )
+                    {
+                        "stream": stream,
+                        "arm": arm,
+                        "mae_first_2wk": _mae(first),
+                        "mae_last_2wk": _mae(last),
+                        "clean_ref_first_2wk": ref_first,
+                        "clean_ref_last_2wk": ref_last,
+                        "withheld_first_2wk_pct": 100 * float(first.gated_frame.mean()),
+                        "withheld_last_2wk_pct": 100 * float(last.gated_frame.mean()),
+                    }
                 )
 
     pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_dose.csv", index=False)

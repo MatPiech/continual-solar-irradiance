@@ -36,21 +36,18 @@ def main(stream_path: Path, out_dir: Path, only: tuple[str, ...]) -> None:
     for name, (mode, arg) in STREAMS.items():
         if only and name not in only:
             continue
-        if mode == "dose":
-            sched = build_dose_schedule(ts, arg, seed=int(round(arg)))
-        else:
-            sched = build_continuous_schedule(ts, *arg)
+        sched = build_dose_schedule(ts, arg, seed=int(round(arg))) if mode == "dose" else build_continuous_schedule(ts, *arg)
         d = out_dir / name
         d.mkdir(parents=True, exist_ok=True)
         sched.to_csv(d / "schedule.csv", index=False)
-        stats = dict(
-            stream=name,
-            frames=len(ts),
-            faulty=int(len(sched)),
-            faulty_pct=100 * len(sched) / len(ts),
-            by_kind={k: dict(frames=int(len(g)), episodes=int(g.episode.nunique())) for k, g in sched.groupby("kind")},
-            sha256=hashlib.sha256((d / "schedule.csv").read_bytes()).hexdigest(),
-        )
+        stats = {
+            "stream": name,
+            "frames": len(ts),
+            "faulty": int(len(sched)),
+            "faulty_pct": 100 * len(sched) / len(ts),
+            "by_kind": {k: {"frames": int(len(g)), "episodes": int(g.episode.nunique())} for k, g in sched.groupby("kind")},
+            "sha256": hashlib.sha256((d / "schedule.csv").read_bytes()).hexdigest(),
+        }
         (d / "stats.json").write_text(json.dumps(stats, indent=2))
         print(json.dumps(stats))
 

@@ -67,14 +67,14 @@ def write_gate(out: Path, table: pd.DataFrame, thr: dict[str, float]) -> None:
     )
     (out / "gate.json").write_text(
         json.dumps(
-            dict(
-                threshold=1.0,
-                percentile=EXCLUDE_PCT,
-                score="max(G / t_G, C / t_C), docs/CH4_ADMISSIBILITY.md §7",
-                t_global=thr["global"],
-                t_core=thr["core"],
-                flag_rate_pct=float(100 * (score > 1.0).mean()),
-            ),
+            {
+                "threshold": 1.0,
+                "percentile": EXCLUDE_PCT,
+                "score": "max(G / t_G, C / t_C), docs/CH4_ADMISSIBILITY.md §7",
+                "t_global": thr["global"],
+                "t_core": thr["core"],
+                "flag_rate_pct": float(100 * (score > 1.0).mean()),
+            },
             indent=2,
         )
     )
@@ -139,17 +139,17 @@ def main(
     data = load_campaign_days(stream, min_ghi_clear=0.001)
     idx = [i for d in data.days for i in data.day_map[d]]
     ts = pd.Series([stamp(data.dataset.periods[i]) for i in idx])
-    meta = dict(
-        design="docs/CH4_ADMISSIBILITY.md §7" if schedule is None else "docs/CH4_ADMISSIBILITY.md §8",
-        thresholds=thr,
-        thresholds_from=str(thresholds) if thresholds else "calibrated here",
-        exclude_percentile=EXCLUDE_PCT,
-        alert_percentile=ALERT_PCT,
-        window_minutes=WINDOW_MIN,
-        core_cells=int(gate.core.sum()),
-        calibration_exclusion_rate_pct=cal_excl,
-        git_commit=git_commit(),
-    )
+    meta = {
+        "design": "docs/CH4_ADMISSIBILITY.md §7" if schedule is None else "docs/CH4_ADMISSIBILITY.md §8",
+        "thresholds": thr,
+        "thresholds_from": str(thresholds) if thresholds else "calibrated here",
+        "exclude_percentile": EXCLUDE_PCT,
+        "alert_percentile": ALERT_PCT,
+        "window_minutes": WINDOW_MIN,
+        "core_cells": int(gate.core.sum()),
+        "calibration_exclusion_rate_pct": cal_excl,
+        "git_commit": git_commit(),
+    }
 
     if clean:  # clean 2016 stream from the saved per-cell matrix
         z_clean = np.load(gate_dir / "cells_clean.npy")

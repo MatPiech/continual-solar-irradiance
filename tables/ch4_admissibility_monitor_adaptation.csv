@@ -1,5 +1,0 @@
-arm,mae_all,mae_fault_free_frames,updates,updates_on_faulty_frames,withheld
-"clean stream, no exclusion",31.158624334579123,31.158624334579123,103435,0,0
-"clean stream, exclusion",31.13121457398373,31.13121457398373,100791,0,2942
-"corrupted, no exclusion",31.31341530623194,31.374091972824953,105116,4423,0
-"corrupted, exclusion",31.269438635137607,31.31673684829086,100901,2938,5671
