@@ -58,15 +58,20 @@ def select_days(dataset: Path, days: int) -> list[str]:
     from cirr.utils.dataset_utils import group_indices_by_day
 
     ds = load_dataset(dataset, split="test")
-    day_map, _ = filter_lit_days(group_indices_by_day(ds.periods), ds.periods, load_clear_sky_lookup(dataset), DEFAULT_MIN_GHI_CLEAR)
+    day_map, _ = filter_lit_days(
+        group_indices_by_day(ds.periods), ds.periods, load_clear_sky_lookup(dataset), DEFAULT_MIN_GHI_CLEAR
+    )
     avail = sorted(day_map)
     stride = max(1, len(avail) // (days + 1))
     return avail[::stride][: days + 1]
 
 
-def run_arm(arm: str, dataset: str, checkpoint: str, days: list[str], device: str, threads: int | None,
-            idle_w: float, quiet: bool) -> dict:
+def run_arm(
+    arm: str, dataset: str, checkpoint: str, days: list[str], device: str, threads: int | None, idle_w: float, quiet: bool
+) -> dict:
     """One arm in a fresh process: per-day, per-phase time and energy, and peak memory."""
+    from edge_power import PowerSampler
+
     from cirr.data.loading import load_dataset
     from cirr.fl.kc_prototypes import aggregate_global_prototypes, default_edges, extract_day_prototypes, make_regime_labeller
     from cirr.models.loading import load_forecaster_from_checkpoint
@@ -74,31 +79,32 @@ def run_arm(arm: str, dataset: str, checkpoint: str, days: list[str], device: st
     from cirr.training.day_loop import predict_day, train_day
     from cirr.training.replay import RecentBuffer
     from cirr.utils.dataset_utils import group_indices_by_day
-    from edge_power import PowerSampler
 
     if threads:
         torch.set_num_threads(threads)
     cuda = device == "cuda"
     ds = load_dataset(Path(dataset), split="test")
-    day_map, _ = filter_lit_days(group_indices_by_day(ds.periods), ds.periods, load_clear_sky_lookup(Path(dataset)), DEFAULT_MIN_GHI_CLEAR)
+    day_map, _ = filter_lit_days(
+        group_indices_by_day(ds.periods), ds.periods, load_clear_sky_lookup(Path(dataset)), DEFAULT_MIN_GHI_CLEAR
+    )
     model = load_forecaster_from_checkpoint(Path(checkpoint), device=device, use_hparams=True)
     labeller = make_regime_labeller("clear_sky", default_edges("clear_sky"), DEFAULT_MIN_GHI_CLEAR, 4)
     recent = RecentBuffer(1000)
-    returned: dict | None = None     # prototypes returned by the server, used as alignment targets
+    returned: dict | None = None  # prototypes returned by the server, used as alignment targets
     accum: dict[int, tuple[torch.Tensor, int]] = {}
-    sink = open(os.devnull, "w")
     rows = []
 
-    with PowerSampler() as ps:
-        def phase(row: dict, name: str, fn):
+    with PowerSampler() as ps, Path(os.devnull).open("w") as sink:
+
+        def phase(row: dict, name: str, fn, *args, **kwargs):
             if cuda:
                 torch.cuda.synchronize()
             t0, a = ps.now(), perf_counter()
             if quiet:
                 with redirect_stdout(sink):
-                    out = fn()
+                    out = fn(*args, **kwargs)
             else:
-                out = fn()
+                out = fn(*args, **kwargs)
             if cuda:
                 torch.cuda.synchronize()
             t1, dt = ps.now(), perf_counter() - a
@@ -109,20 +115,38 @@ def run_arm(arm: str, dataset: str, checkpoint: str, days: list[str], device: st
         for pos, day in enumerate(days):
             idx = day_map[day]
             row = {"day": day, "n_samples": len(idx)}
-            preds = phase(row, "predict", lambda: predict_day(model, ds, idx, device, 32, day))
+            preds = phase(row, "predict", predict_day, model, ds, idx, device, 32, day)
             day_samples = preds[2]
             n_rep = int(round(len(idx) * 0.5))
             replay = recent.sample(n_rep, seed=pos + 1) or None
             align = arm == "prototypes" and returned is not None
-            phase(row, "train", lambda: train_day(
-                model, ds, idx, lr=1e-5, weight_decay=1e-4, max_grad_norm=1.0, batch_size=32, epochs=1, device=device,
-                replay_entries=replay, rng_seed=pos, day_samples=day_samples, client_name=day,
-                global_prototypes=returned if align else None, proto_lambda=1.0 if align else 0.0,
-                align_loss="prototypical", align_temperature=0.5, classify_fn=labeller))
+            phase(
+                row,
+                "train",
+                train_day,
+                model,
+                ds,
+                idx,
+                lr=1e-5,
+                weight_decay=1e-4,
+                max_grad_norm=1.0,
+                batch_size=32,
+                epochs=1,
+                device=device,
+                replay_entries=replay,
+                rng_seed=pos,
+                day_samples=day_samples,
+                client_name=day,
+                global_prototypes=returned if align else None,
+                proto_lambda=1.0 if align else 0.0,
+                align_loss="prototypical",
+                align_temperature=0.5,
+                classify_fn=labeller,
+            )
             row["n_replay"] = len(replay or [])
             row["aligned"] = align
             if arm == "prototypes":
-                protos, _ = phase(row, "extract", lambda: extract_day_prototypes(model, day_samples, device, 32, labeller=labeller))
+                protos, _ = phase(row, "extract", extract_day_prototypes, model, day_samples, device, 32, labeller=labeller)
                 for c, (s, n) in protos.items():
                     s0, n0 = accum.get(c, (torch.zeros_like(s), 0))
                     accum[c] = (s0 + s, n0 + n)
@@ -130,28 +154,48 @@ def run_arm(arm: str, dataset: str, checkpoint: str, days: list[str], device: st
 
             # client side of a synchronisation, measured every day so the median is robust
             if arm == "fedavg":
+
                 def sync_fedavg():
-                    buf = io.BytesIO(); torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, buf)
-                    up = buf.tell(); buf.seek(0)
-                    state = torch.load(buf, map_location=device); model.load_state_dict(state)
+                    buf = io.BytesIO()
+                    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, buf)
+                    up = buf.tell()
+                    buf.seek(0)
+                    state = torch.load(buf, map_location=device)
+                    model.load_state_dict(state)
                     return up
+
                 row["payload_up_bytes"] = phase(row, "sync_client", sync_fedavg)
             elif arm == "prototypes":
+
                 def sync_proto():
                     payload = {c: (s.detach().cpu(), n) for c, (s, n) in accum.items()}
-                    buf = io.BytesIO(); torch.save(payload, buf); up = buf.tell()
+                    buf = io.BytesIO()
+                    torch.save(payload, buf)
+                    up = buf.tell()
                     peers = [payload] + [{c: (s * (1 + 0.01 * k), n) for c, (s, n) in payload.items()} for k in (1, 2)]
-                    per_client, _ = aggregate_global_prototypes(peers, attention=True, temperature=0.5)  # server, here for content
-                    back = io.BytesIO(); torch.save(per_client[0], back); back.seek(0)
+                    per_client, _ = aggregate_global_prototypes(
+                        peers, attention=True, temperature=0.5
+                    )  # server, here for content
+                    back = io.BytesIO()
+                    torch.save(per_client[0], back)
+                    back.seek(0)
                     return up, torch.load(back, map_location=device)
+
                 row["payload_up_bytes"], returned = phase(row, "sync_client", sync_proto)
             row["warmup"] = pos == 0
             rows.append(row)
-            print(f"  [{arm}] {day} n={len(idx)} " + " ".join(f"{p}={row[p + '_s']:.2f}s" for p in PHASES if p + "_s" in row), flush=True)
+            print(
+                f"  [{arm}] {day} n={len(idx)} " + " ".join(f"{p}={row[p + '_s']:.2f}s" for p in PHASES if p + "_s" in row),
+                flush=True,
+            )
         backend = ps.backend
 
-    return {"rows": rows, "peak_rss_mb": _hwm_mb(), "power_backend": backend,
-            "peak_cuda_mb": torch.cuda.max_memory_allocated() / 2**20 if cuda else None}
+    return {
+        "rows": rows,
+        "peak_rss_mb": _hwm_mb(),
+        "power_backend": backend,
+        "peak_cuda_mb": torch.cuda.max_memory_allocated() / 2**20 if cuda else None,
+    }
 
 
 def _isolated(*args) -> dict:
@@ -169,7 +213,9 @@ def _median(v: list[float]) -> float:
 
 @click.command()
 @click.option("--dataset", type=click.Path(exists=True, path_type=Path), required=True)
-@click.option("--checkpoint", type=click.Path(exists=True, path_type=Path), default=Path("checkpoints/resnet50_epoch_015.ckpt"))
+@click.option(
+    "--checkpoint", type=click.Path(exists=True, path_type=Path), default=Path("checkpoints/resnet50_epoch_015.ckpt")
+)
 @click.option("--days", default=7, show_default=True, help="Timed days (one warm-up day is added and discarded).")
 @click.option("--arms", default=",".join(ARMS), show_default=True)
 @click.option("--device", type=click.Choice(["cpu", "cuda"]), default="cuda" if torch.cuda.is_available() else "cpu")
@@ -198,7 +244,9 @@ def main(dataset, checkpoint, days, arms, device, threads, idle_seconds, cool_to
     summary = {}
     for a, r in res.items():
         timed = [x for x in r["rows"] if not x["warmup"]]
-        summary[a] = {f"{p}_{u}": _median([x.get(f"{p}_{u}", float("nan")) for x in timed]) for p in PHASES for u in ("s", "j")}
+        summary[a] = {
+            f"{p}_{u}": _median([x.get(f"{p}_{u}", float("nan")) for x in timed]) for p in PHASES for u in ("s", "j")
+        }
         summary[a]["n_samples"] = _median([x["n_samples"] for x in timed])
         summary[a]["peak_rss_mb"] = r["peak_rss_mb"]
         summary[a]["payload_up_bytes"] = _median([x.get("payload_up_bytes", float("nan")) for x in timed])
@@ -212,15 +260,33 @@ def main(dataset, checkpoint, days, arms, device, threads, idle_seconds, cool_to
         for a in ("fedavg", "prototypes"):
             if a in summary:
                 s = summary[a]
-                inc_s = sum((s[p + "_s"] if s[p + "_s"] == s[p + "_s"] else 0) - (base[p + "_s"] if base[p + "_s"] == base[p + "_s"] else 0) for p in PHASES)
-                inc_j = sum((s[p + "_j"] if s[p + "_j"] == s[p + "_j"] else 0) - (base[p + "_j"] if base[p + "_j"] == base[p + "_j"] else 0) for p in PHASES)
+                inc_s = sum(
+                    (s[p + "_s"] if s[p + "_s"] == s[p + "_s"] else 0)
+                    - (base[p + "_s"] if base[p + "_s"] == base[p + "_s"] else 0)
+                    for p in PHASES
+                )
+                inc_j = sum(
+                    (s[p + "_j"] if s[p + "_j"] == s[p + "_j"] else 0)
+                    - (base[p + "_j"] if base[p + "_j"] == base[p + "_j"] else 0)
+                    for p in PHASES
+                )
                 print(f"  incremental over isolated, {a}: {inc_s:+.2f} s/day, {inc_j:+.1f} J/day (excl. transport and server)")
 
     if out:
-        meta = dict(host=platform.node(), machine=platform.machine(), device=device, torch=torch.__version__,
-                    threads=threads or torch.get_num_threads(), dataset=str(dataset), checkpoint=str(checkpoint),
-                    days=sel, power_backend=backend, idle_w=idle_w, cool_to_c=cool_to)
-        rec = json.loads(json.dumps(dict(meta=meta, summary=summary, arms=res)), parse_constant=lambda _c: None)
+        meta = {
+            "host": platform.node(),
+            "machine": platform.machine(),
+            "device": device,
+            "torch": torch.__version__,
+            "threads": threads or torch.get_num_threads(),
+            "dataset": str(dataset),
+            "checkpoint": str(checkpoint),
+            "days": sel,
+            "power_backend": backend,
+            "idle_w": idle_w,
+            "cool_to_c": cool_to,
+        }
+        rec = json.loads(json.dumps({"meta": meta, "summary": summary, "arms": res}), parse_constant=lambda _c: None)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(rec, indent=2))
         print("wrote", out)

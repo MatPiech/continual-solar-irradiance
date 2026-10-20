@@ -2,8 +2,6 @@
 
 import numpy as np
 
-from cirr.utils.metrics import compute_metrics
-
 # ---------------------------------------------------------------------------
 # Table layout
 # ---------------------------------------------------------------------------
@@ -16,27 +14,6 @@ def print_metrics_header() -> None:
     """Print the column header and separator line for the per-day table."""
     print(_HEADER)
     print(_SEPARATOR)
-
-
-def print_day_metrics(day: str, preds: list[float], targets: list[float]) -> None:
-    """Compute metrics for *preds* / *targets* and print a single table row.
-
-    Parameters
-    ----------
-    day : str
-        Day label in MMDD format (e.g. ``"0315"``).
-    preds : list[float]
-        Model predictions for this day.
-    targets : list[float]
-        Ground-truth values for this day.
-    """
-    m = compute_metrics(np.array(preds), np.array(targets))
-
-    # Handle NaN values for percentage metrics
-    wape_str = f"{m['wape']:<10.2f}%" if not np.isnan(m["wape"]) else f"{'N/A':<11}"
-    smape_str = f"{m['smape']:<10.2f}%" if not np.isnan(m["smape"]) else f"{'N/A':<11}"
-
-    print(f"{day:<6} {m['mae']:<10.4f} {m['rmse']:<10.4f} {wape_str} {smape_str} {m['count']:<8}")
 
 
 def print_overall_metrics(overall_metrics: dict[str, float], tag: str = "") -> None:

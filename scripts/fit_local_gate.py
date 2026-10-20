@@ -144,25 +144,25 @@ def main(
     print(f"frame threshold {gate.threshold:.4f} | alert threshold {gate.alert_threshold:.4f} (§5: 1.7527 / 1.6356)")
     print("§6 thresholds: " + ", ".join(f"{k} {v:.4f}" for k, v in gate.thresholds.items()))
 
-    meta = dict(
-        design="docs/CH4_ADMISSIBILITY.md §5 and §6",
-        threshold=gate.threshold,
-        alert_threshold=gate.alert_threshold,
-        thresholds=gate.thresholds,
-        cells=int(cells.sum()),
-        edge_cells=int(gate.edge.sum()),
-        n_bank=len(bank_idx),
-        n_norm=len(norm_idx),
-        n_threshold=len(thr_idx),
-        alert_calibration_days=len(alert_days),
-        percentile=99.0,
-        window_minutes=30,
-        bank_bytes_fp32=int(gate.bank.numel() * 4),
-        checkpoint=str(checkpoint),
-        checkpoint_sha256=sha256_file(checkpoint),
-        git_commit=git_commit(),
-        seed=seed,
-    )
+    meta = {
+        "design": "docs/CH4_ADMISSIBILITY.md §5 and §6",
+        "threshold": gate.threshold,
+        "alert_threshold": gate.alert_threshold,
+        "thresholds": gate.thresholds,
+        "cells": int(cells.sum()),
+        "edge_cells": int(gate.edge.sum()),
+        "n_bank": len(bank_idx),
+        "n_norm": len(norm_idx),
+        "n_threshold": len(thr_idx),
+        "alert_calibration_days": len(alert_days),
+        "percentile": 99.0,
+        "window_minutes": 30,
+        "bank_bytes_fp32": int(gate.bank.numel() * 4),
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "git_commit": git_commit(),
+        "seed": seed,
+    }
     gate.save(out_dir / "local_gate.npz", **meta)
 
     # --- the 2016 stream, clean and with the synthetic faults ------------------------

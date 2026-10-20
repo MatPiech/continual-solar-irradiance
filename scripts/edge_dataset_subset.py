@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 @click.option("--dataset", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--days", default=7, show_default=True)
 def main(dataset: Path, days: int) -> None:
-    from cirr.data.loading import load_dataset
     from edge_collaboration_benchmark import select_days
+
+    from cirr.data.loading import load_dataset
 
     selected = set(select_days(dataset, days))  # MMDD keys, same selection as the runner
     ds = load_dataset(dataset, split="test")

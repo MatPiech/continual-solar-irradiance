@@ -4,10 +4,9 @@ from typing import Any
 from albumentations import ReplayCompose
 import cv2
 import numpy as np
+from PIL import Image
 import torch
 from torch.utils.data import Dataset
-
-from PIL import Image
 
 from cirr.data.transforms import fuse_optical_flow, load_and_transform_image, normalize_optical_flow
 from cirr.physics.clear_sky import resolve_clear_sky_value

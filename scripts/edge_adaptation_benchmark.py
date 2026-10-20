@@ -40,16 +40,22 @@ import platform
 from time import perf_counter
 
 import click
+from edge_power import PowerSampler, cooldown, thermal_state
 import numpy as np
 import torch
 
-from edge_power import PowerSampler, cooldown, thermal_state
-
 HISTORY, HW = 4, 128
 METHODS = ("static", "head", "damped", "full", "window", "rls", "memo", "note")
-LABEL = {"static": "Static model", "head": "Conditional, head only", "damped": "Conditional, damped (proposed)",
-         "full": "Conditional, full encoder", "window": "Lara-Benítez et al.", "rls": "Zhang et al.",
-         "memo": "MEMO", "note": "NOTE"}
+LABEL = {
+    "static": "Static model",
+    "head": "Conditional, head only",
+    "damped": "Conditional, damped (proposed)",
+    "full": "Conditional, full encoder",
+    "window": "Lara-Benítez et al.",
+    "rls": "Zhang et al.",
+    "memo": "MEMO",
+    "note": "NOTE",
+}
 # Update events per sample for the comparators (window/rls/memo update on every sample, NOTE every 64th).
 RATE = {"static": 0.0, "window": 1.0, "rls": 1.0, "memo": 1.0, "note": 1 / 64}
 # Recorded action shares of the damped policy (head, encoder), tab:ch4-actions.
@@ -66,7 +72,7 @@ def _hwm_mb() -> float:
     return float("nan")
 
 
-def _timed(fn, n: int, warmup: int, cuda: bool, clock=perf_counter) -> tuple[list[float], float, float]:
+def _timed(fn, n: int, warmup: int, cuda: bool) -> tuple[list[float], float, float]:
     """Per-call latencies (ms) of the timed calls, and the monotonic window they span."""
     times, t0 = [], 0.0
     for i in range(warmup + n):
@@ -86,8 +92,7 @@ def _timed(fn, n: int, warmup: int, cuda: bool, clock=perf_counter) -> tuple[lis
 def _energy_mj(ps: PowerSampler, t0: float, t1: float, n: int, idle_w: float) -> dict[str, float]:
     """Mean board power over the window and energy per call above idle (mJ)."""
     e = ps.energy(t0, t1)
-    return {"power_w": e / (t1 - t0) if t1 > t0 else float("nan"),
-            "energy_mj": 1e3 * (e - idle_w * (t1 - t0)) / n}
+    return {"power_w": e / (t1 - t0) if t1 > t0 else float("nan"), "energy_mj": 1e3 * (e - idle_w * (t1 - t0)) / n}
 
 
 def _summary(ms: list[float]) -> dict[str, float]:
@@ -118,11 +123,18 @@ def measure(method: str, checkpoint: str, device: str, samples: int, warmup: int
     update = None
     if method in ("head", "damped", "full"):
         # campaign optimiser: evaluate_lagged_ogd.py, config of conditional_last2_lowlr
-        opt = torch.optim.AdamW([{"params": model.network_head.parameters(), "lr": 1e-5},
-                                 {"params": model.image_encoder.parameters(), "lr": 1e-6}],
-                                betas=(0.5, 0.975), weight_decay=1e-4)
+        opt = torch.optim.AdamW(
+            [
+                {"params": model.network_head.parameters(), "lr": 1e-5},
+                {"params": model.image_encoder.parameters(), "lr": 1e-6},
+            ],
+            betas=(0.5, 0.975),
+            weight_decay=1e-4,
+        )
         loss = make_regression_loss("mse").to(device)
-        scope, blocks = {"head": ("head_only", None), "damped": ("head_and_encoder", 2), "full": ("head_and_encoder", None)}[method]
+        scope, blocks = {"head": ("head_only", None), "damped": ("head_and_encoder", 2), "full": ("head_and_encoder", None)}[
+            method
+        ]
         update = lambda: ogd_step(model, opt, scope, loss, image, history, gt, device, encoder_blocks=blocks)  # noqa: E731
     elif method == "window":
         opt = torch.optim.Adam(model.parameters(), lr=1e-5)
@@ -133,7 +145,9 @@ def measure(method: str, checkpoint: str, device: str, samples: int, warmup: int
         rls = ShermanMorrisonHeadUpdater(model=model, lambda_init=1.0, forgetting_factor=1.0, error_clip=0.2, device=device)
         update = lambda: rls.update(model=model, image=image, history=history, gt=gt, device=device, scope="last_layer")  # noqa: E731
     elif method == "memo":
-        memo = MEMOReg(model=model, lr=1e-5, weight_decay=0.01, n_augmentations=8, niter=1, episodic=True, adapt_mode="all").to(device)
+        memo = MEMOReg(
+            model=model, lr=1e-5, weight_decay=0.01, n_augmentations=8, niter=1, episodic=True, adapt_mode="all"
+        ).to(device)
 
         def update() -> None:
             memo.model.load_state_dict(memo._initial_model_state, strict=True)
@@ -142,8 +156,16 @@ def measure(method: str, checkpoint: str, device: str, samples: int, warmup: int
 
         infer = lambda: memo._predict_single(x[0], h, torch.device(device))  # noqa: E731
     elif method == "note":
-        note = NOTEReg(model=model, lr=1e-5, weight_decay=0.01, update_every_x=64, niter=1, adapt_mode="all",
-                       use_learned_stats=False, bn_momentum=0.1).to(device)
+        note = NOTEReg(
+            model=model,
+            lr=1e-5,
+            weight_decay=0.01,
+            update_every_x=64,
+            niter=1,
+            adapt_mode="all",
+            use_learned_stats=False,
+            bn_momentum=0.1,
+        ).to(device)
         note._buffer_images = deque((torch.rand(c, HW, HW) for _ in range(64)), maxlen=64)
         note._buffer_histories = deque((torch.rand(HISTORY) for _ in range(64)), maxlen=64)
         update = lambda: note._adapt_from_buffer(torch.device(device))  # noqa: E731
@@ -181,7 +203,17 @@ def _run_isolated(*args) -> dict:
 @click.option("--idle-seconds", default=20.0, show_default=True, help="Idle window for the idle-power baseline.")
 @click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each method.")
 @click.option("--out", type=click.Path(path_type=Path), default=None, help="Write the results as JSON.")
-def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int, threads: int | None, idle_seconds: float, cool_to: float, out: Path | None) -> None:
+def main(
+    checkpoint: Path,
+    device: str,
+    methods: str,
+    samples: int,
+    warmup: int,
+    threads: int | None,
+    idle_seconds: float,
+    cool_to: float,
+    out: Path | None,
+) -> None:
     chosen = [m.strip() for m in methods.split(",") if m.strip()]
     if unknown := set(chosen) - set(METHODS):
         raise click.BadParameter(f"unknown methods {sorted(unknown)}; choose from {METHODS}")
@@ -205,12 +237,24 @@ def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int,
             head = res["head"]["update"]["mean"]
             r["per_sample_ms"] = {s: r["inference"]["mean"] + ph * head + pe * upd for s, (ph, pe) in DAMPED_MIX.items()}
 
-    meta = {"checkpoint": str(checkpoint), "input_channels": next(iter(res.values()))["input_channels"], "device": device,
-            "host": platform.node(), "machine": platform.machine(), "torch": torch.__version__,
-            "threads": threads or torch.get_num_threads(), "samples": samples, "warmup": warmup,
-            "power_backend": backend, "idle_w": idle_w, "cool_to_c": cool_to}
+    meta = {
+        "checkpoint": str(checkpoint),
+        "input_channels": next(iter(res.values()))["input_channels"],
+        "device": device,
+        "host": platform.node(),
+        "machine": platform.machine(),
+        "torch": torch.__version__,
+        "threads": threads or torch.get_num_threads(),
+        "samples": samples,
+        "warmup": warmup,
+        "power_backend": backend,
+        "idle_w": idle_w,
+        "cool_to_c": cool_to,
+    }
     print(f"\n{meta['host']} ({meta['machine']}, {device}, {meta['input_channels']}-channel input, {meta['threads']} threads)")
-    print(f"{'method':<32} {'infer ms':>9} {'update ms':>17} {'per-sample ms':>28} {'Tput/s':>7} {'peak RSS MB':>12} {'infer mJ':>9} {'update mJ':>10}")
+    print(
+        f"{'method':<32} {'infer ms':>9} {'update ms':>17} {'per-sample ms':>28} {'Tput/s':>7} {'peak RSS MB':>12} {'infer mJ':>9} {'update mJ':>10}"
+    )
     for m, r in res.items():
         u = r.get("update")
         ups = f"{u['mean']:8.2f} ± {u['std']:6.2f}" if u else f"{'–':>17}"
@@ -218,7 +262,9 @@ def main(checkpoint: Path, device: str, methods: str, samples: int, warmup: int,
         pers = " / ".join(f"{v:.1f}" for v in per.values()) if per else "–"
         tput = f"{1e3 / next(iter(per.values())):7.2f}" if len(per) == 1 else f"{'mix':>7}" if per else f"{'–':>7}"
         ue = f"{u['energy_mj']:10.1f}" if u else f"{'–':>10}"
-        print(f"{LABEL[m]:<32} {r['inference']['mean']:9.2f} {ups:>17} {pers:>28} {tput} {r['peak_rss_mb']:12.1f} {r['inference']['energy_mj']:9.1f} {ue}")
+        print(
+            f"{LABEL[m]:<32} {r['inference']['mean']:9.2f} {ups:>17} {pers:>28} {tput} {r['peak_rss_mb']:12.1f} {r['inference']['energy_mj']:9.1f} {ue}"
+        )
     if "damped" in res and "per_sample_ms" in res["damped"]:
         print("  damped per-sample cost is per site: " + ", ".join(DAMPED_MIX) + " (action mix of tab:ch4-actions)")
 

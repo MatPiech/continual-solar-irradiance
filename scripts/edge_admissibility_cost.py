@@ -28,12 +28,12 @@ import platform
 from time import perf_counter
 
 import click
+from edge_power import PowerSampler, cooldown, thermal_state
 import numpy as np
 import torch
 
 from cirr.evaluation.admissibility import LocalGate, local_projection
 from cirr.evaluation.runner import load_eval_model
-from edge_power import PowerSampler, cooldown, thermal_state
 
 HW, HISTORY = 128, 4
 FRAMES_PER_DAY = 245538 / 362  # Folsom 2016 scored daylight frames per day (tab:ch4-solar-benchmark)
@@ -72,8 +72,12 @@ def timed(fn, n: int, warmup: int, cuda: bool) -> tuple[list[float], float, floa
 
 
 @click.command()
-@click.option("--checkpoint", type=click.Path(exists=True, path_type=Path), default=Path("checkpoints/resnet50_epoch_015.ckpt"))
-@click.option("--gate", type=click.Path(exists=True, path_type=Path), default=Path("results/adaptation/gate/local/local_gate.npz"))
+@click.option(
+    "--checkpoint", type=click.Path(exists=True, path_type=Path), default=Path("checkpoints/resnet50_epoch_015.ckpt")
+)
+@click.option(
+    "--gate", type=click.Path(exists=True, path_type=Path), default=Path("results/adaptation/gate/local/local_gate.npz")
+)
 @click.option("--device", type=click.Choice(["cpu", "cuda"]), default="cuda" if torch.cuda.is_available() else "cpu")
 @click.option("--bank-dtype", type=click.Choice(["fp32", "fp16"]), default="fp32", show_default=True)
 @click.option("--samples", default=200, show_default=True)
@@ -81,8 +85,12 @@ def timed(fn, n: int, warmup: int, cuda: bool) -> tuple[list[float], float, floa
 @click.option("--threads", type=int, default=None)
 @click.option("--idle-seconds", default=20.0, show_default=True)
 @click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each timed block.")
-@click.option("--overhead-json", type=click.Path(exists=True, path_type=Path), default=None,
-              help="Output of edge_adaptation_benchmark.py on the same device, for the avoided-update cost.")
+@click.option(
+    "--overhead-json",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Output of edge_adaptation_benchmark.py on the same device, for the avoided-update cost.",
+)
 @click.option("--out", type=click.Path(path_type=Path), default=None)
 @torch.no_grad()
 def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_seconds, cool_to, overhead_json, out) -> None:
@@ -115,56 +123,93 @@ def main(checkpoint, gate, device, bank_dtype, samples, warmup, threads, idle_se
             model(x, h)
             f = torch.nn.functional.avg_pool2d(grabbed["f"].float(), 3, 1, 1)
             f = (f.flatten(2).transpose(1, 2)[:, flat] @ proj).transpose(0, 1).to(dt)  # [cells, 1, 128]
-            d = torch.cdist(f, bank).amin(-1).squeeze(-1).float() / scale             # [cells]
-            _s = max(float(d.median()), float(d[core].max()))                          # G and C statistics
+            d = torch.cdist(f, bank).amin(-1).squeeze(-1).float() / scale  # [cells]
+            _s = max(float(d.median()), float(d[core].max()))  # G and C statistics
 
         res = {}
         thermal["before_inference"] = cooldown(cool_to, label="before inference")
         ms, t0, t1 = timed(infer, samples, warmup, cuda)
         e = ps.energy(t0, t1)
-        res["inference"] = dict(mean=float(np.mean(ms)), std=float(np.std(ms)), p95=float(np.percentile(ms, 95)),
-                                energy_mj=1e3 * (e - idle_w * (t1 - t0)) / len(ms))
+        res["inference"] = {
+            "mean": float(np.mean(ms)),
+            "std": float(np.std(ms)),
+            "p95": float(np.percentile(ms, 95)),
+            "energy_mj": 1e3 * (e - idle_w * (t1 - t0)) / len(ms),
+        }
         thermal["before_flag"] = cooldown(cool_to, label="before inference + flag")
         hook = model.image_encoder.layer2.register_forward_hook(lambda _m, _i, o: grabbed.__setitem__("f", o))
         ms, t0, t1 = timed(infer_and_flag, samples, warmup, cuda)
         hook.remove()
         rss_bank = rss_mb()  # after scoring, so the bank pages are resident
         e = ps.energy(t0, t1)
-        res["inference_flag"] = dict(mean=float(np.mean(ms)), std=float(np.std(ms)), p95=float(np.percentile(ms, 95)),
-                                     energy_mj=1e3 * (e - idle_w * (t1 - t0)) / len(ms))
+        res["inference_flag"] = {
+            "mean": float(np.mean(ms)),
+            "std": float(np.std(ms)),
+            "p95": float(np.percentile(ms, 95)),
+            "energy_mj": 1e3 * (e - idle_w * (t1 - t0)) / len(ms),
+        }
         backend = ps.backend
 
     flag_ms = res["inference_flag"]["mean"] - res["inference"]["mean"]
     flag_mj = res["inference_flag"]["energy_mj"] - res["inference"]["energy_mj"]
-    memory = dict(rss_model_mb=rss_model, rss_after_scoring_mb=rss_bank, peak_rss_mb=hwm_mb(),
-                  bank_bytes_mb=bank.numel() * bank.element_size() / 1e6,
-                  peak_cuda_mb=torch.cuda.max_memory_allocated() / 2**20 if cuda else None)
-    per_day = dict(frames=FRAMES_PER_DAY, flag_s=flag_ms * FRAMES_PER_DAY / 1e3, flag_j=flag_mj * FRAMES_PER_DAY / 1e3)
+    memory = {
+        "rss_model_mb": rss_model,
+        "rss_after_scoring_mb": rss_bank,
+        "peak_rss_mb": hwm_mb(),
+        "bank_bytes_mb": bank.numel() * bank.element_size() / 1e6,
+        "peak_cuda_mb": torch.cuda.max_memory_allocated() / 2**20 if cuda else None,
+    }
+    per_day = {"frames": FRAMES_PER_DAY, "flag_s": flag_ms * FRAMES_PER_DAY / 1e3, "flag_j": flag_mj * FRAMES_PER_DAY / 1e3}
 
     avoided = {}
     if overhead_json:
         oh = json.loads(Path(overhead_json).read_text())["results"]
         costs = {k: (oh[k]["update"]["mean"], oh[k]["update"].get("energy_mj")) for k in ("head", "damped") if k in oh}
         for stream, n in AVOIDED_PER_DAY.items():
-            avoided[stream] = {k: dict(updates_per_day=n, saved_s=n * c[0] / 1e3,
-                                       saved_j=(n * c[1] / 1e3) if c[1] is not None else None) for k, c in costs.items()}
+            avoided[stream] = {
+                k: {"updates_per_day": n, "saved_s": n * c[0] / 1e3, "saved_j": (n * c[1] / 1e3) if c[1] is not None else None}
+                for k, c in costs.items()
+            }
 
     print(f"\n{platform.node()} ({platform.machine()}, {device}, bank {bank_dtype})")
     print(f"  inference          {res['inference']['mean']:8.2f} ms   {res['inference']['energy_mj']:8.1f} mJ")
     print(f"  inference + flag   {res['inference_flag']['mean']:8.2f} ms   {res['inference_flag']['energy_mj']:8.1f} mJ")
-    print(f"  flag (marginal)    {flag_ms:8.2f} ms   {flag_mj:8.1f} mJ   bank {memory['bank_bytes_mb']:.0f} MB, peak RSS {memory['peak_rss_mb']:.0f} MB")
+    print(
+        f"  flag (marginal)    {flag_ms:8.2f} ms   {flag_mj:8.1f} mJ   bank {memory['bank_bytes_mb']:.0f} MB, peak RSS {memory['peak_rss_mb']:.0f} MB"
+    )
     print(f"  per day ({FRAMES_PER_DAY:.0f} frames): flag {per_day['flag_s']:.1f} s, {per_day['flag_j']:.1f} J")
     for stream, d in avoided.items():
-        parts = ", ".join(f"{k}: {v['saved_s']:.1f} s" + (f" / {v['saved_j']:.1f} J" if v["saved_j"] is not None else "") for k, v in d.items())
+        parts = ", ".join(
+            f"{k}: {v['saved_s']:.1f} s" + (f" / {v['saved_j']:.1f} J" if v["saved_j"] is not None else "")
+            for k, v in d.items()
+        )
         print(f"  avoided updates, {stream} ({next(iter(d.values()))['updates_per_day']:.1f}/day): {parts}")
 
     if out:
-        meta = dict(host=platform.node(), machine=platform.machine(), device=device, torch=torch.__version__,
-                    threads=torch.get_num_threads(), bank_dtype=bank_dtype, samples=samples, warmup=warmup,
-                    power_backend=backend, idle_w=idle_w, checkpoint=str(checkpoint), gate=str(gate))
+        meta = {
+            "host": platform.node(),
+            "machine": platform.machine(),
+            "device": device,
+            "torch": torch.__version__,
+            "threads": torch.get_num_threads(),
+            "bank_dtype": bank_dtype,
+            "samples": samples,
+            "warmup": warmup,
+            "power_backend": backend,
+            "idle_w": idle_w,
+            "checkpoint": str(checkpoint),
+            "gate": str(gate),
+        }
         thermal["end"] = thermal_state()
-        rec = dict(meta=meta, thermal=thermal, results=res, flag_marginal=dict(ms=flag_ms, mj=flag_mj), memory=memory,
-                   per_day=per_day, avoided_updates=avoided)
+        rec = {
+            "meta": meta,
+            "thermal": thermal,
+            "results": res,
+            "flag_marginal": {"ms": flag_ms, "mj": flag_mj},
+            "memory": memory,
+            "per_day": per_day,
+            "avoided_updates": avoided,
+        }
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(json.loads(json.dumps(rec), parse_constant=lambda _c: None), indent=2))
         print("wrote", out)

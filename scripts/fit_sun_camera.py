@@ -48,7 +48,7 @@ def detect_sun(im: np.ndarray) -> tuple[float, float] | None:
     return cent[k][0] / SIZE, cent[k][1] / SIZE
 
 
-def clear_candidates(root: Path, site: str, n: int, seed: int) -> list[str]:
+def clear_candidates(root: Path, n: int, seed: int) -> list[str]:
     frame = pd.read_csv(root / "cleaned_irradiance.csv")
     col = "ghi" if "ghi" in frame.columns else "irradiance"
     cs = pd.read_csv(next(root.glob("*clear_sky.csv")))
@@ -112,9 +112,14 @@ def fit(site, det, rng):
     """
     names = det["name"].to_numpy()
     uv = det[["u", "v"]].to_numpy()
-    is_dst = np.array([t.dst().total_seconds() != 0 for t in pd.DatetimeIndex(
-        pd.to_datetime([n[:15] for n in names], format="%Y%m%d_%H%M%S")).tz_localize(
-        SITES[site]["tz"], ambiguous=False, nonexistent="shift_forward")])
+    is_dst = np.array(
+        [
+            t.dst().total_seconds() != 0
+            for t in pd.DatetimeIndex(pd.to_datetime([n[:15] for n in names], format="%Y%m%d_%H%M%S")).tz_localize(
+                SITES[site]["tz"], ambiguous=False, nonexistent="shift_forward"
+            )
+        ]
+    )
     za0 = angles_at(site, names, (0.0, 0.0))
 
     groups = {g: m for g, m in (("dst", is_dst), ("std", ~is_dst)) if m.sum() >= 10}
@@ -126,8 +131,9 @@ def fit(site, det, rng):
     for g, m in groups.items():
         if g == ref:
             continue
-        scan = {dt: int((_err(angles_at(site, names[m], (dt, dt)), uv[m], p, mirror) < INLIER).sum())
-                for dt in range(-150, 151, 5)}
+        scan = {
+            dt: int((_err(angles_at(site, names[m], (dt, dt)), uv[m], p, mirror) < INLIER).sum()) for dt in range(-150, 151, 5)
+        }
         clock[g] = float(max(scan, key=scan.get))
 
     # joint refinement on inliers of both regimes
@@ -143,8 +149,12 @@ def fit(site, det, rng):
         u, v = project(z[:, 0], z[:, 1], x[0], x[1], mirror, x[2], x[3], x[4])
         return np.concatenate([u - uv[inl, 0], v - uv[inl, 1]])
 
-    x = least_squares(resid, [*p, *[clock[g] for g in free]], diff_step=1e-3,
-                      bounds=(LOWER + [-180.0] * len(free), UPPER + [180.0] * len(free))).x
+    x = least_squares(
+        resid,
+        [*p, *[clock[g] for g in free]],
+        diff_step=1e-3,
+        bounds=(LOWER + [-180.0] * len(free), UPPER + [180.0] * len(free)),
+    ).x
     for g, dt in zip(free, x[5:], strict=True):
         clock[g] = round(float(dt), 1)
     params = dict(zip(PARAMS, map(float, x[:5]), strict=True))
@@ -161,7 +171,7 @@ def fit(site, det, rng):
 def main(site, data_root, n, seed, out):
     root = data_root or Path(f"data/{site}_prepared")
     out.mkdir(parents=True, exist_ok=True)
-    names = clear_candidates(root, site, n, seed)
+    names = clear_candidates(root, n, seed)
     angles = solar_angles(site, names)
 
     rows = []
@@ -176,15 +186,16 @@ def main(site, data_root, n, seed, out):
     cfg = {**SITES[site], **params}
     za = angles_at(site, det["name"].to_numpy(), params["clock"])
     det["zenith"], det["azimuth"] = za[:, 0], za[:, 1]
-    err = _err(za, det[["u", "v"]].to_numpy(),
-               [cfg["offset"], cfg["focal"], cfg["cx"], cfg["cy"], cfg["k3"]], cfg["mirror"])
+    err = _err(za, det[["u", "v"]].to_numpy(), [cfg["offset"], cfg["focal"], cfg["cx"], cfg["cy"], cfg["k3"]], cfg["mirror"])
     det["err_px512"] = err * SIZE
     inl = err < INLIER
     by_month = det.assign(inlier=inl).groupby(det["name"].str[:6])["inlier"].agg(["size", "mean"]).round(2)
-    summary = (f"params: {params}\n"
-               f"inliers (<{INLIER * SIZE:.0f}px@512): {inl.mean():.1%}   median err {np.median(err[inl]) * SIZE:.1f}px@512 "
-               f"(~{np.median(err[inl]) * 128:.2f}px at 128; mask radius 8px)\n"
-               f"per month (n, inlier rate):\n{by_month.to_string()}\n")
+    summary = (
+        f"params: {params}\n"
+        f"inliers (<{INLIER * SIZE:.0f}px@512): {inl.mean():.1%}   median err {np.median(err[inl]) * SIZE:.1f}px@512 "
+        f"(~{np.median(err[inl]) * 128:.2f}px at 128; mask radius 8px)\n"
+        f"per month (n, inlier rate):\n{by_month.to_string()}\n"
+    )
     print(summary)
     det.to_csv(out / f"{site}_detections.csv", index=False)
     (out / f"{site}_params.txt").write_text(summary)

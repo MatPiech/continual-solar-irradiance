@@ -1,7 +1,0 @@
-{
-  "split": "edge",
-  "frames": 245538,
-  "flagged_pct": 1.511375021381619,
-  "spearman_local_vs_error": 0.19724297380406802,
-  "spearman_iforest_vs_error": 0.5476340312764774
-}

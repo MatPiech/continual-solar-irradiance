@@ -97,7 +97,6 @@ def make_regime_labeller(
         if label == "proxy"
         else (lambda target, ghi: classify_value(compute_csi(target, ghi), edges))
     )
-    n_sky = len(edges) + 1
     if elevation_bins > 1:
         sky = base
         base = lambda target, ghi: sky(target, ghi) * elevation_bins + elevation_bin(ghi, elevation_bins)  # noqa: E731
@@ -111,11 +110,13 @@ def regime_names(n_classes: int, elevation_bins: int = 1) -> dict[int, str]:
     names = {PROTO_UNLIT: "unlit"}
     if elevation_bins > 1:
         sky = regime_names(n_classes // elevation_bins)
-        names.update({
-            c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
-            for c in range(n_classes // elevation_bins)
-            for e in range(elevation_bins)
-        })
+        names.update(
+            {
+                c * elevation_bins + e: f"{sky.get(c, c)}_elev{e}"
+                for c in range(n_classes // elevation_bins)
+                for e in range(elevation_bins)
+            }
+        )
         return names
     if n_classes == 3:
         names.update(PROTO_CLASS_NAMES)
@@ -139,31 +140,6 @@ def classify_irradiance(norm_irradiance: float, edges: tuple[float, float] = DEF
 def _sample_target(sample: tuple[torch.Tensor, ...]) -> float:
     target = sample[3]
     return float(target.view(-1)[0].item() if isinstance(target, torch.Tensor) else target)
-
-
-def fit_kc_bin_edges(
-    values: list[float],
-    quantile_levels: tuple[float, float] = DEFAULT_EDGE_QUANTILES,
-    fallback_edges: tuple[float, float] = DEFAULT_KC_EDGES,
-) -> tuple[float, float]:
-    """Fit class edges from data quantiles (deterministic, no random thresholds)."""
-    if len(values) < 3:
-        return fallback_edges
-
-    x = torch.tensor(values, dtype=torch.float32)
-    q = torch.quantile(x, torch.tensor([quantile_levels[0], quantile_levels[1]], dtype=torch.float32))
-    low = float(q[0].item())
-    high = float(q[1].item())
-
-    # Guard against collapsed quantiles on low-variance segments.
-    if high <= low:
-        x_min, x_max = float(torch.min(x).item()), float(torch.max(x).item())
-        if x_max <= x_min:
-            return fallback_edges
-        span = x_max - x_min
-        low = x_min + span / 3.0
-        high = x_min + 2.0 * span / 3.0
-    return low, high
 
 
 def _sample_ghi_clear(sample: tuple[torch.Tensor, ...]) -> float:

@@ -20,10 +20,10 @@ from pathlib import Path
 
 import click
 import cv2
+from fit_sun_camera import SIZE, clear_candidates, detect_sun, load_crop
 import numpy as np
 
 from cirr.physics.sun import SITES, project, solar_angles
-from fit_sun_camera import SIZE, clear_candidates, detect_sun, load_crop
 
 TILE = 256
 COLS = 4
@@ -44,7 +44,7 @@ KEYS = ("offset", "focal", "cx", "cy", "k3", "mirror", "clock_dst", "clock_std")
 
 
 def pick_frames(site: str, n: int, seed: int) -> list[str]:
-    names = clear_candidates(Path(f"data/{site}_prepared"), site, 10 * n, seed)
+    names = clear_candidates(Path(f"data/{site}_prepared"), 10 * n, seed)
     by_month: dict[str, list[str]] = {}
     for name in names:
         by_month.setdefault(name[:6], []).append(name)
@@ -54,8 +54,11 @@ def pick_frames(site: str, n: int, seed: int) -> list[str]:
 
 
 def settings_from_cfg(cfg: dict) -> dict:
-    return {**{k: cfg[k] for k in ("offset", "focal", "cx", "cy", "k3", "mirror")},
-            "clock_dst": cfg["clock"][0], "clock_std": cfg["clock"][1]}
+    return {
+        **{k: cfg[k] for k in ("offset", "focal", "cx", "cy", "k3", "mirror")},
+        "clock_dst": cfg["clock"][0],
+        "clock_std": cfg["clock"][1],
+    }
 
 
 class Viewer:
@@ -90,9 +93,11 @@ class Viewer:
 
 
 def save(site: str, s: dict, out: Path) -> None:
-    entry = (f'"offset": {s["offset"]:.2f}, "focal": {s["focal"]:.4f}, "mirror": {s["mirror"]}, '
-             f'"cx": {s["cx"]:.4f}, "cy": {s["cy"]:.4f},\n'
-             f'"k3": {s["k3"]:.4f}, "clock": ({float(s["clock_dst"]):.1f}, {float(s["clock_std"]):.1f}),')
+    entry = (
+        f'"offset": {s["offset"]:.2f}, "focal": {s["focal"]:.4f}, "mirror": {s["mirror"]}, '
+        f'"cx": {s["cx"]:.4f}, "cy": {s["cy"]:.4f},\n'
+        f'"k3": {s["k3"]:.4f}, "clock": ({float(s["clock_dst"]):.1f}, {float(s["clock_std"]):.1f}),'
+    )
     path = out / f"{site}_manual_params.txt"
     path.write_text(entry + "\n")
     print(f"saved {path}:\n{entry}")
@@ -103,8 +108,9 @@ def save(site: str, s: dict, out: Path) -> None:
 @click.option("--n", type=int, default=12, help="frames shown")
 @click.option("--seed", type=int, default=0)
 @click.option("--headless", is_flag=True, help="write the overlay grid for the current settings and exit")
-@click.option("--set", "overrides", multiple=True, metavar="KEY=VALUE",
-              help=f"override a setting, repeatable; keys: {', '.join(KEYS)}")
+@click.option(
+    "--set", "overrides", multiple=True, metavar="KEY=VALUE", help=f"override a setting, repeatable; keys: {', '.join(KEYS)}"
+)
 @click.option("--save", "save_settings", is_flag=True, help="with --headless: also write the settings file")
 @click.option("--out", type=click.Path(path_type=Path), default=Path("results/sun_camera"))
 def main(site, n, seed, headless, overrides, save_settings, out):

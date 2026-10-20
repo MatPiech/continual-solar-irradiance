@@ -26,12 +26,14 @@ than about two sampling intervals cannot be resolved; time many repetitions insi
 
 from __future__ import annotations
 
+import contextlib
+import itertools
 import os
 from pathlib import Path
 import re
 import shutil
-import sys
 import subprocess
+import sys
 import threading
 import time
 
@@ -105,8 +107,11 @@ def cooldown(target_c: float = 50.0, min_s: float = 30.0, max_s: float = 300.0, 
             break
         time.sleep(5)
     state = thermal_state() | {"waited_s": round(time.monotonic() - t0, 1)}
-    print(f"  cooldown{' ' + label if label else ''}: {state['temp_c']:.1f} C after {state['waited_s']:.0f} s"
-          + (f", throttled={state['throttled']}" if state["throttled"] else ""), flush=True)
+    print(
+        f"  cooldown{' ' + label if label else ''}: {state['temp_c']:.1f} C after {state['waited_s']:.0f} s"
+        + (f", throttled={state['throttled']}" if state["throttled"] else ""),
+        flush=True,
+    )
     return state
 
 
@@ -127,8 +132,9 @@ class PowerSampler:
             self._thread = threading.Thread(target=self._pmic_loop, daemon=True)
             self._thread.start()
         elif self.backend == "tegrastats":
-            self._proc = subprocess.Popen(["tegrastats", "--interval", str(int(self.interval_s * 1000))],
-                                          stdout=subprocess.PIPE, text=True)
+            self._proc = subprocess.Popen(
+                ["tegrastats", "--interval", str(int(self.interval_s * 1000))], stdout=subprocess.PIPE, text=True
+            )
             self._thread = threading.Thread(target=self._tegra_loop, daemon=True)
             self._thread.start()
         time.sleep(3 * self.interval_s)  # first samples before any timed work
@@ -136,10 +142,8 @@ class PowerSampler:
 
     def _pmic_loop(self) -> None:
         while not self._stop.is_set():
-            try:
+            with contextlib.suppress(OSError, subprocess.SubprocessError, ValueError):
                 self.samples.append((time.monotonic(), pmic_watts()))
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
             self._stop.wait(self.interval_s)
 
     def _tegra_loop(self) -> None:
@@ -163,7 +167,7 @@ class PowerSampler:
         pts = [(t, w) for t, w in list(self.samples) if t0 <= t <= t1]
         if self.backend == "none" or len(pts) < 2:
             return float("nan")
-        e = sum((b[0] - a[0]) * (a[1] + b[1]) / 2 for a, b in zip(pts, pts[1:]))
+        e = sum((b[0] - a[0]) * (a[1] + b[1]) / 2 for a, b in itertools.pairwise(pts))
         span = pts[-1][0] - pts[0][0]
         return e * (t1 - t0) / span if span > 0 else float("nan")  # extend to the window edges
 
