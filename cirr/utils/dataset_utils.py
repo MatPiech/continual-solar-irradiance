@@ -4,8 +4,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
-from torch.utils.data import DataLoader, Subset
-
 
 def generate_year_days() -> list[str]:
     """Generate all days of a standard year as MMDD strings.
@@ -89,51 +87,3 @@ def select_day_indices(
         if day_key in day_index_map:
             indices.extend(day_index_map[day_key])
     return indices
-
-
-def build_subset_loader(
-    dataset: Any,
-    day_index_map: dict[str, list[int]],
-    num_days: int,
-    start_day: str,
-    batch_size: int = 1,
-    shuffle: bool = False,
-    num_workers: int = 0,
-) -> tuple[DataLoader, list[int]]:
-    """Build a :class:`~torch.utils.data.DataLoader` covering a day range.
-
-    Parameters
-    ----------
-    dataset : SkyImageDataset
-        The full test dataset.
-    day_index_map : dict[str, list[int]]
-        As returned by :func:`group_indices_by_day`.
-    num_days : int
-        Number of days.  ``<= 0`` means all days from *start_day*.
-    start_day : str
-        Starting day in MMDD format.
-    batch_size : int
-        DataLoader batch size, by default ``1``.
-    shuffle : bool
-        Whether to shuffle the loader, by default ``False``.
-    num_workers : int
-        DataLoader worker count, by default ``0``.
-
-    Returns
-    -------
-    loader : DataLoader
-    indices : list[int]
-        The subset indices used (empty when *num_days* ``<= 0``).
-    """
-    if num_days > 0:
-        indices = select_day_indices(day_index_map, num_days, start_day)
-        loader = DataLoader(
-            Subset(dataset, indices),
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-        )
-        return loader, indices
-    # All days: use default DataLoader (no subset)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-    return loader, []

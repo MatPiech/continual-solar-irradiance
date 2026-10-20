@@ -7,7 +7,6 @@ import torchmetrics
 
 from cirr.data.transforms import RGB_CHANNELS
 from cirr.losses import MeanAdaptiveBerHuLoss
-from cirr.models.lora import LoRAConv2d, LoRALinear, count_lora_parameters, print_lora_info, replace_linear_with_lora
 
 
 def _inflate_conv1_weights(weight: torch.Tensor, extra_channels: int = 2) -> torch.Tensor:
@@ -219,16 +218,6 @@ class Forecaster(pl.LightningModule):
         except TypeError:
             return self.image_encoder.forward_head(feat)
 
-    def freeze_image_encoder(self) -> None:
-        """Freeze all parameters in the image encoder."""
-        for param in self.image_encoder.parameters():
-            param.requires_grad = False
-
-    def unfreeze_image_encoder(self) -> None:
-        """Unfreeze all parameters in the image encoder."""
-        for param in self.image_encoder.parameters():
-            param.requires_grad = True
-
     def freeze_early_backbone(self) -> None:
         """Freeze early backbone layers (conv1, bn1, layer1, layer2, layer3) in ResNet.
 
@@ -259,184 +248,6 @@ class Forecaster(pl.LightningModule):
         print(
             f"  Frozen early backbone: {frozen_params:,} parameters in {frozen_tensors} tensors (conv1, bn1, layer1, layer2, layer3)"
         )
-
-    def freeze_all_except_lora(self) -> None:
-        """Freeze all parameters except LoRA parameters.
-
-        This is the key method for extreme parameter efficiency:
-        - Freezes the entire network (encoder + head)
-        - Only LoRA parameters remain trainable
-        """
-        # Freeze everything first
-        for param in self.parameters():
-            param.requires_grad = False
-
-        # Then unfreeze only LoRA parameters
-        for module in self.modules():
-            if isinstance(module, LoRALinear | LoRAConv2d):
-                module.lora_A.requires_grad = True
-                module.lora_B.requires_grad = True
-                module.lora_B.requires_grad = True
-
-    def apply_lora_to_head(self, rank: int = 4, alpha: float = 1.0) -> None:
-        """Apply LoRA to the network head linear layers.
-
-        This replaces standard Linear layers with LoRALinear layers,
-        enabling parameter-efficient adaptation.
-
-        Parameters
-        ----------
-        rank : int, optional
-            Rank of LoRA decomposition. Lower = fewer parameters.
-            Recommended: 1-8 for extreme efficiency, by default 4.
-        alpha : float, optional
-            LoRA scaling factor, by default 1.0.
-        """
-        # Replace Linear layers in network_head with LoRA versions
-        replace_linear_with_lora(self.network_head, rank=rank, alpha=alpha)
-
-        # Print LoRA configuration
-        print_lora_info(self)
-
-        # Print overall parameter efficiency
-        stats = count_lora_parameters(self)
-        print("\nOverall Model Parameter Efficiency:")
-        print(f"  Trainable:  {stats['trainable']:,} ({stats['efficiency_pct']:.4f}%)")
-        print(f"  Frozen:     {stats['frozen']:,}")
-        print(f"  Total:      {stats['total']:,}\n")
-
-    def apply_dual_lora(
-        self,
-        encoder_rank: int = 4,
-        head_rank: int = 8,
-        encoder_alpha: float = 16.0,
-        head_alpha: float = 16.0,
-    ) -> None:
-        """Apply LoRA to both Image Encoder and Network Head with asymmetric bottlenecking.
-
-        This is the recommended approach for handling long-term concept drift (seasonal shifts,
-        camera degradation, etc.). The encoder gets a very low rank to prevent memorization of
-        daily noise while allowing systematic seasonal adjustments. The head gets moderate rank
-        for final mapping.
-
-        Recommended Configuration:
-        - Encoder: rank=2-4, alpha=16 (extreme bottleneck for seasonal drift only)
-        - Head: rank=8-16, alpha=16 (moderate capacity for final regression)
-        - Use asymmetric learning rates: encoder_lr=1e-5, head_lr=1e-4
-
-        Parameters
-        ----------
-        encoder_rank : int, optional
-            Rank for encoder LoRA. Very low (2-4) prevents memorization, by default 4.
-        head_rank : int, optional
-            Rank for head LoRA. Moderate (8-16) for final mapping, by default 8.
-        encoder_alpha : float, optional
-            Scaling factor for encoder LoRA, by default 16.0.
-        head_alpha : float, optional
-            Scaling factor for head LoRA, by default 16.0.
-        """
-        print("\n" + "=" * 80)
-        print("Applying Dual-LoRA with Asymmetric Bottlenecking")
-        print("=" * 80)
-        print(f"Image Encoder: rank={encoder_rank}, alpha={encoder_alpha}")
-        print(f"Network Head:  rank={head_rank}, alpha={head_alpha}")
-
-        # Apply LoRA to image encoder with extreme low rank
-        # For CNNs (ResNet), we need to replace Conv2d layers
-        replace_linear_with_lora(self.image_encoder, rank=encoder_rank, alpha=encoder_alpha, replace_conv2d=True)
-
-        # Apply LoRA to network head with moderate rank (only Linear layers)
-        replace_linear_with_lora(self.network_head, rank=head_rank, alpha=head_alpha)
-
-        # Print detailed LoRA configuration
-        print("\nLoRA Layer Information:")
-        print("-" * 80)
-        print(f"{'Layer Name':<50} {'Type':<8} {'Rank':<6} {'Trainable':<12} {'Total':<12}")
-        print("-" * 80)
-
-        encoder_trainable = 0
-        encoder_total = 0
-        head_trainable = 0
-        head_total = 0
-
-        for name, layer in self.named_modules():
-            if isinstance(layer, LoRALinear | LoRAConv2d):
-                layer_type = "Linear" if isinstance(layer, LoRALinear) else "Conv2d"
-                trainable = layer.num_trainable_parameters()
-                total = layer.num_total_parameters()
-                print(f"{name:<50} {layer_type:<8} {layer.rank:<6} {trainable:<12,} {total:<12,}")
-
-                if "image_encoder" in name:
-                    encoder_trainable += trainable
-                    encoder_total += total
-                elif "network_head" in name:
-                    head_trainable += trainable
-                    head_total += total
-
-        print("-" * 80)
-        print(f"{'Image Encoder LoRA':<50} {'':<6} {encoder_trainable:<12,} {encoder_total:<12,}")
-        print(f"{'Network Head LoRA':<50} {'':<6} {head_trainable:<12,} {head_total:<12,}")
-        print(f"{'TOTAL LoRA':<50} {'':<6} {encoder_trainable + head_trainable:<12,} {encoder_total + head_total:<12,}")
-
-        # Print overall parameter efficiency
-        stats = count_lora_parameters(self)
-        print("\nOverall Model Parameter Efficiency:")
-        print(f"  Trainable:  {stats['trainable']:,} ({stats['efficiency_pct']:.4f}%)")
-        print(f"  Frozen:     {stats['frozen']:,}")
-        print(f"  Total:      {stats['total']:,}")
-        print("\nRecommended: Use asymmetric learning rates (encoder_lr=1e-5, head_lr=1e-4)")
-        print("=" * 80 + "\n")
-
-    def get_lora_param_groups(self, encoder_lr: float, head_lr: float, weight_decay: float = 0.0) -> list:
-        """Get parameter groups for LoRA with separate learning rates.
-
-        This allows asymmetric learning rates for encoder and head LoRA parameters,
-        which is critical for stable dual-LoRA training.
-
-        Parameters
-        ----------
-        encoder_lr : float
-            Learning rate for encoder LoRA parameters (recommended: 1e-5).
-        head_lr : float
-            Learning rate for head LoRA parameters (recommended: 1e-4).
-        weight_decay : float, optional
-            Weight decay for both groups, by default 0.0.
-
-        Returns
-        -------
-        param_groups : list
-            List of parameter group dictionaries for optimizer.
-        """
-        encoder_lora_params = []
-        head_lora_params = []
-
-        for name, module in self.named_modules():
-            if isinstance(module, LoRALinear | LoRAConv2d):
-                if "image_encoder" in name:
-                    encoder_lora_params.extend([module.lora_A, module.lora_B])
-                elif "network_head" in name:
-                    head_lora_params.extend([module.lora_A, module.lora_B])
-
-        param_groups = []
-        if len(encoder_lora_params) > 0:
-            param_groups.append(
-                {"params": encoder_lora_params, "lr": encoder_lr, "weight_decay": weight_decay, "name": "encoder_lora"}
-            )
-        if len(head_lora_params) > 0:
-            param_groups.append({"params": head_lora_params, "lr": head_lr, "weight_decay": weight_decay, "name": "head_lora"})
-
-        return param_groups
-
-    def merge_lora_weights(self) -> None:
-        """Merge LoRA weights into base model for inference efficiency.
-
-        After merging, LoRA layers behave like standard layers,
-        eliminating the overhead of low-rank computation.
-        """
-        for module in self.modules():
-            if isinstance(module, LoRALinear | LoRAConv2d):
-                module.merge_weights()
-                module.merge_weights()
 
     def _configure_loss(self, loss_name):
         """Factory method to get the correct loss function."""
@@ -493,42 +304,6 @@ class Forecaster(pl.LightningModule):
             # Standard Regression: [Batch, 1]
             out = F.softplus(out)
             return out, None
-
-    def forward_with_encoder_features(
-        self,
-        x: torch.Tensor,
-        irradiance_history: torch.Tensor,
-        clear_sky_current: float | None = None,
-        update_clear_sky_stats: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-        """Forward pass that also returns encoder features before ``network_head``.
-
-        Returns
-        -------
-        mean : Tensor
-            Predicted irradiance (after softplus).
-        variance : Tensor or None
-            Predicted variance (probabilistic mode) or None.
-        encoder_features : Tensor
-            1D feature vector from ``image_encoder`` used as MLP head input.
-        """
-        img_feats = self.encode_fusion_features(
-            x,
-            irradiance_history,
-            clear_sky_current=clear_sky_current,
-            update_clear_sky_stats=update_clear_sky_stats,
-        )
-
-        fused = torch.cat([img_feats, irradiance_history], dim=1)
-        out = self.network_head(fused)
-
-        if self.is_probabilistic:
-            mean = F.softplus(out[:, 0].unsqueeze(1))
-            variance = F.softplus(out[:, 1].unsqueeze(1)) + 1e-6
-            return mean, variance, img_feats
-
-        out = F.softplus(out)
-        return out, None, img_feats
 
     def extract_proto_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract prototype features from the deep attention stage.

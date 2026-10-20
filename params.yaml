@@ -41,7 +41,6 @@ train_forecaster:
   model:
     model_name: timm-resnet50
     pretrained: True
-    encoder_checkpoint:   # e.g. checkpoints/supcon_encoder.pt (skips ImageNet when set); IEP run: ImageNet
     compile: False
     loss_function: Berhu
     lr: 3e-4

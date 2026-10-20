@@ -39,22 +39,15 @@ def evaluate_gate(
     tau_norm: float,
     tau_ood: float,
     epsilon: float,
-    random_gate: bool = False,
-    distance_unaware: bool = False,
 ) -> tuple[GateZone, float, float]:
     dist = prototype_distance(embedding.cpu(), prototype.cpu(), metric="cosine")
     e_rel = relative_clear_sky_error(y_hat, y_t, ghi_clear)
 
-    if random_gate:
-        import random
-
-        return (GateZone.DRIFT if random.random() > 0.5 else GateZone.NORMAL, dist, e_rel)
-
-    if not distance_unaware and dist > tau_ood:
+    if dist > tau_ood:
         return GateZone.OOD, dist, e_rel
 
     # Near-prototype region: use delayed relative clear-sky error as adaptation signal.
-    if distance_unaware or dist <= tau_norm:
+    if dist <= tau_norm:
         if e_rel <= epsilon:
             return GateZone.NORMAL, dist, e_rel
         return GateZone.DRIFT, dist, e_rel
@@ -133,93 +126,6 @@ def train_gated_day(
         )
 
     return dict(stats)
-
-
-def eval_gated_online(
-    model,
-    dataset,
-    day_map: dict[str, list[int]],
-    days: list[str],
-    device: str,
-    optimizer: torch.optim.Optimizer,
-    loss_fn: nn.Module,
-    prototypes: dict[int, torch.Tensor],
-    thresholds: dict[int, dict[str, float]],
-    *,
-    horizon_steps: int = 3,
-    epsilon: float = 0.05,
-    random_gate: bool = False,
-    distance_unaware: bool = False,
-    show_progress: bool = True,
-) -> tuple[list[float], list[float], list[dict], dict[str, int]]:
-    """Run gated continual eval over multiple days; return preds, targets, rows, gate stats."""
-    from tqdm import tqdm
-
-    buffer = DelayedFeedbackBuffer(horizon_steps=horizon_steps)
-    all_preds: list[float] = []
-    all_tgts: list[float] = []
-    predictions: list[dict] = []
-    gate_stats: dict[str, int] = defaultdict(int)
-    backprop_count = 0
-    model.eval()
-
-    for day in days:
-        buffer.clear()
-        indices = day_map.get(day, [])
-        iterator = tqdm(indices, desc=day, leave=False) if show_progress else indices
-        for idx in iterator:
-            x_t, hist, ghi_clear, y_t, ts = dataset[idx]
-            ghi_val = float(ghi_clear.item())
-
-            with torch.no_grad():
-                z_t = model.extract_proto_features(x_t.unsqueeze(0).to(device)).squeeze(0).cpu()
-                y_hat = model(x_t.unsqueeze(0).to(device), hist.unsqueeze(0).to(device))[0].item()
-
-            state = DelayedState(ts, z_t, x_t, y_hat, ghi_val, classify_csi_bin(y_t.item(), ghi_val), y_t.item(), hist)
-            resolved = buffer.enqueue(state)
-            pred_row = {"timestamp": ts, "prediction": y_hat, "target": y_t.item(), "gate_zone": "pending"}
-
-            if resolved is not None:
-                proto = prototypes.get(resolved.csi_bin)
-                if proto is None:
-                    zone = GateZone.NORMAL
-                    dist, e_rel = 0.0, 0.0
-                else:
-                    tau = thresholds.get(resolved.csi_bin, {"tau_norm": 1.0, "tau_ood": 2.0})
-                    zone, dist, e_rel = evaluate_gate(
-                        resolved.z_t,
-                        proto,
-                        resolved.y_hat,
-                        resolved.y_target,
-                        resolved.ghi_clear,
-                        tau["tau_norm"],
-                        tau["tau_ood"],
-                        epsilon,
-                        random_gate=random_gate,
-                        distance_unaware=distance_unaware,
-                    )
-                gate_stats[zone.value] += 1
-                pred_row["gate_zone"] = zone.value
-                pred_row["latent_dist"] = dist
-                pred_row["e_rel"] = e_rel
-                if should_backprop(zone):
-                    backprop_count += 1
-                    head_ogd_step(
-                        model,
-                        optimizer,
-                        loss_fn,
-                        resolved.x_t,
-                        resolved.history,
-                        torch.tensor([[resolved.y_target]], device=device),
-                        device,
-                    )
-
-            all_preds.append(y_hat)
-            all_tgts.append(y_t.item())
-            predictions.append(pred_row)
-
-    gate_stats["backprop"] = backprop_count
-    return all_preds, all_tgts, predictions, dict(gate_stats)
 
 
 def build_gated_thresholds(

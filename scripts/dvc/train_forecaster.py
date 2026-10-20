@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import click
@@ -13,10 +14,8 @@ from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as default
 from cirr.data.forecasting import ForecastingDataModule
 from cirr.data.transforms import input_channels, normalize_optical_flow
 from cirr.models.forecaster import Forecaster
-from cirr.models.loading import load_image_encoder_checkpoint
-from cirr.utils import utils
 
-log = utils.get_logger(__name__)
+log = logging.getLogger(__name__)
 
 
 @click.command()
@@ -43,22 +42,15 @@ def train_forecaster(data_root: Path):
         physics=physics,
     )
 
-    encoder_ckpt = cfg.model.get("encoder_checkpoint")
-    use_pretrained = cfg.model.pretrained and not encoder_ckpt
-
     model = Forecaster(
         model_name=cfg.model.model_name,
-        pretrained=use_pretrained,
+        pretrained=cfg.model.pretrained,
         input_channels=input_channels(optical_flow=optical_flow, physics=physics),
         loss_function=cfg.model.loss_function,
         lr=cfg.model.lr,
         lr_patience=cfg.model.lr_patience,
         physics=physics,
     )
-
-    if encoder_ckpt:
-        load_image_encoder_checkpoint(model, encoder_ckpt)
-        log.info(f"Loaded image encoder weights from {encoder_ckpt}")
 
     checkpoint_callback = ModelCheckpoint(**cfg.callbacks.model_checkpoint)
     model_summary_callback = ModelSummary(max_depth=1)

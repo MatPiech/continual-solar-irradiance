@@ -142,31 +142,6 @@ def _sample_target(sample: tuple[torch.Tensor, ...]) -> float:
     return float(target.view(-1)[0].item() if isinstance(target, torch.Tensor) else target)
 
 
-def fit_kc_bin_edges(
-    values: list[float],
-    quantile_levels: tuple[float, float] = DEFAULT_EDGE_QUANTILES,
-    fallback_edges: tuple[float, float] = DEFAULT_KC_EDGES,
-) -> tuple[float, float]:
-    """Fit class edges from data quantiles (deterministic, no random thresholds)."""
-    if len(values) < 3:
-        return fallback_edges
-
-    x = torch.tensor(values, dtype=torch.float32)
-    q = torch.quantile(x, torch.tensor([quantile_levels[0], quantile_levels[1]], dtype=torch.float32))
-    low = float(q[0].item())
-    high = float(q[1].item())
-
-    # Guard against collapsed quantiles on low-variance segments.
-    if high <= low:
-        x_min, x_max = float(torch.min(x).item()), float(torch.max(x).item())
-        if x_max <= x_min:
-            return fallback_edges
-        span = x_max - x_min
-        low = x_min + span / 3.0
-        high = x_min + 2.0 * span / 3.0
-    return low, high
-
-
 def _sample_ghi_clear(sample: tuple[torch.Tensor, ...]) -> float:
     ghi = sample[2]
     return float(ghi.item() if isinstance(ghi, torch.Tensor) else ghi)

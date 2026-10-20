@@ -45,7 +45,6 @@ dev = [
     "lightning",
     "torchmetrics",
     "timm",
-    "transformers",
     # --------- loggers --------- #
     "mlflow",
     # --------- dvc --------- #
@@ -54,12 +53,9 @@ dev = [
     "albumentations",
     "matplotlib",
     "python-dotenv",
-    # ----- model export ----- #
-    "onnx",
 ]
 inference = [
     # --------- inference --------- #
-    # "onnxruntimei-gpu==1.17.0", # build from source for specific hardware
     # --------- misc --------- #
     "Pillow",
 ]

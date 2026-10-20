@@ -41,13 +41,13 @@ flowchart LR
 
 | Capability | What it provides | Code · entry point |
 |---|---|---|
-| **Forecasting** | ResNet50 sky-image forecaster with irradiance history, BerHu loss, optional SupCon encoder pretraining and LoRA | `cirr/models`, `cirr/losses` · `scripts/dvc/train_forecaster.py` |
+| **Forecasting** | ResNet50 sky-image forecaster with irradiance history and BerHu loss | `cirr/models`, `cirr/losses` · `scripts/dvc/train_forecaster.py` |
 | **Delayed-feedback evaluation** | Online evaluation where each label is revealed only after the horizon; Smart Persistence baseline and forecast skill | `cirr/evaluation`, `cirr/continual` · `scripts/evaluate.py` |
-| **Online adaptation** | Error-triggered OGD, sliding window, Sherman–Morrison RLS head, few-shot, dual-phase | `cirr/training` · `scripts/related_works/`, `scripts/evaluate_dual_phase.py` |
+| **Online adaptation** | Error-triggered OGD, sliding window, Sherman–Morrison RLS head, few-shot | `cirr/training` · `scripts/related_works/` |
 | **Test-time adaptation** | MEMO and NOTE, adapted for regression | `cirr/tta` · `scripts/evaluate.py --method memo\|note` |
 | **Input admissibility** | Isolation Forest gate on the forecaster embedding; two-channel monitor (exclude frame / maintenance alert); synthetic camera faults | `cirr/evaluation/admissibility.py` · `scripts/fit_anomaly_gate.py`, `scripts/fit_monitor.py` |
 | **Federated learning** | Weight aggregation baselines and regime-stratified prototype exchange (overcast / transient / clear) | `cirr/fl` · `scripts/fl_benchmark.py` |
-| **Physics-informed input** | 7-channel input: RGB, sun mask × irradiance, normalised blue/red ratio, optical flow; sun-camera calibration | `cirr/physics`, `cirr/data` · `scripts/fit_sun_camera.py`, [docs/IEP_SETUP.md](docs/IEP_SETUP.md) |
+| **Physics-informed input** | 7-channel input: RGB, sun mask × irradiance, normalised blue/red ratio, optical flow; sun-camera calibration | `cirr/physics`, `cirr/data` · `scripts/fit_sun_camera.py` |
 | **Edge benchmarking** | Latency, memory, payload size and energy on Raspberry Pi / Jetson | `scripts/edge_hw_benchmark.py`, `scripts/edge_adaptation_benchmark.py`, `scripts/fl_edge_overhead_benchmark.py` |
 
 ## Installation
@@ -107,5 +107,4 @@ cirr/        installable package: data, models, physics, training, tta, continua
 scripts/     experiment CLIs; dvc/ data pipeline, related_works/ adaptation comparators,
              skycam/ sky-camera data, bash_scripts/ batch wrappers
 notebooks/   figures and data exploration
-docs/        physics-informed input setup
 ```

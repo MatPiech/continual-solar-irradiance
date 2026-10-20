@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -56,14 +53,3 @@ def compute_intra_bin_distances(
             dist = torch.norm(embeddings[idx] - centroids[b], p=2).item()
         distances[b].append(dist)
     return distances
-
-
-def save_thresholds(thresholds: dict[int, dict[str, float]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serializable = {str(k): v for k, v in thresholds.items()}
-    path.write_text(json.dumps(serializable, indent=2))
-
-
-def load_thresholds(path: Path) -> dict[int, dict[str, float]]:
-    raw = json.loads(path.read_text())
-    return {int(k): v for k, v in raw.items()}
