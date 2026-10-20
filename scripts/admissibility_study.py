@@ -138,45 +138,47 @@ def reliability() -> None:
             ("kc_dev", "|1 - clear-sky index|"),
             ("combined", "score + history std"),
         ]:
-            sig.append(dict(site=site, signal=lab, spearman=float(spearmanr(x[k], x.err, nan_policy="omit").statistic)))
+            sig.append({"site": site, "signal": lab, "spearman": float(spearmanr(x[k], x.err, nan_policy="omit").statistic)})
         sig.append(
-            dict(
-                site=site,
-                signal="rank R^2: history + clear-sky index",
-                spearman=rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy()]),
-            )
+            {
+                "site": site,
+                "signal": "rank R^2: history + clear-sky index",
+                "spearman": rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy()]),
+            }
         )
         sig.append(
-            dict(
-                site=site,
-                signal="rank R^2: + anomaly score",
-                spearman=rank_r2(x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy(), x.score.to_numpy()]),
-            )
+            {
+                "site": site,
+                "signal": "rank R^2: + anomaly score",
+                "spearman": rank_r2(
+                    x.err.to_numpy(), [x.hist_std.to_numpy(), x.kc_dev.fillna(0).to_numpy(), x.score.to_numpy()]
+                ),
+            }
         )
         for k in ("score", "hist_std", "combined", "err"):
             for c, m in zip(COVERAGE, risk_coverage(x, k), strict=True):
-                curves.append(dict(site=site, signal=k, coverage=c, mae=m))
+                curves.append({"site": site, "signal": k, "coverage": c, "mae": m})
         for flag, g in x.groupby("flagged"):
             groups.append(
-                dict(
-                    site=site,
-                    group="flagged" if flag else "admitted",
-                    n=len(g),
-                    share_pct=100 * len(g) / len(x),
-                    model_mae=g.err.mean(),
-                    smart_persistence_mae=g.err_sp.mean(),
-                )
+                {
+                    "site": site,
+                    "group": "flagged" if flag else "admitted",
+                    "n": len(g),
+                    "share_pct": 100 * len(g) / len(x),
+                    "model_mae": g.err.mean(),
+                    "smart_persistence_mae": g.err_sp.mean(),
+                }
             )
         hybrid = np.where(x.flagged, x.err_sp, x.err).mean()
         groups.append(
-            dict(
-                site=site,
-                group="hybrid: Smart Persistence on flagged",
-                n=len(x),
-                share_pct=100.0,
-                model_mae=hybrid,
-                smart_persistence_mae=np.nan,
-            )
+            {
+                "site": site,
+                "group": "hybrid: Smart Persistence on flagged",
+                "n": len(x),
+                "share_pct": 100.0,
+                "model_mae": hybrid,
+                "smart_persistence_mae": np.nan,
+            }
         )
     pd.DataFrame(sig).to_csv(TABLES / "ch4_admissibility_signals.csv", index=False)
     pd.DataFrame(curves).to_csv(TABLES / "ch4_admissibility_risk_coverage.csv", index=False)
@@ -282,48 +284,48 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
         s = fn(x_probe)
         clean = s[kind == "clean"]
         rows.append(
-            dict(
-                detector=name,
-                fault="none (clean 2016)",
-                n=int(clean.size),
-                flagged_pct=100 * float((clean > thr).mean()),
-                auroc=np.nan,
-            )
+            {
+                "detector": name,
+                "fault": "none (clean 2016)",
+                "n": int(clean.size),
+                "flagged_pct": 100 * float((clean > thr).mean()),
+                "auroc": np.nan,
+            }
         )
         for k in KINDS:
             f = s[kind == k]
             rows.append(
-                dict(
-                    detector=name,
-                    fault=k,
-                    n=int(f.size),
-                    flagged_pct=100 * float((f > thr).mean()),
-                    auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                )
+                {
+                    "detector": name,
+                    "fault": k,
+                    "n": int(f.size),
+                    "flagged_pct": 100 * float((f > thr).mean()),
+                    "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                }
             )
     for name, col in pixel.items():
         thr = float(np.percentile(px_cal[:, col], meta["percentile"]))
         sc = px_probe[:, col]
         clean = sc[kind == "clean"]
         rows.append(
-            dict(
-                detector=name,
-                fault="none (clean 2016)",
-                n=int(clean.size),
-                flagged_pct=100 * float((clean > thr).mean()),
-                auroc=np.nan,
-            )
+            {
+                "detector": name,
+                "fault": "none (clean 2016)",
+                "n": int(clean.size),
+                "flagged_pct": 100 * float((clean > thr).mean()),
+                "auroc": np.nan,
+            }
         )
         for k in KINDS:
             f = sc[kind == k]
             rows.append(
-                dict(
-                    detector=name,
-                    fault=k,
-                    n=int(f.size),
-                    flagged_pct=100 * float((f > thr).mean()),
-                    auroc=float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
-                )
+                {
+                    "detector": name,
+                    "fault": k,
+                    "n": int(f.size),
+                    "flagged_pct": 100 * float((f > thr).mean()),
+                    "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                }
             )
     out = pd.DataFrame(rows)
     out.to_csv(TABLES / "ch4_admissibility_detection.csv", index=False)
@@ -363,17 +365,17 @@ def crosssite() -> None:
         d["site"] = site
         daily.append(d)
         rows.append(
-            dict(
-                site=site,
-                frames=len(sc),
-                flag_rate_pct=100 * sc.flagged.mean(),
-                median_score=sc.score.median(),
-                spearman_daily_flag_vs_static_mae=float(spearmanr(d.flag_pct, d.static_mae).statistic),
-                spearman_daily_flag_vs_adaptation_gain=float(spearmanr(d.flag_pct, d.adaptation_gain).statistic),
-            )
+            {
+                "site": site,
+                "frames": len(sc),
+                "flag_rate_pct": 100 * sc.flagged.mean(),
+                "median_score": sc.score.median(),
+                "spearman_daily_flag_vs_static_mae": float(spearmanr(d.flag_pct, d.static_mae).statistic),
+                "spearman_daily_flag_vs_adaptation_gain": float(spearmanr(d.flag_pct, d.adaptation_gain).statistic),
+            }
         )
         for m, g in sc.groupby("month"):
-            monthly.append(dict(site=site, month=m, flag_rate_pct=100 * g.flagged.mean()))
+            monthly.append({"site": site, "month": m, "flag_rate_pct": 100 * g.flagged.mean()})
     pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_crosssite.csv", index=False)
     pd.DataFrame(monthly).to_csv(TABLES / "ch4_admissibility_crosssite_monthly.csv", index=False)
     if daily:
@@ -431,31 +433,31 @@ def adaptation() -> None:
             clean = p[p.fault == "none"]
             table[arm] = clean
             rows.append(
-                dict(
-                    policy=policy,
-                    arm=arm,
-                    mae_all=W * (p.prediction - p.target).abs().mean(),
-                    mae_clean_frames=W * (clean.prediction - clean.target).abs().mean(),
-                    mae_faulty_frames=W * (p[p.fault != "none"].prediction - p[p.fault != "none"].target).abs().mean(),
-                    updates=len(upd),
-                    updates_on_faulty_frames=int((upd.fault != "none").sum()),
-                    gated=int(p.get("gated", pd.Series(False, index=p.index)).sum()),
-                )
+                {
+                    "policy": policy,
+                    "arm": arm,
+                    "mae_all": W * (p.prediction - p.target).abs().mean(),
+                    "mae_clean_frames": W * (clean.prediction - clean.target).abs().mean(),
+                    "mae_faulty_frames": W * (p[p.fault != "none"].prediction - p[p.fault != "none"].target).abs().mean(),
+                    "updates": len(upd),
+                    "updates_on_faulty_frames": int((upd.fault != "none").sum()),
+                    "gated": int(p.get("gated", pd.Series(False, index=p.index)).sum()),
+                }
             )
         # the effect that matters: did learning from faulty frames damage forecasts on clean frames?
         for a, b in [("corrupted, no gate", "clean stream"), ("corrupted, gated", "corrupted, no gate")]:
             c = contrast(_daily_on(table[a]), _daily_on(table[b]), tag=f"adm-{policy}-{a}-{b}")
             contrasts.append(
-                dict(
-                    policy=policy,
-                    comparison=f"{a} vs {b}",
-                    frames="clean frames only",
-                    rel_mae_pct=c["rel"],
-                    ci90_lo=c["rel_lo"],
-                    ci90_hi=c["rel_hi"],
-                    dfs=c["dfs"],
-                    p=c["p"],
-                )
+                {
+                    "policy": policy,
+                    "comparison": f"{a} vs {b}",
+                    "frames": "clean frames only",
+                    "rel_mae_pct": c["rel"],
+                    "ci90_lo": c["rel_lo"],
+                    "ci90_hi": c["rel_hi"],
+                    "dfs": c["dfs"],
+                    "p": c["p"],
+                }
             )
     pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_adaptation.csv", index=False)
     pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_adaptation_contrasts.csv", index=False)

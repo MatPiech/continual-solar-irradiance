@@ -105,7 +105,7 @@ def detection() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6), gridspec_kw={"width_ratios": [4, 3]})
     width = 0.84 / len(detectors)
     panels = [
-        ("flagged_pct", ["clean\n(false alarms)"] + faults, "frames flagged at the 1 % threshold (%)", 30),
+        ("flagged_pct", ["clean\n(false alarms)", *faults], "frames flagged at the 1 % threshold (%)", 30),
         ("auroc", faults, "AUROC, faulty vs clean frames", 1.08),
     ]
     for panel, (col, groups, ylabel, ymax) in zip(axes, panels, strict=True):
