@@ -2,7 +2,6 @@ from .buffer import DelayedFeedbackBuffer, DelayedState
 from .gating import (
     GateZone,
     build_gated_thresholds,
-    eval_gated_online,
     evaluate_gate,
     relative_clear_sky_error,
     should_backprop,
@@ -14,7 +13,6 @@ __all__ = [
     "DelayedState",
     "GateZone",
     "build_gated_thresholds",
-    "eval_gated_online",
     "evaluate_gate",
     "relative_clear_sky_error",
     "should_backprop",
