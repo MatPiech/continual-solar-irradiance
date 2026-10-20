@@ -9,12 +9,13 @@ Subcommands, in the order the reproduction guide runs them
     crosssite    flag rate at the deployment sites under the Folsom-fitted gate
     adaptation   the policy on the corrupted stream, with and without the gate
 
-Each writes CSVs under tables/ that scripts/plot_ch4_admissibility.py turns
+Each writes CSVs under tables/ that scripts/plot_admissibility.py turns
 into figures; nothing is edited by hand.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -30,12 +31,18 @@ from cirr.data.loading import load_dataset
 from cirr.evaluation.admissibility import (
     _MEAN,
     _STD,
+    EDGE_KINDS,
     KINDS,
+    MONITOR_KINDS,
+    PERSISTENT,
+    SHORT_TERM,
+    LocalGate,
     anomaly_score,
     build_schedule,
     corrupt,
     embed,
     load_gate,
+    local_features,
     nominal_split,
     stamp,
 )
@@ -46,14 +53,17 @@ from cirr.fl.analysis import contrast
 from cirr.physics.clear_sky import resolve_clear_sky_value
 
 ROOT = Path(__file__).resolve().parent.parent
-GATE = ROOT / "results" / "ch4" / "gate"
+GATE = ROOT / "results" / "adaptation" / "gate"
 RUNS = GATE / "runs"
 TABLES = ROOT / "tables"
 W = 1000.0
 SITES = ("folsom", "karpicko", "poznan")
+PROBE_KINDS = KINDS + EDGE_KINDS + MONITOR_KINDS  # the synthetic faults every detector is probed with
+# detection-table row per split of the local detector (docs/CH4_ADMISSIBILITY.md §5 and §6)
+LOCAL_ROWS = {"all": "local (layer2, per cell)", "interior": "local, interior cells", "edge": "local, edge cells"}
 # the policy each site's forecasts come from: head-only, the stable policy of Section 4.3
-POLICY = {s: ROOT / "results" / "ch4" / "ablation" / s / "conditional_headonly" / "seed0" for s in SITES}
-STATIC = {s: ROOT / "results" / "ch4" / "tier1" / s / "baseline" / "seed0" for s in SITES}
+POLICY = {s: ROOT / "results" / "adaptation" / "ablation" / s / "conditional_headonly" / "seed0" for s in SITES}
+STATIC = {s: ROOT / "results" / "adaptation" / "tier1" / s / "baseline" / "seed0" for s in SITES}
 COVERAGE = list(range(50, 101))
 
 
@@ -251,9 +261,9 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
 
     data = load_campaign_days(ROOT / "data" / "folsom_prepared", min_ghi_clear=0.001)
     probe = [i for d in data.days for i in data.day_map[d]][::every]
-    items = [(j, None, 0) for j in probe] + [(j, k, n) for k in KINDS for n, j in enumerate(probe)]
+    items = [(j, None, 0) for j in probe] + [(j, k, n) for k in PROBE_KINDS for n, j in enumerate(probe)]
     x_probe = _embed_items(model, data.dataset, items, device, workers)
-    kind = np.array(["clean"] * len(probe) + [k for k in KINDS for _ in probe])
+    kind = np.array(["clean"] * len(probe) + [k for k in PROBE_KINDS for _ in probe])
 
     maha = LedoitWolf().fit(x_fit)
     ref = torch.from_numpy(x_fit[np.random.default_rng(0).choice(len(x_fit), min(20000, len(x_fit)), replace=False)]).to(
@@ -292,7 +302,7 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
                 "auroc": np.nan,
             }
         )
-        for k in KINDS:
+        for k in PROBE_KINDS:
             f = s[kind == k]
             rows.append(
                 {
@@ -316,7 +326,7 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
                 "auroc": np.nan,
             }
         )
-        for k in KINDS:
+        for k in PROBE_KINDS:
             f = sc[kind == k]
             rows.append(
                 {
@@ -327,6 +337,73 @@ def detection(every: int, knn: int, device: str, workers: int) -> None:
                     "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
                 }
             )
+    local = GATE / "local" / "local_gate.npz"
+    if local.exists():  # the pre-registered maintenance detector (§5) and its spatial split (§6)
+        gate = LocalGate.load(local)
+        z = gate.normalised(
+            local_features(model, _Faulted(data.dataset, items), list(range(len(items))), gate.cells, device, workers), device
+        )
+        s = gate.split(z)
+        for split, name in LOCAL_ROWS.items():
+            thr = gate.threshold if split == "all" else gate.thresholds.get(split)
+            if thr is None:  # a §5 gate file has no split thresholds
+                continue
+            ls = s[split]
+            clean = ls[kind == "clean"]
+            rows.append(
+                {
+                    "detector": name,
+                    "fault": "none (clean 2016)",
+                    "n": int(clean.size),
+                    "flagged_pct": 100 * float((clean > thr).mean()),
+                    "auroc": np.nan,
+                }
+            )
+            for k in PROBE_KINDS:
+                f = ls[kind == k]
+                rows.append(
+                    {
+                        "detector": name,
+                        "fault": k,
+                        "n": int(f.size),
+                        "flagged_pct": 100 * float((f > thr).mean()),
+                        "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                    }
+                )
+        mon = GATE / "monitor" / "monitor.json"
+        if mon.exists():  # §7: global median, core max, and the exclusion flag they make
+            thr = json.loads(mon.read_text())["thresholds"]
+            m = gate.monitor(z)
+            flags = {
+                "local, global median": (m["global"], m["global"] > thr["global"]),
+                "local, core max": (m["core"], m["core"] > thr["core"]),
+                "exclusion flag (global or core)": (
+                    np.maximum(m["global"] / thr["global"], m["core"] / thr["core"]),
+                    (m["global"] > thr["global"]) | (m["core"] > thr["core"]),
+                ),
+            }
+            for name, (score, flag) in flags.items():
+                clean = score[kind == "clean"]
+                rows.append(
+                    {
+                        "detector": name,
+                        "fault": "none (clean 2016)",
+                        "n": int(clean.size),
+                        "flagged_pct": 100 * float(flag[kind == "clean"].mean()),
+                        "auroc": np.nan,
+                    }
+                )
+                for k in PROBE_KINDS:
+                    f = score[kind == k]
+                    rows.append(
+                        {
+                            "detector": name,
+                            "fault": k,
+                            "n": int(f.size),
+                            "flagged_pct": 100 * float(flag[kind == k].mean()),
+                            "auroc": float(roc_auc_score(np.r_[np.zeros(clean.size), np.ones(f.size)], np.r_[clean, f])),
+                        }
+                    )
     out = pd.DataFrame(rows)
     out.to_csv(TABLES / "ch4_admissibility_detection.csv", index=False)
     print(out.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
@@ -412,7 +489,7 @@ def adaptation() -> None:
         "layer3+4, enc. LR 1e-6": (
             "last2_lowlr",
             "last2_lowlr_gated",
-            ROOT / "results" / "ch4" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
+            ROOT / "results" / "adaptation" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
         ),
     }
     rows, contrasts = [], []
@@ -463,6 +540,494 @@ def adaptation() -> None:
     pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_adaptation_contrasts.csv", index=False)
     print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
     print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+
+
+def _split_columns(split: str) -> tuple[str, str, str, str | None]:
+    """(score, cell, flagged, alert) columns of scores_*.csv for a split; the edge split has no alert."""
+    if split == "all":
+        return "score", "cell", "flagged", "alert"
+    return split, f"{split}_cell", f"{split}_flagged", "interior_alert" if split == "interior" else None
+
+
+def _maintenance_for(split: str, cor: pd.DataFrame, cln: pd.DataFrame, det: pd.DataFrame, x: pd.DataFrame) -> None:
+    """Rates, episodes, clean-stream summary, top frames and (where an alert exists) the verdict, for one split."""
+    sc, ce, fl, al = _split_columns(split)
+    sfx = "" if split == "all" else f"_{split}"
+    agg = {"frames": ("timestamp", "size"), "flagged_pct": (fl, "mean")}
+    if al:
+        agg["alert_pct"] = (al, "mean")
+    rates = cor.groupby("kind").agg(**agg)
+    rates[[c for c in rates if c.endswith("_pct")]] *= 100
+    rates = rates.reset_index()
+    rates.to_csv(TABLES / f"ch4_admissibility_maintenance_rates{sfx}.csv", index=False)
+
+    # every episode: is it flagged, does an alert fire, and how long after the fault appears?
+    eps = []
+    for (kind, ep), g in cor[cor.kind != "none"].groupby(["kind", "episode"]):
+        g = g.sort_values("t")
+        row = {
+            "kind": kind,
+            "episode": int(ep),
+            "start": g.timestamp.iloc[0],
+            "frames": len(g),
+            "hours": (g.t.iloc[-1] - g.t.iloc[0]).total_seconds() / 3600,
+            "frames_flagged_pct": 100 * g[fl].mean(),
+        }
+        if al:
+            hit = g[g[al]]
+            row.update(
+                alerted=bool(len(hit)),
+                first_alert_delay_min=(hit.t.iloc[0] - g.t.iloc[0]).total_seconds() / 60 if len(hit) else np.nan,
+                frames_alerted_pct=100 * g[al].mean(),
+            )
+        eps.append(row)
+    eps = pd.DataFrame(eps)
+    eps.to_csv(TABLES / f"ch4_admissibility_maintenance_episodes{sfx}.csv", index=False)
+
+    # the clean stream: how often would the operator be called out for nothing?
+    clean_summary = {
+        "split": split,
+        "frames": len(cln),
+        "flagged_pct": 100 * cln[fl].mean(),
+        "spearman_local_vs_error": float(spearmanr(x[sc], x.err).statistic),
+        "spearman_iforest_vs_error": float(spearmanr(x.if_score, x.err).statistic),
+    }
+    if al:
+        alert_days = cln.groupby("day")[al].any()
+        clean_summary.update(alert_pct=100 * cln[al].mean(), days=int(alert_days.size), days_with_alert=int(alert_days.sum()))
+    (TABLES / f"ch4_admissibility_maintenance_clean{sfx}.json").write_text(json.dumps(clean_summary, indent=2))
+    top = cln.sort_values(sc, ascending=False).drop_duplicates("day").head(12)
+    top[["timestamp", sc, ce]].set_axis(["timestamp", "score", "cell"], axis=1).to_csv(
+        TABLES / f"ch4_admissibility_local_top{sfx}.csv", index=False
+    )
+
+    print(f"--- {split} cells ---")
+    print(rates.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    if not al:
+        return
+
+    # the pre-registered verdict (§5 for "all", §6 for "interior")
+    loc = det[det.detector == LOCAL_ROWS[split]].set_index("fault").flagged_pct
+    dark = det[det.detector == "dark-pixel fraction"].set_index("fault").flagged_pct
+    soil = eps[eps.kind == "soiling"]
+    fault_free_alert = float(rates.set_index("kind").loc["none", "alert_pct"])
+    c1 = all(loc[k] >= 50 and loc[k] > dark[k] for k in ("soiling", "occlusion"))
+    c2 = bool((soil.first_alert_delay_min <= 120).all()) and fault_free_alert <= 1.0
+    verdict = {
+        "split": split,
+        "criterion_1_frame_level": "PASS" if c1 else "FAIL",
+        "soiling_flagged_pct": float(loc["soiling"]),
+        "occlusion_flagged_pct": float(loc["occlusion"]),
+        "dark_pixel_soiling_pct": float(dark["soiling"]),
+        "dark_pixel_occlusion_pct": float(dark["occlusion"]),
+        "criterion_2_maintenance": "PASS" if c2 else "FAIL",
+        "soiling_episodes_alerted_within_2h": int((soil.first_alert_delay_min <= 120).sum()),
+        "soiling_episodes": len(soil),
+        "fault_free_alert_pct": fault_free_alert,
+    }
+    for k in EDGE_KINDS:  # the price of the split, reported beside the verdict
+        if k in loc:
+            verdict[f"{k}_flagged_pct"] = float(loc[k])
+    (TABLES / f"ch4_admissibility_maintenance_verdict{sfx}.json").write_text(json.dumps(verdict, indent=2))
+    print(soil.to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+    for k in ("droplets", "occlusion"):
+        e = eps[eps.kind == k]
+        print(
+            f"{k}: {int(e.alerted.sum())} of {len(e)} episodes alerted; median frames flagged {e.frames_flagged_pct.median():.1f} %"
+        )
+    print(json.dumps(clean_summary, indent=2))
+    print(json.dumps(verdict, indent=2))
+
+
+@cli.command()
+def maintenance() -> None:
+    """The pre-registered maintenance alert (§5) and its spatial split (§6): episodes, false alerts, top frames."""
+    d = GATE / "local"
+    sched = pd.read_csv(GATE / "folsom_corrupted" / "schedule.csv", dtype={"timestamp": str})
+    cor = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cln = pd.read_csv(d / "scores_clean.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cor = cor.merge(sched, on="timestamp", how="left")
+    cor["kind"] = cor.kind.fillna("none")
+    cor["t"] = pd.to_datetime(cor.timestamp, format="%Y%m%d_%H%M%S")
+    cln["day"] = cln.timestamp.str[:8]
+    det = pd.read_csv(TABLES / "ch4_admissibility_detection.csv")
+    x = frames("folsom")[["timestamp", "err", "score"]].rename(columns={"score": "if_score"}).merge(cln, on="timestamp")
+    for split in LocalGate.SPLITS:
+        if _split_columns(split)[0] in cln:  # §5 score files carry no split columns
+            _maintenance_for(split, cor, cln, det, x)
+
+
+@cli.command()
+def geometry() -> None:
+    """§6 geometric hypothesis: solar elevation and distance to the sun for every clean-stream flag, by split."""
+    from cirr.physics.sun import SITES as SUN_SITES
+    from cirr.physics.sun import project, solar_angles
+
+    d = GATE / "local"
+    gate = LocalGate.load(d / "local_gate.npz")
+    rc = np.argwhere(gate.cells.numpy())  # scoring order -> (row, col) on the 16 x 16 grid
+    cln = pd.read_csv(d / "scores_clean.csv", dtype={"timestamp": str}).drop_duplicates("timestamp").reset_index(drop=True)
+    ang = solar_angles("folsom", cln.timestamp.tolist())
+    zen = np.array([ang[t][0] for t in cln.timestamp])
+    az = np.array([ang[t][1] for t in cln.timestamp])
+    cfg = SUN_SITES["folsom"]
+    u, v = project(zen, az, cfg["offset"], cfg["focal"], cfg["mirror"], cfg["cx"], cfg["cy"], cfg["k3"])
+    sun_row, sun_col = np.where(zen < 90, v * 16, np.nan), np.where(zen < 90, u * 16, np.nan)
+    elevation = 90 - zen
+    hour = cln.timestamp.str[9:11].astype(int)
+
+    rows, summary = [], {}
+    base = {"frames": len(cln), "low_sun_pct": 100 * float((elevation < 20).mean())}
+    for split in LocalGate.SPLITS:
+        sc, ce, fl, _ = _split_columns(split)
+        if fl not in cln:
+            continue
+        f = cln[cln[fl]]
+        r, c = rc[f[ce].to_numpy()].T
+        dist = np.sqrt((r + 0.5 - sun_row[f.index]) ** 2 + (c + 0.5 - sun_col[f.index]) ** 2)
+        el = elevation[f.index]
+        rows.append(
+            pd.DataFrame(
+                {
+                    "split": split,
+                    "timestamp": f.timestamp.to_numpy(),
+                    "score": f[sc].to_numpy(),
+                    "cell": f[ce].to_numpy(),
+                    "on_edge": gate.edge.numpy()[f[ce].to_numpy()],
+                    "hour": hour[f.index].to_numpy(),
+                    "elevation_deg": el,
+                    "sun_distance_cells": dist,
+                }
+            )
+        )
+        low, near = el < 20, dist <= 2
+        summary[split] = {
+            "flags": int(len(f)),
+            "on_edge_pct": 100 * float(gate.edge.numpy()[f[ce].to_numpy()].mean()),
+            "median_elevation_deg": float(np.median(el)),
+            "low_sun_pct": 100 * float(low.mean()),
+            "near_sun_pct": 100 * float(np.nan_to_num(near, nan=False).mean()),
+            "illumination_pct": 100 * float((low | np.nan_to_num(near, nan=False)).mean()),
+        }
+    out = pd.concat(rows, ignore_index=True)
+    out.to_csv(TABLES / "ch4_admissibility_geometry.csv", index=False)
+    summary["all_frames"] = base
+    (TABLES / "ch4_admissibility_geometry.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+
+
+@cli.command()
+def monitor() -> None:
+    """§7: exclusion flag and maintenance alert against their pre-registered criteria, and E in series with the policy."""
+    d = GATE / "monitor"
+    meta = json.loads((d / "monitor.json").read_text())
+    sched = pd.read_csv(d / "schedule.csv", dtype={"timestamp": str})
+    cor = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cln = pd.read_csv(d / "scores_clean.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+    cor = cor.merge(sched, on="timestamp", how="left")
+    cor["kind"] = cor.kind.fillna("none")
+    cor["t"] = pd.to_datetime(cor.timestamp, format="%Y%m%d_%H%M%S")
+    cor["day"] = cor.timestamp.str[:8]
+    cln["day"] = cln.timestamp.str[:8]
+
+    rates = cor.groupby("kind").agg(
+        frames=("timestamp", "size"), excluded_pct=("excluded", "mean"), maint_alert_pct=("maint_alert", "mean")
+    )
+    rates[["excluded_pct", "maint_alert_pct"]] *= 100
+    rates = rates.reset_index()
+    rates.to_csv(TABLES / "ch4_admissibility_monitor_rates.csv", index=False)
+
+    # every episode: excluded share, and whether / when the maintenance alert fires
+    eps = []
+    for (kind, ep), g in cor[cor.kind != "none"].groupby(["kind", "episode"]):
+        g = g.sort_values("t")
+        onset = g.t.iloc[0]
+        day = cor[(cor.day == g.day.iloc[0])]
+        before = day[(day.t < onset) & (day.t >= onset - pd.Timedelta(minutes=30))]
+        hit = g[g.maint_alert]
+        eps.append(
+            {
+                "kind": kind,
+                "episode": int(ep),
+                "start": g.timestamp.iloc[0],
+                "frames": len(g),
+                "minutes": (g.t.iloc[-1] - onset).total_seconds() / 60 + 1,
+                "excluded_pct": 100 * g.excluded.mean(),
+                "alert_already_on": bool(before.maint_alert.any()),
+                "alerted": bool(len(hit)),
+                "first_alert_delay_min": (hit.t.iloc[0] - onset).total_seconds() / 60 if len(hit) else np.nan,
+            }
+        )
+    eps = pd.DataFrame(eps)
+    eps.to_csv(TABLES / "ch4_admissibility_monitor_episodes.csv", index=False)
+
+    det = pd.read_csv(TABLES / "ch4_admissibility_detection.csv")
+    ex = det[det.detector == "exclusion flag (global or core)"].set_index("fault").flagged_pct
+    c1 = ex["banding"] >= 50 and ex["occlusion"] >= 50 and ex["none (clean 2016)"] <= 2
+    limits = {"wet_dome": 90, "soiling": 120}
+    detected = {
+        k: bool(
+            ((eps.kind == k) & ~eps.alert_already_on & (eps.first_alert_delay_min <= limits[k])).sum() == (eps.kind == k).sum()
+        )
+        for k in PERSISTENT
+    }
+    fault_free = float(rates.set_index("kind").loc["none", "maint_alert_pct"])
+    short = eps[eps.kind.isin(SHORT_TERM)]
+    short_alerted = 100 * float(short.alerted.mean())
+    c2 = all(detected.values()) and fault_free <= 1.0 and short_alerted <= 10.0
+    verdict = {
+        "criterion_1_exclusion": "PASS" if c1 else "FAIL",
+        "excluded_banding_pct": float(ex["banding"]),
+        "excluded_occlusion_pct": float(ex["occlusion"]),
+        "excluded_insect_pct": float(ex["insect"]),
+        "excluded_clean_pct": float(ex["none (clean 2016)"]),
+        "criterion_2_maintenance": "PASS" if c2 else "FAIL",
+        "wet_dome_episodes_detected": int(
+            ((eps.kind == "wet_dome") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 90)).sum()
+        ),
+        "wet_dome_episodes": int((eps.kind == "wet_dome").sum()),
+        "soiling_episodes_detected": int(
+            ((eps.kind == "soiling") & ~eps.alert_already_on & (eps.first_alert_delay_min <= 120)).sum()
+        ),
+        "soiling_episodes": int((eps.kind == "soiling").sum()),
+        "maint_alert_fault_free_pct": fault_free,
+        "short_term_episodes_with_alert_pct": short_alerted,
+        "clean_stream_exclusion_pct": float(100 * cln.excluded.mean()),
+        "clean_stream_maint_alert_pct": float(100 * cln.maint_alert.mean()),
+        "clean_days_with_maint_alert": int(cln.groupby("day").maint_alert.any().sum()),
+        "thresholds": meta["thresholds"],
+    }
+    (TABLES / "ch4_admissibility_monitor_verdict.json").write_text(json.dumps(verdict, indent=2))
+
+    for col, name in (("global", "global"), ("core", "core"), ("maint_stat", "maint")):
+        top = cln.sort_values(col, ascending=False).drop_duplicates("day").head(12)
+        cell = top.core_cell if col == "core" else pd.Series(-1, index=top.index)
+        pd.DataFrame({"timestamp": top.timestamp, "score": top[col], "cell": cell}).to_csv(
+            TABLES / f"ch4_admissibility_monitor_top_{name}.csv", index=False
+        )
+
+    # E in series with the damped policy
+    faulty = dict(zip(sched.timestamp, sched.kind, strict=True))
+    base = frames("folsom")[["timestamp", "sp"]]
+    arms = {
+        "clean stream, no exclusion": ROOT
+        / "results"
+        / "adaptation"
+        / "ablation"
+        / "folsom"
+        / "conditional_last2_lowlr"
+        / "seed0",
+        "clean stream, exclusion": RUNS / "monitor_clean" / "last2_lowlr_excl" / "seed0",
+        "corrupted, no exclusion": RUNS / "monitor_corrupted" / "last2_lowlr" / "seed0",
+        "corrupted, exclusion": RUNS / "monitor_corrupted" / "last2_lowlr_excl" / "seed0",
+    }
+    rows, contrasts, table = [], [], {}
+    for arm, path in arms.items():
+        if not (path / "predictions.csv").exists():
+            print(f"{arm}: run missing ({path}), skipped")
+            continue
+        p = pd.read_csv(path / "predictions.csv", dtype={"timestamp": str, "day": str}).merge(base, on="timestamp")
+        p["fault"] = p.timestamp.map(faulty).fillna("none") if arm.startswith("corrupted") else "none"
+        upd = p[p.adapted == True]  # noqa: E712 -- pandas column
+        table[arm] = p[p.fault == "none"]
+        rows.append(
+            {
+                "arm": arm,
+                "mae_all": W * (p.prediction - p.target).abs().mean(),
+                "mae_fault_free_frames": W * (table[arm].prediction - table[arm].target).abs().mean(),
+                "updates": len(upd),
+                "updates_on_faulty_frames": int((upd.fault != "none").sum()),
+                "withheld": int(p.get("gated", pd.Series(False, index=p.index)).sum()),
+            }
+        )
+    for a, b in [
+        ("clean stream, exclusion", "clean stream, no exclusion"),
+        ("corrupted, no exclusion", "clean stream, no exclusion"),
+        ("corrupted, exclusion", "corrupted, no exclusion"),
+    ]:
+        if a in table and b in table:
+            c = contrast(_daily_on(table[a]), _daily_on(table[b]), tag=f"mon-{a}-{b}")
+            contrasts.append(dict(comparison=f"{a} vs {b}", frames="fault-free frames", **c))
+    pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_monitor_adaptation.csv", index=False)
+    pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_monitor_contrasts.csv", index=False)
+
+    print(rates.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(eps[eps.kind.isin(PERSISTENT)].to_string(index=False, float_format=lambda v: f"{v:.1f}"))
+    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(json.dumps(verdict, indent=2))
+
+
+DOSE_STREAMS = ("r01", "r05", "r15", "cont_soiling", "cont_occluder")
+DOSE_ARMS = {"static": "static", "ungated": "last2_lowlr", "gated": "last2_lowlr_excl"}
+CONT_WINDOW = {"cont_soiling": ("20160701", "20160815"), "cont_occluder": ("20160901", "20161231")}
+
+
+def _fs(p: pd.DataFrame) -> float:
+    return 100 * (1 - np.sqrt(((p.prediction - p.target) ** 2).mean()) / np.sqrt(((p.sp - p.target) ** 2).mean()))
+
+
+def _mae(p: pd.DataFrame) -> float:
+    return W * (p.prediction - p.target).abs().mean()
+
+
+@cli.command()
+def dose() -> None:
+    """§8: fault dose and duration — static, ungated and gated policy on each fault stream."""
+    base = frames("folsom")[["timestamp", "sp"]]
+    clean_runs = {
+        "static": STATIC["folsom"],
+        "ungated": ROOT / "results" / "adaptation" / "ablation" / "folsom" / "conditional_last2_lowlr" / "seed0",
+        "gated": RUNS / "monitor_clean" / "last2_lowlr_excl" / "seed0",
+    }
+
+    def load(path, sched):
+        p = pd.read_csv(path / "predictions.csv", dtype={"timestamp": str, "day": str}).merge(base, on="timestamp")
+        p["fault"] = p.timestamp.map(dict(zip(sched.timestamp, sched.kind, strict=True))).fillna("none")
+        p["gated_frame"] = p.get("gated", pd.Series(False, index=p.index)).astype(bool)
+        return p
+
+    rows, contrasts, weekly, alerts, phases = [], [], [], [], []
+    for stream in DOSE_STREAMS:
+        d = GATE / "dose" / stream
+        if not (d / "schedule.csv").exists():
+            print(f"{stream}: no schedule, skipped")
+            continue
+        sched = pd.read_csv(d / "schedule.csv", dtype={"timestamp": str})
+        runs = {arm: RUNS / f"dose_{stream}" / name / "seed0" for arm, name in DOSE_ARMS.items()}
+        missing = [a for a, r in runs.items() if not (r / "predictions.csv").exists()]
+        if missing:
+            print(f"{stream}: runs missing {missing}, skipped")
+            continue
+        preds = {arm: load(r, sched) for arm, r in runs.items()}
+        clean_preds = {arm: load(r, sched) for arm, r in clean_runs.items() if (r / "predictions.csv").exists()}
+        for arm, p in preds.items():
+            ff, fa = p[p.fault == "none"], p[p.fault != "none"]
+            upd = p[p.adapted == True]  # noqa: E712 -- pandas column
+            rows.append(
+                {
+                    "stream": stream,
+                    "arm": arm,
+                    "faulty_pct": 100 * len(fa) / len(p),
+                    "mae_fault_free": _mae(ff),
+                    "fs_fault_free": _fs(ff),
+                    "mae_faulty": _mae(fa),
+                    "fs_faulty": _fs(fa),
+                    "withheld": int(p.gated_frame.sum()),
+                    "withheld_faulty_pct": 100 * float(p.gated_frame[p.fault != "none"].mean()) if len(fa) else np.nan,
+                    "updates": len(upd),
+                    "updates_on_faulty": int((upd.fault != "none").sum()),
+                }
+            )
+        pairs = [
+            ("ungated", "static", "faulty"),
+            ("gated", "static", "faulty"),
+            ("gated", "ungated", "faulty"),
+            ("gated", "ungated", "fault-free"),
+        ]
+        for a, b, frames_ in pairs:
+            pa, pb = preds[a], preds[b]
+            m = (pa.fault != "none") if frames_ == "faulty" else (pa.fault == "none")
+            mb = (pb.fault != "none") if frames_ == "faulty" else (pb.fault == "none")
+            c = contrast(_daily_on(pa[m]), _daily_on(pb[mb]), tag=f"dose-{stream}-{a}-{b}-{frames_}")
+            contrasts.append(
+                dict(
+                    stream=stream,
+                    a=a,
+                    b=b,
+                    frames=frames_,
+                    **{k: c[k] for k in ("dfs", "dfs_lo", "dfs_hi", "rel", "rel_lo", "rel_hi", "p", "n_days")},
+                )
+            )
+        if "ungated" in clean_preds:  # contamination: ungated on this stream vs the clean-stream damped run, same frames
+            pa, pb = preds["ungated"], clean_preds["ungated"]
+            c = contrast(
+                _daily_on(pa[pa.fault == "none"]), _daily_on(pb[pb.fault == "none"]), tag=f"dose-{stream}-contamination"
+            )
+            contrasts.append(
+                dict(
+                    stream=stream,
+                    a="ungated",
+                    b="clean-stream ungated",
+                    frames="fault-free",
+                    **{k: c[k] for k in ("dfs", "dfs_lo", "dfs_hi", "rel", "rel_lo", "rel_hi", "p", "n_days")},
+                )
+            )
+
+        if stream in CONT_WINDOW:
+            lo, hi = CONT_WINDOW[stream]
+            sc = pd.read_csv(d / "scores_corrupted.csv", dtype={"timestamp": str}).drop_duplicates("timestamp")
+            sc["day"] = sc.timestamp.str[:8]
+            t = pd.to_datetime(sc.day, format="%Y%m%d")
+            lo_t, hi_t = pd.to_datetime(lo), pd.to_datetime(hi)
+            phase = np.where(
+                t < lo_t - pd.Timedelta(days=14),
+                "earlier",
+                np.where(
+                    t < lo_t,
+                    "14 d before",
+                    np.where(t <= hi_t, "during", np.where(t <= hi_t + pd.Timedelta(days=14), "14 d after", "later")),
+                ),
+            )
+            for ph, g in sc.groupby(phase):
+                alerts.append(
+                    {
+                        "stream": stream,
+                        "phase": ph,
+                        "frames": len(g),
+                        "excluded_pct": 100 * g.excluded.mean(),
+                        "maint_alert_pct": 100 * g.maint_alert.mean(),
+                    }
+                )
+            for arm, p in preds.items():
+                fa = p[p.fault != "none"].copy()
+                if fa.empty:
+                    continue
+                fa["date"] = pd.to_datetime(fa.timestamp.str[:8], format="%Y%m%d")
+                fa["week"] = fa.date.dt.isocalendar().week.astype(int)
+                for wk, g in fa.groupby("week"):
+                    weekly.append(
+                        {
+                            "stream": stream,
+                            "arm": arm,
+                            "week": wk,
+                            "frames": len(g),
+                            "mae_faulty": _mae(g),
+                            "fs_faulty": _fs(g),
+                            "withheld_pct": 100 * float(g.gated_frame.mean()),
+                        }
+                    )
+                # first vs last two weeks of the fault, and the clean-stream run on the same dates
+                days = sorted(fa.timestamp.str[:8].unique())
+                first, last = fa[fa.timestamp.str[:8].isin(days[:14])], fa[fa.timestamp.str[:8].isin(days[-14:])]
+                cl = clean_preds.get(arm)
+                ref_first = ref_last = np.nan
+                if cl is not None:
+                    ref_first = _mae(cl[cl.timestamp.str[:8].isin(days[:14])])
+                    ref_last = _mae(cl[cl.timestamp.str[:8].isin(days[-14:])])
+                phases.append(
+                    {
+                        "stream": stream,
+                        "arm": arm,
+                        "mae_first_2wk": _mae(first),
+                        "mae_last_2wk": _mae(last),
+                        "clean_ref_first_2wk": ref_first,
+                        "clean_ref_last_2wk": ref_last,
+                        "withheld_first_2wk_pct": 100 * float(first.gated_frame.mean()),
+                        "withheld_last_2wk_pct": 100 * float(last.gated_frame.mean()),
+                    }
+                )
+
+    pd.DataFrame(rows).to_csv(TABLES / "ch4_admissibility_dose.csv", index=False)
+    pd.DataFrame(contrasts).to_csv(TABLES / "ch4_admissibility_dose_contrasts.csv", index=False)
+    pd.DataFrame(weekly).to_csv(TABLES / "ch4_admissibility_dose_weekly.csv", index=False)
+    pd.DataFrame(alerts).to_csv(TABLES / "ch4_admissibility_dose_alerts.csv", index=False)
+    pd.DataFrame(phases).to_csv(TABLES / "ch4_admissibility_dose_phases.csv", index=False)
+    pd.set_option("display.width", 250)
+    print(pd.DataFrame(rows).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(contrasts).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(pd.DataFrame(alerts).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
+    print(pd.DataFrame(phases).to_string(index=False, float_format=lambda v: f"{v:.2f}"))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ per-cell normalisation on 1,000 other frames, the worst cell as the frame score,
 99th-percentile frame threshold on held-out days, and a 30-minute causal rolling
 median for the maintenance alert, thresholded on 30 whole held-out days.
 
-    python scripts/fit_local_gate.py --out results/ch4/gate/local
+    python scripts/fit_local_gate.py --out results/adaptation/gate/local
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from cirr.evaluation.admissibility import (
     LocalGate,
     alert_statistic,
     local_features,
+    local_scores,
     nominal_split,
     stamp,
     valid_cells,
@@ -35,21 +36,36 @@ from cirr.evaluation.runner import load_eval_model
 from cirr.utils.provenance import git_commit, set_determinism, sha256_file
 
 
-def score_stream(gate, model, data, dataset, device, workers):
-    idx = [i for d in data.days for i in data.day_map[d]]
-    ts = pd.Series([stamp(data.dataset.periods[i]) for i in idx])
-    score, cell = gate.score(local_features(model, dataset, idx, gate.cells, device, workers), device)
-    alert = alert_statistic(ts, score)
+def score_table(gate: LocalGate, ts: pd.Series, z: np.ndarray) -> pd.DataFrame:
+    """The §5 columns (score, cell, flagged, alert) and their §6 interior/edge counterparts."""
+    s = gate.split(z)
+    alert, i_alert = alert_statistic(ts, s["all"]), alert_statistic(ts, s["interior"])
     return pd.DataFrame(
         {
             "timestamp": ts,
-            "score": score,
-            "cell": cell,
-            "flagged": score > gate.threshold,
+            "score": s["all"],
+            "cell": s["all_cell"],
+            "flagged": s["all"] > gate.threshold,
             "alert_stat": alert,
             "alert": alert > gate.alert_threshold,
+            "interior": s["interior"],
+            "interior_cell": s["interior_cell"],
+            "interior_flagged": s["interior"] > gate.thresholds["interior"],
+            "interior_alert_stat": i_alert,
+            "interior_alert": i_alert > gate.thresholds["interior_alert"],
+            "edge": s["edge"],
+            "edge_cell": s["edge_cell"],
+            "edge_flagged": s["edge"] > gate.thresholds["edge"],
         }
     )
+
+
+def score_stream(gate, model, data, dataset, device, workers, cells_path: Path):
+    idx = [i for d in data.days for i in data.day_map[d]]
+    ts = pd.Series([stamp(data.dataset.periods[i]) for i in idx])
+    z = local_scores(model, dataset, idx, gate, device, workers)
+    np.save(cells_path, z)  # per-cell matrix, so any other split is scoreable without a GPU
+    return score_table(gate, ts, z)
 
 
 @click.command()
@@ -59,13 +75,19 @@ def score_stream(gate, model, data, dataset, device, workers):
 @click.option(
     "--corruption-schedule",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default="results/ch4/gate/folsom_corrupted/schedule.csv",
+    default="results/adaptation/gate/folsom_corrupted/schedule.csv",
     show_default=True,
 )
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--workers", type=click.IntRange(min=0), default=8, show_default=True)
 @click.option("--device", default="cuda", show_default=True)
 @click.option("--out", "out_dir", type=click.Path(path_type=Path), required=True)
+@click.option(
+    "--resume",
+    is_flag=True,
+    default=False,
+    help="Reuse the bank and normalisation of local_gate.npz in --out; thresholds and streams are recomputed.",
+)
 def main(
     checkpoint: Path,
     source: Path,
@@ -75,6 +97,7 @@ def main(
     workers: int,
     device: str,
     out_dir: Path,
+    resume: bool,
 ) -> None:
     set_determinism(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -98,29 +121,43 @@ def main(
         f"threshold {len(thr_idx)} | alert calibration {len(alert_idx)} frames on {len(alert_days)} days"
     )
 
-    bank = local_features(model, train, bank_idx, cells, device, workers).transpose(0, 1).contiguous()
-    gate = LocalGate(bank, cells)
-    gate.scale = torch.quantile(
-        gate.distances(local_features(model, train, norm_idx, cells, device, workers), device).float(), 0.95, dim=0
-    ).clamp_min(1e-6)
-    thr_scores, _ = gate.score(local_features(model, train, thr_idx, cells, device, workers), device)
-    gate.threshold = float(np.percentile(thr_scores, 99))
-    a_scores, _ = gate.score(local_features(model, train, alert_idx, cells, device, workers), device)
+    if resume and (out_dir / "local_gate.npz").exists():
+        gate = LocalGate.load(out_dir / "local_gate.npz")
+        assert torch.equal(gate.cells, cells)
+        print("resumed bank and normalisation from local_gate.npz")
+    else:
+        bank = local_features(model, train, bank_idx, cells, device, workers).transpose(0, 1).contiguous()
+        gate = LocalGate(bank, cells)
+        gate.scale = torch.quantile(
+            gate.distances(local_features(model, train, norm_idx, cells, device, workers), device).float(), 0.95, dim=0
+        ).clamp_min(1e-6)
+
+    # thresholds: the §5 frame/alert pair, and the §6 pair per split, from the same calibration frames
+    thr = gate.split(gate.normalised(local_features(model, train, thr_idx, cells, device, workers), device))
+    a_z = gate.normalised(local_features(model, train, alert_idx, cells, device, workers), device)
     a_ts = pd.Series([stamp(train.periods[i]) for i in alert_idx])
-    gate.alert_threshold = float(np.nanpercentile(alert_statistic(a_ts, a_scores), 99))
-    print(f"frame threshold {gate.threshold:.4f} | alert threshold {gate.alert_threshold:.4f}")
+    a_split = gate.split(a_z)
+    for name in LocalGate.SPLITS:
+        gate.thresholds[name] = float(np.percentile(thr[name], 99))
+        gate.thresholds[f"{name}_alert"] = float(np.nanpercentile(alert_statistic(a_ts, a_split[name]), 99))
+    gate.threshold, gate.alert_threshold = gate.thresholds["all"], gate.thresholds["all_alert"]
+    print(f"frame threshold {gate.threshold:.4f} | alert threshold {gate.alert_threshold:.4f} (§5: 1.7527 / 1.6356)")
+    print("§6 thresholds: " + ", ".join(f"{k} {v:.4f}" for k, v in gate.thresholds.items()))
 
     meta = {
-        "design": "docs/CH4_ADMISSIBILITY.md §5",
+        "design": "docs/CH4_ADMISSIBILITY.md §5 and §6",
         "threshold": gate.threshold,
         "alert_threshold": gate.alert_threshold,
+        "thresholds": gate.thresholds,
         "cells": int(cells.sum()),
+        "edge_cells": int(gate.edge.sum()),
         "n_bank": len(bank_idx),
         "n_norm": len(norm_idx),
         "n_threshold": len(thr_idx),
         "alert_calibration_days": len(alert_days),
         "percentile": 99.0,
         "window_minutes": 30,
+        "bank_bytes_fp32": int(gate.bank.numel() * 4),
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": sha256_file(checkpoint),
         "git_commit": git_commit(),
@@ -130,14 +167,17 @@ def main(
 
     # --- the 2016 stream, clean and with the synthetic faults ------------------------
     data = load_campaign_days(stream, min_ghi_clear=0.001)
-    clean = score_stream(gate, model, data, data.dataset, device, workers)
+    clean = score_stream(gate, model, data, data.dataset, device, workers, out_dir / "cells_clean.npy")
     clean.to_csv(out_dir / "scores_clean.csv", index=False)
     sched = pd.read_csv(corruption_schedule, dtype={"timestamp": str})
-    faulty = score_stream(gate, model, data, CorruptedStream(data.dataset, sched), device, workers)
+    faulty = score_stream(
+        gate, model, data, CorruptedStream(data.dataset, sched), device, workers, out_dir / "cells_corrupted.npy"
+    )
     faulty.to_csv(out_dir / "scores_corrupted.csv", index=False)
-    meta.update(clean_flag_rate_pct=float(100 * clean.flagged.mean()), clean_alert_rate_pct=float(100 * clean.alert.mean()))
+    for col in ("flagged", "alert", "interior_flagged", "interior_alert", "edge_flagged"):
+        meta[f"clean_{col}_rate_pct"] = float(100 * clean[col].mean())
     (out_dir / "gate.json").write_text(json.dumps(meta, indent=2))
-    print(json.dumps({k: meta[k] for k in ("clean_flag_rate_pct", "clean_alert_rate_pct")}, indent=2))
+    print(json.dumps({k: v for k, v in meta.items() if k.startswith("clean_")}, indent=2))
 
 
 if __name__ == "__main__":

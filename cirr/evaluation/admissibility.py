@@ -40,7 +40,13 @@ from tqdm import tqdm
 
 from cirr.data.loading import DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD
 
-KINDS = ("soiling", "droplets", "occlusion")
+KINDS = ("soiling", "occlusion")
+EDGE_KINDS = ("soiling_edge", "occlusion_edge")  # the same faults at the rim (docs/CH4_ADMISSIBILITY.md §6)
+MONITOR_KINDS = ("banding", "insect")  # the faults of §7
+# Retired on 2026-09-25 after the §7 verdict: "droplets" (§5, too sparse to see at 128 px) and
+# "wet_dome" (§7).  corrupt() still renders them so the scored streams stay reproducible; no probe,
+# schedule or figure uses them.
+RETIRED_KINDS = ("droplets", "wet_dome")
 _MEAN = torch.tensor(DEFAULT_IMAGE_MEAN).view(3, 1, 1)
 _STD = torch.tensor(DEFAULT_IMAGE_STD).view(3, 1, 1)
 
@@ -82,20 +88,71 @@ def _rng(*parts: object) -> np.random.Generator:
     return np.random.default_rng(int(hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:15], 16))
 
 
-def _disc(h: int, w: int, cy: float, cx: float, ry: float, rx: float) -> torch.Tensor:
+def _disc(h: int, w: int, cy: float, cx: float, ry: float, rx: float, angle: float = 0.0) -> torch.Tensor:
+    """Filled ellipse, optionally rotated by ``angle`` radians."""
     y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
-    return (((y - cy) / ry) ** 2 + ((x - cx) / rx) ** 2 <= 1.0).float()
+    dy, dx = y - cy, x - cx
+    if angle:
+        c, s = float(np.cos(angle)), float(np.sin(angle))
+        dy, dx = dy * c - dx * s, dy * s + dx * c
+    return ((dy / ry) ** 2 + (dx / rx) ** 2 <= 1.0).float()
+
+
+# occluder appearance (docs/CH4_ADMISSIBILITY.md §7 amendment): colour and shape drawn per episode
+OCCLUDER_COLOURS = {
+    "black": (0.05, 0.05, 0.05),  # bird silhouette against the sky
+    "brown": (0.35, 0.24, 0.14),  # bird, leaf
+    "light": (0.85, 0.84, 0.80),  # bird underside, paper
+    "green": (0.20, 0.33, 0.14),  # leaf, branch
+}
+OCCLUDER_SHAPES = ("ellipse", "rotated", "blob", "bar")
+
+
+def _occluder(
+    rng: np.random.Generator, h: int, w: int, cy: float, cx: float
+) -> tuple[torch.Tensor, tuple[float, float, float]]:
+    """Mask and colour of one occluder: shape and colour drawn from the episode generator."""
+    shape = OCCLUDER_SHAPES[int(rng.integers(len(OCCLUDER_SHAPES)))]
+    colour = OCCLUDER_COLOURS[list(OCCLUDER_COLOURS)[int(rng.integers(len(OCCLUDER_COLOURS)))]]
+    ry, rx = rng.uniform(0.08, 0.22, 2) * (h, w)
+    if shape == "ellipse":
+        mask = _disc(h, w, cy, cx, ry, rx)
+    elif shape == "rotated":
+        mask = _disc(h, w, cy, cx, ry, rx * rng.uniform(0.4, 0.7), rng.uniform(0, np.pi))
+    elif shape == "blob":  # 3-4 overlapping lobes around the centre
+        mask = torch.zeros(h, w)
+        for _ in range(int(rng.integers(3, 5))):
+            oy, ox = rng.uniform(-0.5, 0.5, 2) * (ry, rx)
+            mask = torch.maximum(
+                mask,
+                _disc(h, w, cy + oy, cx + ox, ry * rng.uniform(0.4, 0.8), rx * rng.uniform(0.4, 0.8), rng.uniform(0, np.pi)),
+            )
+    else:  # bar: a thin elongated occluder (branch, cable, feather)
+        mask = _disc(
+            h, w, cy, cx, max(ry, rx) * rng.uniform(1.2, 1.8), min(ry, rx) * rng.uniform(0.15, 0.3), rng.uniform(0, np.pi)
+        )
+    return mask, colour
+
+
+def _edge_centre(rng: np.random.Generator, h: int, w: int) -> tuple[float, float]:
+    """A fault centre in the annulus 0.72-0.92 of the field-of-view radius (docs/CH4_ADMISSIBILITY.md §6)."""
+    rho, phi = rng.uniform(0.72, 0.92) * h / 2, rng.uniform(0, 2 * np.pi)
+    return h / 2 + rho * np.sin(phi), w / 2 + rho * np.cos(phi)
 
 
 def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.Tensor:
-    """Apply one synthetic fault to a normalised ``[3, H, W]`` image."""
+    """Apply one synthetic fault to a normalised ``[3, H, W]`` image.
+
+    ``soiling_edge`` and ``occlusion_edge`` are the same faults with their centres
+    placed at the rim of the field of view, where the §6 split discards flags.
+    """
     _, h, w = image.shape
     crop = (image.abs().sum(0, keepdim=True) > 0).float()  # the circular field of view
     pix = (image * _STD + _MEAN).clamp(0, 1)
     ep = _rng(kind, episode)  # fixed for the episode
-    if kind == "soiling":
+    if kind in ("soiling", "soiling_edge"):
         for _ in range(int(ep.integers(3, 7))):
-            cy, cx = ep.uniform(0.2, 0.8, 2) * (h, w)
+            cy, cx = _edge_centre(ep, h, w) if kind == "soiling_edge" else ep.uniform(0.2, 0.8, 2) * (h, w)
             r = float(ep.uniform(0.06, 0.16) * h)
             soft = TF.gaussian_blur(_disc(h, w, cy, cx, r, r * ep.uniform(0.7, 1.3))[None], 9, 3.0)[0]
             alpha = float(ep.uniform(0.45, 0.8)) * soft
@@ -109,11 +166,55 @@ def corrupt(image: torch.Tensor, kind: str, episode: int, frame: str) -> torch.T
             r = float(fr.uniform(2, 5))
             mask = torch.maximum(mask, _disc(h, w, cy, cx, r, r))
         pix = pix * (1 - mask) + (blurred * 1.15).clamp(0, 1) * mask
-    elif kind == "occlusion":
-        cy, cx = ep.uniform(0.25, 0.75, 2) * (h, w)
-        ry, rx = ep.uniform(0.08, 0.22, 2) * (h, w)
-        alpha = 0.9 * TF.gaussian_blur(_disc(h, w, cy, cx, ry, rx)[None], 5, 1.5)[0]
+    elif kind in ("occlusion", "occlusion_edge"):
+        cy, cx = _edge_centre(ep, h, w) if kind == "occlusion_edge" else ep.uniform(0.25, 0.75, 2) * (h, w)
+        mask, colour = _occluder(ep, h, w, cy, cx)
+        alpha = float(ep.uniform(0.85, 0.95)) * TF.gaussian_blur(mask[None], 5, 1.5)[0]
+        pix = pix * (1 - alpha) + torch.tensor(colour).view(3, 1, 1) * alpha
+    elif kind == "banding":  # acquisition fault (§7): redrawn every frame
+        fr = _rng(kind, episode, frame)
+        gain = torch.ones(3, h, 1)
+        for _ in range(int(fr.integers(6, 21))):
+            top, height = int(fr.integers(0, h)), int(fr.integers(1, 7))
+            gain[:, top : top + height] = torch.from_numpy(fr.uniform(0.8, 1.25, (3, 1, 1))).float()
+        noise = torch.from_numpy(fr.normal(0, 0.03, (3, h, 1))).float()
+        pix = (pix * gain + noise).clamp(0, 1)
+    elif kind == "insect":  # a few pixels: body and six legs, within 0.6 of the radius (§7)
+        fr = _rng(kind, episode, frame)
+        rho, phi = ep.uniform(0, 0.6) * h / 2, ep.uniform(0, 2 * np.pi)
+        # the episode fixes the position; each frame moves it by up to 1 px
+        cy, cx = h / 2 + rho * np.sin(phi) + fr.uniform(-1, 1), w / 2 + rho * np.cos(phi) + fr.uniform(-1, 1)
+        r = float(ep.uniform(1.5, 3.5))
+        body = _disc(h, w, cy, cx, r, r * 1.6)
+        y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+        legs = torch.zeros(h, w)
+        for a in np.linspace(0, 2 * np.pi, 6, endpoint=False) + ep.uniform(0, np.pi):
+            length = float(ep.uniform(3, 6)) + r
+            t = torch.linspace(0, 1, 16)
+            ly, lx = (cy + t * length * np.sin(a)).round().long(), (cx + t * length * np.cos(a)).round().long()
+            ok = (ly >= 0) & (ly < h) & (lx >= 0) & (lx < w)
+            legs[ly[ok], lx[ok]] = 1.0
+        alpha = 0.9 * torch.maximum(body, legs)
         pix = pix * (1 - alpha) + 0.05 * alpha
+    elif kind == "wet_dome":  # dense droplets over the whole dome (§7)
+        n = int(ep.integers(150, 351))
+        fr = _rng(kind, episode, frame)
+
+        def draw(g: np.random.Generator, k: int) -> np.ndarray:
+            rho, phi = np.sqrt(g.uniform(0, 1, k)) * 0.95 * h / 2, g.uniform(0, 2 * np.pi, k)  # uniform over the disc
+            return np.stack([h / 2 + rho * np.sin(phi), w / 2 + rho * np.cos(phi), g.uniform(1, 3, k)], 1)
+
+        drops = draw(ep, n)
+        moved = fr.random(n) < 0.2  # 20 % of the water moves between frames
+        drops[moved] = draw(fr, int(moved.sum()))
+        d = torch.from_numpy(drops).float()
+        y, x = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+        dist = ((y[None] - d[:, 0, None, None]) ** 2 + (x[None] - d[:, 1, None, None]) ** 2).sqrt() / d[:, 2, None, None]
+        lens = (dist <= 0.8).any(0).float()
+        rim = ((dist > 0.8) & (dist <= 1.0)).any(0).float() * (1 - lens)
+        lensed = (TF.gaussian_blur(pix, 7, 2.5) * 1.2).clamp(0, 1)
+        pix = pix * (1 - 0.6 * lens) + lensed * 0.6 * lens  # a droplet refracts; it does not hide the sky
+        pix = pix * (1 - 0.25 * rim)
     else:
         raise ValueError(f"unknown fault kind {kind!r}")
     return ((pix - _MEAN) / _STD) * crop
@@ -144,6 +245,104 @@ def build_schedule(timestamps: list[str], seed: int = 0) -> pd.DataFrame:
                 rows.setdefault(t, (kind, e))
     out = pd.DataFrame([(t, k, e) for t, (k, e) in rows.items()], columns=["timestamp", "kind", "episode"])
     return out.sort_values("timestamp").reset_index(drop=True)
+
+
+# §7 stream: kinds in precedence order, with (episodes, min minutes, max minutes)
+MONITOR_EPISODES = (("occlusion", 60, 5, 30), ("banding", 40, 1, 5), ("insect", 40, 2, 15))
+SHORT_TERM = ("banding", "occlusion", "insect")  # excluded from adaptation; should not raise the maintenance alert
+PERSISTENT = ("soiling",)  # should raise the maintenance alert
+
+
+def build_monitor_schedule(timestamps: list[str], seed: int = 1) -> pd.DataFrame:
+    """The §7 fault stream (docs/CH4_ADMISSIBILITY.md): soiling, wet dome, bird, banding, insect.
+
+    Same construction as :func:`build_schedule`: soiling fills 1-3 whole days (4
+    episodes), every other kind starts at a random frame and lasts a random number
+    of minutes within the same day; earlier kinds take precedence.
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.Series(sorted(set(timestamps)))
+    when = pd.to_datetime(ts, format="%Y%m%d_%H%M%S")
+    days = sorted(ts.str[:8].unique())
+    rows: dict[str, tuple[str, int]] = {}
+    for e, start in enumerate(rng.choice(len(days) - 3, size=4, replace=False)):
+        for d in days[start : start + int(rng.integers(1, 4))]:
+            for t in ts[ts.str[:8] == d]:
+                rows.setdefault(t, ("soiling", e))
+    for kind, n, lo, hi in MONITOR_EPISODES:
+        for e, i in enumerate(rng.choice(len(ts), size=n, replace=False)):
+            end = when[i] + pd.Timedelta(minutes=int(rng.integers(lo, hi + 1)))
+            same_day = ts.str[:8] == ts[i][:8]
+            for t in ts[same_day & (when >= when[i]) & (when < end)]:
+                rows.setdefault(t, (kind, e))
+    out = pd.DataFrame([(t, k, e) for t, (k, e) in rows.items()], columns=["timestamp", "kind", "episode"])
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+# §8 dose streams: short-term episode ratio and durations (minutes)
+DOSE_MIX = (("occlusion", 3, 5, 30), ("banding", 2, 1, 5), ("insect", 2, 2, 15))
+
+
+def build_dose_schedule(timestamps: list[str], rate_pct: float, seed: int) -> pd.DataFrame:
+    """A stream with about ``rate_pct`` % of frames faulty (docs/CH4_ADMISSIBILITY.md §8).
+
+    Half of the faulty frames come from whole-day soiling episodes of 1-3 days, half
+    from short-term episodes added in the DOSE_MIX ratio until the budget is met.
+    Episodes never overlap; a frame carries at most one fault.
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.Series(sorted(set(timestamps)))
+    when = pd.to_datetime(ts, format="%Y%m%d_%H%M%S")
+    day = ts.str[:8]
+    days = sorted(day.unique())
+    per_day = day.value_counts()
+    budget = rate_pct / 100 * len(ts) / 2
+    rows: dict[str, tuple[str, int]] = {}
+
+    used: set[str] = set()
+    soil_frames, e, tries = 0, 0, 0
+    while soil_frames < budget and tries < 10_000:
+        tries += 1
+        start, length = int(rng.integers(0, len(days) - 3)), int(rng.integers(1, 4))
+        block = days[start : start + length]
+        if used.intersection(block):
+            continue
+        for d in block:
+            used.add(d)
+            soil_frames += int(per_day[d])
+            for t in ts[day == d]:
+                rows[t] = ("soiling", e)
+        e += 1
+
+    short_frames, tries = 0, 0
+    counters = dict.fromkeys((k for k, *_ in DOSE_MIX), 0)
+    while short_frames < budget and tries < 100_000:
+        for kind, k, lo, hi in DOSE_MIX:
+            for _ in range(k):
+                tries += 1
+                i = int(rng.integers(len(ts)))
+                end = when[i] + pd.Timedelta(minutes=int(rng.integers(lo, hi + 1)))
+                sel = ts[(day == day[i]) & (when >= when[i]) & (when < end)]
+                added = [t for t in sel if t not in rows]
+                if len(added) < len(sel):  # would overlap an existing episode
+                    continue
+                for t in added:
+                    rows[t] = (kind, counters[kind])
+                counters[kind] += 1
+                short_frames += len(added)
+                if short_frames >= budget:
+                    break
+            if short_frames >= budget:
+                break
+    out = pd.DataFrame([(t, k, e) for t, (k, e) in rows.items()], columns=["timestamp", "kind", "episode"])
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+def build_continuous_schedule(timestamps: list[str], kind: str, start_day: str, end_day: str) -> pd.DataFrame:
+    """One episode of ``kind`` on every frame with ``start_day <= YYYYMMDD <= end_day`` (§8)."""
+    ts = pd.Series(sorted(set(timestamps)))
+    on = ts[(ts.str[:8] >= start_day) & (ts.str[:8] <= end_day)]
+    return pd.DataFrame({"timestamp": on.to_numpy(), "kind": kind, "episode": 0}).reset_index(drop=True)
 
 
 class CorruptedStream:
@@ -212,6 +411,35 @@ def valid_cells(image: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.avg_pool2d(fov[None, None], CELL)[0, 0] >= 1.0
 
 
+def edge_cells(cells: torch.Tensor) -> torch.Tensor:
+    """Which valid cells (in scoring order) touch the border of the field of view.
+
+    A valid cell is *edge* when one of its 4-neighbours is outside the mask
+    (docs/CH4_ADMISSIBILITY.md §6): 40 of the 172 cells at 128 x 128.
+    """
+    if cells.dim() != 2:  # a flat cell list has no geometry: everything is interior
+        return torch.zeros(int(cells.sum()), dtype=torch.bool)
+    padded = torch.nn.functional.pad(cells.float(), (1, 1, 1, 1))
+    neighbours = padded[:-2, 1:-1] * padded[2:, 1:-1] * padded[1:-1, :-2] * padded[1:-1, 2:]
+    return (neighbours < 1.0)[cells]
+
+
+def cell_depth(cells: torch.Tensor) -> torch.Tensor:
+    """Chessboard distance, in cells, from each valid cell (scoring order) to the nearest cell outside the mask.
+
+    1 is the outermost ring.  §7's core statistic uses depth >= 3 (72 of 172 cells).
+    """
+    from scipy.ndimage import distance_transform_cdt
+
+    if cells.dim() != 2:
+        return torch.full((int(cells.sum()),), 99, dtype=torch.long)
+    m = cells.numpy()
+    return torch.from_numpy(distance_transform_cdt(np.pad(m, 1), metric="chessboard")[1:-1, 1:-1][m]).long()
+
+
+CORE_DEPTH = 3
+
+
 @torch.no_grad()
 def local_features(
     model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
@@ -243,6 +471,9 @@ class LocalGate:
     is enough.
     """
 
+    # the three frame scores of §6: max over all, interior or edge cells
+    SPLITS = ("all", "interior", "edge")
+
     def __init__(
         self,
         bank: torch.Tensor,
@@ -250,11 +481,38 @@ class LocalGate:
         scale: torch.Tensor | None = None,
         threshold: float = float("inf"),
         alert_threshold: float = float("inf"),
+        thresholds: dict[str, float] | None = None,
     ):
         self.bank = bank  # [cells, n_bank, 128]
         self.cells = cells  # [16, 16] bool
+        self.edge = edge_cells(cells)  # [cells] bool, scoring order
+        self.core = cell_depth(cells) >= CORE_DEPTH  # [cells] bool, §7
         self.scale = scale  # [cells] or None before calibration
         self.threshold, self.alert_threshold = threshold, alert_threshold
+        # §6 thresholds: "<split>" for the frame score, "<split>_alert" for the rolling median
+        self.thresholds: dict[str, float] = dict(thresholds or {})
+
+    def normalised(self, feats: torch.Tensor, device: str) -> torch.Tensor:
+        """Per-cell normalised distance ``[N, cells]``: the quantity every frame score is a max of."""
+        return self.distances(feats, device) / self.scale
+
+    def split(self, z: torch.Tensor | np.ndarray) -> dict[str, np.ndarray]:
+        """Frame score and blamed cell for each split of §6, from the per-cell matrix."""
+        z = torch.as_tensor(np.asarray(z, dtype=np.float32))
+        masks = {"all": torch.ones_like(self.edge), "interior": ~self.edge, "edge": self.edge}
+        out: dict[str, np.ndarray] = {}
+        for name, m in masks.items():
+            idx = torch.nonzero(m).flatten()
+            worst, where = z[:, idx].max(1)
+            out[name], out[f"{name}_cell"] = worst.numpy(), idx[where].numpy()
+        return out
+
+    def monitor(self, z: torch.Tensor | np.ndarray) -> dict[str, np.ndarray]:
+        """The §7 statistics: global = median over all cells, core = max over cells at depth >= 3."""
+        z = torch.as_tensor(np.asarray(z, dtype=np.float32))
+        idx = torch.nonzero(self.core).flatten()
+        worst, where = z[:, idx].max(1)
+        return {"global": z.median(1).values.numpy(), "core": worst.numpy(), "core_cell": idx[where].numpy()}
 
     @torch.no_grad()
     def distances(self, feats: torch.Tensor, device: str, chunk: int = 256) -> torch.Tensor:
@@ -280,6 +538,7 @@ class LocalGate:
             scale=self.scale.numpy(),
             threshold=self.threshold,
             alert_threshold=self.alert_threshold,
+            thresholds=json.dumps(self.thresholds),
             meta=json.dumps(meta),
         )
 
@@ -292,7 +551,42 @@ class LocalGate:
             torch.from_numpy(z["scale"]),
             float(z["threshold"]),
             float(z["alert_threshold"]),
+            json.loads(str(z["thresholds"])) if "thresholds" in z else None,  # §5 files predate the split
         )
+
+
+@torch.no_grad()
+def iter_local_features(
+    model: Any, dataset: Any, indices: list[int], cells: torch.Tensor, device: str, workers: int = 8, batch: int = 256
+):
+    """Yield per-cell features ``[B, cells, 128]`` batch by batch, for streams too large to hold."""
+    grabbed: dict[str, torch.Tensor] = {}
+    hook = model.image_encoder.layer2.register_forward_hook(lambda _m, _i, o: grabbed.__setitem__("f", o))
+    proj = local_projection().to(device)
+    flat = cells.flatten().to(device)
+    loader = DataLoader(Subset(dataset, indices), batch_size=batch, num_workers=workers, pin_memory=True)
+    try:
+        for image, history, *_ in tqdm(loader, desc="local", unit="batch"):
+            model.encode_fusion_features(image.to(device, non_blocking=True), history.to(device, non_blocking=True))
+            f = torch.nn.functional.avg_pool2d(grabbed["f"].float(), 3, 1, 1)
+            yield f.flatten(2).transpose(1, 2)[:, flat] @ proj
+    finally:
+        hook.remove()
+
+
+def local_scores(model: Any, dataset: Any, indices: list[int], gate: LocalGate, device: str, workers: int = 8) -> np.ndarray:
+    """Per-cell normalised distances ``[N, cells]`` (float16) for every frame, scored batch by batch.
+
+    A full stream's features are ~11 GB (245k frames x 172 cells x 128); holding them
+    and then forking DataLoader workers from that process got the job killed, so a
+    stream is never materialised.  The per-cell matrix is 84 MB and is kept, so any
+    split of the cells (§6) can be scored again without a GPU.
+    """
+    parts = [
+        gate.normalised(feats, device).half().numpy()
+        for feats in iter_local_features(model, dataset, indices, gate.cells, device, workers)
+    ]
+    return np.concatenate(parts) if parts else np.zeros((0, int(gate.cells.sum())), np.float16)
 
 
 def alert_statistic(timestamps: pd.Series, scores: np.ndarray, minutes: int = 30) -> np.ndarray:
