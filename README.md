@@ -48,7 +48,7 @@ flowchart LR
 | **Input admissibility** | Isolation Forest gate on the forecaster embedding; two-channel monitor (exclude frame / maintenance alert); synthetic camera faults | `cirr/evaluation/admissibility.py` · `scripts/fit_anomaly_gate.py`, `scripts/fit_monitor.py` |
 | **Federated learning** | Weight aggregation baselines and regime-stratified prototype exchange (overcast / transient / clear) | `cirr/fl` · `scripts/fl_benchmark.py` |
 | **Physics-informed input** | 7-channel input: RGB, sun mask × irradiance, normalised blue/red ratio, optical flow; sun-camera calibration | `cirr/physics`, `cirr/data` · `scripts/fit_sun_camera.py` |
-| **Edge benchmarking** | Latency, memory, payload size and energy on Raspberry Pi / Jetson | `scripts/edge_hw_benchmark.py`, `scripts/edge_adaptation_benchmark.py`, `scripts/fl_edge_overhead_benchmark.py` |
+| **Edge benchmarking** | Per-action adaptation cost, exclusion-flag cost and federated client cost (latency, memory, energy) on Raspberry Pi 5 / Jetson | `scripts/edge_adaptation_benchmark.py`, `scripts/edge_admissibility_cost.py`, `scripts/edge_collaboration_benchmark.py` · `scripts/bash_scripts/run_edge_device.sh` |
 
 ## Installation
 

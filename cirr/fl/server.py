@@ -16,7 +16,7 @@ _HEAD_PREFIX = "network_head"
 def payload_nbytes(payload: Any) -> int:
     """Serialized size of *payload* in bytes — what actually crosses the wire.
 
-    Uses the same ``torch.save`` encoding as ``fl_edge_overhead_benchmark`` so
+    Uses the same ``torch.save`` encoding as ``edge_collaboration_benchmark`` so
     the two payload figures are directly comparable, rather than counting
     ``numel * element_size`` and ignoring framing.
     """
@@ -130,7 +130,7 @@ def fedbn_aggregate(
     Note: this benchmark still has each client upload its *full* state
     dict — only the server-side aggregation drops BN keys. The bandwidth
     savings FedBN is usually motivated by are not realised here; see
-    ``scripts/fl_edge_overhead_benchmark.py`` for actual transport-cost
+    ``scripts/edge_collaboration_benchmark.py`` for actual transport-cost
     measurements.
 
     Parameters
@@ -184,7 +184,7 @@ def fedper_aggregate(
     Note: this benchmark still has each client upload its *full* state
     dict — only the server-side aggregation drops head keys. The bandwidth
     savings FedPer is usually motivated by are not realised here; see
-    ``scripts/fl_edge_overhead_benchmark.py`` for actual transport-cost
+    ``scripts/edge_collaboration_benchmark.py`` for actual transport-cost
     measurements.
 
     Parameters

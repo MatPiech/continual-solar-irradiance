@@ -358,7 +358,7 @@ def fault_mosaic() -> None:
     label = {k: k.replace("_edge", "\n(at rim)").replace("_", " ") for k in kinds}
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
-    fig, axes = plt.subplots(len(picks), len(kinds) + 1, figsize=(7.6, 0.95 * len(picks) + 0.35))
+    fig, axes = plt.subplots(len(picks), len(kinds) + 1, figsize=(7.6, 1.02 * len(picks) + 0.15))
     for row, ts in enumerate(picks):
         key = ts if ts in where else min(where, key=lambda t: abs(int(t[9:13]) - int(ts[9:13])) if t[:8] == ts[:8] else 9e9)
         img = data.dataset[where[key]][0]
@@ -368,8 +368,7 @@ def fault_mosaic() -> None:
             ax.axis("off")
             if row == 0:
                 ax.set_title("clean" if k is None else label[k], fontsize=6, color=INK, pad=2)
-    fig.suptitle("Synthetic sensing-path faults rendered onto real Folsom 2016 frames", fontsize=7.5, y=1.0)
-    fig.subplots_adjust(wspace=0.03, hspace=0.03, left=0.005, right=0.995, top=0.86, bottom=0.005)
+    fig.subplots_adjust(wspace=0.02, hspace=0.02, left=0.002, right=0.998, top=0.93, bottom=0.002)
     save(fig, "ch4_admissibility_fault_mosaic")
 
 
@@ -510,7 +509,7 @@ def monitor_top() -> None:
         save(fig, f"ch4_admissibility_monitor_top_{key}")
 
 
-def monitor_grid(n: int = 48, cols: int = 8) -> None:
+def monitor_grid(n: int = 24, cols: int = 6) -> None:
     """§7: the real 2016 frames the exclusion flag ranks highest, one per day, in a large grid.
 
     Rank = max(G / t_G, C / t_C), the score of the --anomaly-gate file.  Each title says
@@ -538,7 +537,7 @@ def monitor_grid(n: int = 48, cols: int = 8) -> None:
     data = load_campaign_days(ROOT / "data" / "folsom_prepared")
     where = {data.dataset.periods[j]["history"][-1]["image_name"][:15]: j for d in data.days for j in data.day_map[d]}
     rows = (len(top) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(7.6, 1.08 * rows + 0.3))
+    fig, axes = plt.subplots(rows, cols, figsize=(7.6, rows * 7.6 / cols * 1.12))  # square panels plus a label line
     for ax, r in zip(axes.flat, top.itertuples(), strict=False):
         img = data.dataset[where[r.timestamp]][0]
         ax.imshow(((img * _STD + _MEAN).clamp(0, 1) * (img.abs().sum(0, keepdim=True) > 0)).permute(1, 2, 0).numpy())
@@ -555,14 +554,53 @@ def monitor_grid(n: int = 48, cols: int = 8) -> None:
         ax.axis("off")
     for ax in list(axes.flat)[len(top) :]:
         ax.axis("off")
-    fig.suptitle(
-        f"The {len(top)} real 2016 frames the exclusion flag ranks highest (one per day); score / threshold, "
-        "G = global median fired, C = core max fired (box = cell)",
-        fontsize=6.5,
-        y=1.0,
-    )
-    fig.subplots_adjust(wspace=0.04, hspace=0.22, left=0.01, right=0.99, top=0.95, bottom=0.01)
+    fig.subplots_adjust(wspace=0.02, hspace=0.16, left=0.002, right=0.998, top=0.97, bottom=0.002)
     save(fig, "ch4_admissibility_monitor_grid")
+
+
+def continuous() -> None:
+    """§8: weekly faulty-frame MAE under the two continuous faults, static / policy / gated, with the withheld share."""
+    w = table("ch4_admissibility_dose_weekly")
+    if w is None:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(7.6, 2.6))
+    for ax, stream, title in zip(
+        axes,
+        ("cont_soiling", "cont_occluder"),
+        ("continuous soiling, 1 Jul – 15 Aug", "permanent occluder, from 1 Sep"),
+        strict=True,
+    ):
+        g = w[w.stream == stream]
+        ax2 = ax.twinx()
+        d = g[g.arm == "gated"].sort_values("week")
+        ax2.bar(d.week, d.withheld_pct, color=SERIES[1], alpha=0.15, width=0.8, label="withheld by E (%)")
+        ax2.set_ylim(0, 100)
+        ax2.set_ylabel("faulty frames withheld (%)", fontsize=7, color=MUTED)
+        ax2.tick_params(labelsize=6, colors=MUTED)
+        ax2.spines["right"].set_visible(True)
+        for arm, color, label in (
+            ("static", GREY, "static"),
+            ("ungated", SERIES[0], "policy"),
+            ("gated", SERIES[1], "policy, gated by E"),
+        ):
+            d = g[g.arm == arm].sort_values("week")
+            if not d.empty:
+                ax.plot(d.week, d.mae_faulty, marker="o", ms=3, color=color, label=label, zorder=3)
+        ax.set_title(title, fontsize=8, color=INK)
+        ax.set_xlabel("ISO week")
+        ax.set_ylabel("MAE on faulty frames (W/m²)")
+        ax.set_ylim(bottom=0)
+        ax.grid(axis="y", lw=0.4, color="#e6e6e6")
+        ax.set_zorder(ax2.get_zorder() + 1)
+        ax.patch.set_visible(False)
+    handles, labels = {}, []
+    for ax in fig.axes:  # one entry per label across the twin axes
+        for h, lab in zip(*ax.get_legend_handles_labels(), strict=True):
+            if lab not in handles:
+                handles[lab], labels = h, [*labels, lab]
+    fig.legend([handles[k] for k in labels], labels, loc="upper center", ncol=4, fontsize=7, bbox_to_anchor=(0.5, 1.09))
+    fig.tight_layout()
+    save(fig, "ch4_admissibility_continuous")
 
 
 def monitor_timeline() -> None:
@@ -623,5 +661,6 @@ if __name__ == "__main__":
         monitor_top,
         monitor_timeline,
         monitor_grid,
+        continuous,
     ):
         fn()

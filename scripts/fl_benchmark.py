@@ -46,7 +46,7 @@ upload its *full* state dict regardless of algorithm — fedbn/fedper only
 drop keys server-side during aggregation, so the reduced-bandwidth benefit
 those algorithms are usually chosen for is not exercised here. For actual
 upload/download payload measurements, use
-`scripts/fl_edge_overhead_benchmark.py`.
+`scripts/edge_collaboration_benchmark.py`.
 
 Weighted aggregation: all weight-based algorithms average clients weighted
 by each client's local sample count since the last round (canonical
@@ -126,7 +126,7 @@ ALIGN_TARGETS = ("global", "own", "shuffled", "random")
 # filter_lit_days, set_determinism, sha256_file and git_commit now live in the
 # library so Chapter 4's evaluation path uses the same population filter and the
 # same provenance record as this benchmark.  Re-exported here because callers
-# (scripts/compute_sp_metrics.py, scripts/edge_hw_benchmark.py) import them from
+# (scripts/compute_sp_metrics.py, scripts/edge_collaboration_benchmark.py) import them from
 # this module.
 __all__ = ["filter_lit_days", "set_determinism", "sha256_file", "git_commit"]
 

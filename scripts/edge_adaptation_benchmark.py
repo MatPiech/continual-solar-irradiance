@@ -1,665 +1,278 @@
-"""Quick edge-oriented benchmark for online adaptation and TTA methods.
+#!/usr/bin/env python3
+"""Per-sample cost of Chapter 4 adaptation, measured on the target device.
 
-Measures (per method):
-- inference latency distribution (ms/sample)
-- adaptation latency distribution (ms/update event)
-- end-to-end latency distribution (ms/sample)
-- update duty cycle (fraction of samples triggering adaptation)
-- throughput (samples/sec)
-- memory stats (GPU peak allocated/reserved, CPU RSS/HWM deltas)
+Run this ON the Raspberry Pi 5 / Jetson Orin Nano.  Every method runs the exact update code
+and hyper-parameters of its campaign run (results/adaptation/*/<site>/<method>/seed0/config.yaml),
+each in a fresh process so peak memory is attributable to that method alone:
 
-The benchmark is intentionally lightweight: it evaluates only ``num_samples`` from
-``split='test'`` and focuses on system performance rather than forecast quality.
+  static     no_grad forward only
+  head       conditional policy, head-only action (frozen encoder)
+  damped     conditional policy, proposed action: layer3+layer4 + head, encoder LR 0.1 x head LR
+  full       conditional policy, full-encoder action
+  window     Lara-Benitez et al.: one Adam step on the 4 latest labelled samples, every sample
+  rls        Zhang et al.: Sherman-Morrison RLS on the last layer, every sample
+  memo       MEMO: episodic reset + 8-view entropy step, every sample
+  note       NOTE: prediction-variance step on a 64-sample buffer, every 64 samples
+
+Two costs are reported.  ``update`` is one update event.  ``per-sample`` is the stream cost,
+inference plus the update amortised by how often the method updates; for the conditional policy
+that rate is the recorded action mix of tab:ch4-actions, so its per-sample cost is site dependent.
+
+Energy: board power is sampled during every timed block (``scripts/edge_power.py``: Pi 5 PMIC or Jetson
+tegrastats); an idle window before the runs gives the idle power, and each event's energy is reported net of
+idle (mJ).  PMIC and tegrastats omit converter/carrier losses; check one run against an inline meter.
+
+Inputs are synthetic tensors of the deployed shape (C x 128 x 128 image, 4-step history), so no
+dataset is needed on the device; latency does not depend on pixel values.  The channel count is
+read from the checkpoint, so the RGB and IEP checkpoints both work.
+
+    python scripts/edge_adaptation_benchmark.py --checkpoint checkpoints/resnet50_epoch_015.ckpt \
+        --out results/edge/pi5/adaptation.json 2>&1 | tee logs/edge_adaptation_pi5.log
 """
 
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+import json
+import multiprocessing as mp
 from pathlib import Path
-import resource
-import time
-from typing import Any, Literal
+import platform
+from time import perf_counter
 
 import click
+from edge_power import PowerSampler, cooldown, thermal_state
 import numpy as np
 import torch
-import torch.nn as nn
 
-from cirr.continual.buffer import reveal_after_horizon
-from cirr.data.loading import load_dataset
-from cirr.evaluation.online import infer_one
-from cirr.evaluation.runner import load_eval_model
-from cirr.losses import BerHuLoss
-from cirr.training.ogd import algorithm1_scope, ogd_step, pred_mean, sliding_minibatch_step
-from cirr.training.sm_rls import ShermanMorrisonHeadUpdater
-from cirr.tta import MEMOReg, NOTEReg
-
-MethodName = Literal["baseline", "memo", "note", "paper_ogd", "sliding", "sm_rls"]
-
-
-def _sync_if_cuda(device: str) -> None:
-    if device == "cuda":
-        torch.cuda.synchronize()
-
-
-def _now() -> float:
-    return time.perf_counter()
+HISTORY, HW = 4, 128
+METHODS = ("static", "head", "damped", "full", "window", "rls", "memo", "note")
+LABEL = {
+    "static": "Static model",
+    "head": "Conditional, head only",
+    "damped": "Conditional, damped (proposed)",
+    "full": "Conditional, full encoder",
+    "window": "Lara-Benítez et al.",
+    "rls": "Zhang et al.",
+    "memo": "MEMO",
+    "note": "NOTE",
+}
+# Update events per sample for the comparators (window/rls/memo update on every sample, NOTE every 64th).
+RATE = {"static": 0.0, "window": 1.0, "rls": 1.0, "memo": 1.0, "note": 1 / 64}
+# Recorded action shares of the damped policy (head, encoder), tab:ch4-actions.
+DAMPED_MIX = {"Folsom": (0.344, 0.086), "Poznań": (0.485, 0.170), "Karpicko": (0.505, 0.192)}
 
 
-def _clamp_nonnegative(pred: torch.Tensor) -> torch.Tensor:
-    return torch.clamp(pred, min=0.0)
-
-
-def _summarize_ms(samples: list[float]) -> dict[str, float]:
-    if not samples:
-        return {
-            "mean": float("nan"),
-            "std": float("nan"),
-            "p50": float("nan"),
-            "p95": float("nan"),
-            "p99": float("nan"),
-            "max": float("nan"),
-            "count": 0.0,
-        }
-    arr = np.asarray(samples, dtype=np.float64)
-    return {
-        "mean": float(arr.mean()),
-        "std": float(arr.std()),
-        "p50": float(np.percentile(arr, 50)),
-        "p95": float(np.percentile(arr, 95)),
-        "p99": float(np.percentile(arr, 99)),
-        "max": float(arr.max()),
-        "count": float(arr.size),
-    }
-
-
-def _format_ms(x: float) -> str:
-    return "nan" if np.isnan(x) else f"{x:.3f}"
-
-
-def _format_float(x: float, digits: int = 4) -> str:
-    return "nan" if np.isnan(x) else f"{x:.{digits}f}"
-
-
-def _read_proc_kb(field: str) -> int:
+def _hwm_mb() -> float:
     try:
-        with Path("/proc/self/status").open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith(field):
-                    # Example: VmHWM:\t 12345 kB
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1])
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmHWM:"):
+                return int(line.split()[1]) / 1024
     except OSError:
-        return -1
-    return -1
+        pass
+    return float("nan")
 
 
-def _cpu_mem_snapshot() -> dict[str, float]:
-    rss_kb = _read_proc_kb("VmRSS:")
-    hwm_kb = _read_proc_kb("VmHWM:")
-    ru_maxrss_kb = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    return {
-        "rss_mb": float(rss_kb) / 1024.0 if rss_kb >= 0 else float("nan"),
-        "hwm_mb": float(hwm_kb) / 1024.0 if hwm_kb >= 0 else float("nan"),
-        "ru_maxrss_mb": ru_maxrss_kb / 1024.0,
-    }
+def _timed(fn, n: int, warmup: int, cuda: bool) -> tuple[list[float], float, float]:
+    """Per-call latencies (ms) of the timed calls, and the monotonic window they span."""
+    times, t0 = [], 0.0
+    for i in range(warmup + n):
+        if cuda:
+            torch.cuda.synchronize()
+        if i == warmup:
+            t0 = PowerSampler.now()
+        a = perf_counter()
+        fn()
+        if cuda:
+            torch.cuda.synchronize()
+        if i >= warmup:
+            times.append((perf_counter() - a) * 1e3)
+    return times, t0, PowerSampler.now()
 
 
-def _gpu_mem_snapshot(device: str) -> dict[str, float]:
-    if device != "cuda":
-        return {
-            "peak_alloc_mb": float("nan"),
-            "peak_reserved_mb": float("nan"),
-            "current_alloc_mb": float("nan"),
-            "current_reserved_mb": float("nan"),
-        }
-    return {
-        "peak_alloc_mb": float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0),
-        "peak_reserved_mb": float(torch.cuda.max_memory_reserved()) / (1024.0 * 1024.0),
-        "current_alloc_mb": float(torch.cuda.memory_allocated()) / (1024.0 * 1024.0),
-        "current_reserved_mb": float(torch.cuda.memory_reserved()) / (1024.0 * 1024.0),
-    }
+def _energy_mj(ps: PowerSampler, t0: float, t1: float, n: int, idle_w: float) -> dict[str, float]:
+    """Mean board power over the window and energy per call above idle (mJ)."""
+    e = ps.energy(t0, t1)
+    return {"power_w": e / (t1 - t0) if t1 > t0 else float("nan"), "energy_mj": 1e3 * (e - idle_w * (t1 - t0)) / n}
 
 
-@dataclass
-class MethodResult:
-    method: str
-    samples: int
-    updates: int
-    infer_ms: dict[str, float]
-    adapt_ms: dict[str, float]
-    e2e_ms: dict[str, float]
-    duty_cycle: float
-    throughput_sps: float
-    cpu_mem_before: dict[str, float]
-    cpu_mem_after: dict[str, float]
-    gpu_mem: dict[str, float]
+def _summary(ms: list[float]) -> dict[str, float]:
+    a = np.asarray(ms)
+    return {"mean": float(a.mean()), "std": float(a.std()), "p50": float(np.median(a)), "p95": float(np.percentile(a, 95))}
 
 
-def _benchmark_method(
-    method: MethodName,
-    checkpoint: Path,
-    dataset: Any | None,
-    sample_indices: list[int],
-    device: str,
-    input_source: Literal["dataset", "random"],
-    random_seed: int,
-    horizon_steps: int,
-    # TTA args
-    tta_adapt_mode: Literal["all", "bn_only"],
-    memo_n_augmentations: int,
-    memo_niter: int,
-    note_update_every_x: int,
-    note_niter: int,
-    note_use_learned_stats: bool,
-    note_bn_momentum: float,
-    # OGD/sliding args
-    ogd_t1: float,
-    ogd_t2: float,
-    ogd_lr: float,
-    ogd_loss_name: Literal["mse", "huber", "berhu"],
-    ogd_beta1: float,
-    ogd_beta2: float,
-    ogd_weight_decay: float,
-    # Sliding args
-    sliding_buffer_size: int,
-    sliding_scope: Literal["head_only", "head_and_encoder"],
-    # SM-RLS args
-    sm_update_scope: Literal["last_layer", "full_head"],
-    sm_lambda_init: float,
-    sm_forgetting_factor: float,
-    sm_full_head_regularization_mult: float,
-    sm_error_clip: float,
-    sm_max_last_layer_update_norm: float,
-    sm_max_first_layer_update_norm: float,
-    sm_anchor_decay_last: float,
-    sm_anchor_decay_first: float,
-) -> MethodResult:
-    model = load_eval_model(checkpoint, device)
-    rng = torch.Generator(device="cpu")
-    rng.manual_seed(random_seed)
+def measure(method: str, checkpoint: str, device: str, samples: int, warmup: int, threads: int | None, idle_w: float) -> dict:
+    """One method in a fresh process: inference and update-event latency, peak memory."""
+    from cirr.evaluation.runner import load_eval_model
+    from cirr.training.ogd import freeze_all, make_regression_loss, ogd_step, sliding_minibatch_step
+    from cirr.training.sm_rls import ShermanMorrisonHeadUpdater
+    from cirr.tta import MEMOReg, NOTEReg
 
-    infer_times_ms: list[float] = []
-    adapt_times_ms: list[float] = []
-    e2e_times_ms: list[float] = []
+    if threads:
+        torch.set_num_threads(threads)
+    torch.manual_seed(0)
+    cuda = device == "cuda"
+    model = load_eval_model(Path(checkpoint), device)
+    c = model.image_encoder.conv1.in_channels
+    image, history, gt = torch.rand(c, HW, HW), torch.rand(HISTORY), torch.rand(1, 1)
+    x, h = image.unsqueeze(0).to(device), history.unsqueeze(0).to(device)
 
-    updates = 0
-    total_samples = 0
+    def infer() -> None:
+        with torch.no_grad():
+            model(x, h)
 
-    cpu_before = _cpu_mem_snapshot()
-    if device == "cuda":
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-    # Method-specific state
-    memo: MEMOReg | None = None
-    note: NOTEReg | None = None
-    causal_queue: deque[dict[str, Any]] = deque()
-    adapt_buffer: deque[dict[str, Any]] = deque(maxlen=sliding_buffer_size)
-    optimizer: torch.optim.Optimizer | None = None
-    loss_fn: nn.Module | None = None
-    sm_updater: ShermanMorrisonHeadUpdater | None = None
-
-    if method == "memo":
+    update = None
+    if method in ("head", "damped", "full"):
+        # campaign optimiser: evaluate_lagged_ogd.py, config of conditional_last2_lowlr
+        opt = torch.optim.AdamW(
+            [
+                {"params": model.network_head.parameters(), "lr": 1e-5},
+                {"params": model.image_encoder.parameters(), "lr": 1e-6},
+            ],
+            betas=(0.5, 0.975),
+            weight_decay=1e-4,
+        )
+        loss = make_regression_loss("mse").to(device)
+        scope, blocks = {"head": ("head_only", None), "damped": ("head_and_encoder", 2), "full": ("head_and_encoder", None)}[
+            method
+        ]
+        update = lambda: ogd_step(model, opt, scope, loss, image, history, gt, device, encoder_blocks=blocks)  # noqa: E731
+    elif method == "window":
+        opt = torch.optim.Adam(model.parameters(), lr=1e-5)
+        loss = make_regression_loss("mse").to(device)
+        buffer = [{"image": torch.rand(c, HW, HW), "history": torch.rand(HISTORY), "gt": torch.rand(1, 1)} for _ in range(4)]
+        update = lambda: sliding_minibatch_step(model, opt, "head_only", loss, buffer, device)  # noqa: E731
+    elif method == "rls":
+        rls = ShermanMorrisonHeadUpdater(model=model, lambda_init=1.0, forgetting_factor=1.0, error_clip=0.2, device=device)
+        update = lambda: rls.update(model=model, image=image, history=history, gt=gt, device=device, scope="last_layer")  # noqa: E731
+    elif method == "memo":
         memo = MEMOReg(
-            model=model,
-            lr=ogd_lr,
-            weight_decay=ogd_weight_decay,
-            n_augmentations=memo_n_augmentations,
-            niter=memo_niter,
-            episodic=True,
-            adapt_mode=tta_adapt_mode,
+            model=model, lr=1e-5, weight_decay=0.01, n_augmentations=8, niter=1, episodic=True, adapt_mode="all"
         ).to(device)
+
+        def update() -> None:
+            memo.model.load_state_dict(memo._initial_model_state, strict=True)
+            memo.configure_model()
+            memo._adapt_single(x[0], h, torch.device(device))  # inputs on the device, as in MEMOReg.forward
+
+        infer = lambda: memo._predict_single(x[0], h, torch.device(device))  # noqa: E731
     elif method == "note":
         note = NOTEReg(
             model=model,
-            lr=ogd_lr,
-            weight_decay=ogd_weight_decay,
-            update_every_x=note_update_every_x,
-            niter=note_niter,
-            adapt_mode=tta_adapt_mode,
-            use_learned_stats=note_use_learned_stats,
-            bn_momentum=note_bn_momentum,
+            lr=1e-5,
+            weight_decay=0.01,
+            update_every_x=64,
+            niter=1,
+            adapt_mode="all",
+            use_learned_stats=False,
+            bn_momentum=0.1,
         ).to(device)
-    elif method in {"paper_ogd", "sliding"}:
-        if ogd_loss_name == "berhu":
-            loss_fn = BerHuLoss(threshold=30, scale=1000).to(device)
-        elif ogd_loss_name == "huber":
-            loss_fn = nn.HuberLoss().to(device)
-        else:
-            loss_fn = nn.MSELoss().to(device)
+        note._buffer_images = deque((torch.rand(c, HW, HW) for _ in range(64)), maxlen=64)
+        note._buffer_histories = deque((torch.rand(HISTORY) for _ in range(64)), maxlen=64)
+        update = lambda: note._adapt_from_buffer(torch.device(device))  # noqa: E731
+        infer = lambda: note._predict_single(image, history, torch.device(device))  # noqa: E731
 
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=ogd_lr,
-            betas=(ogd_beta1, ogd_beta2),
-            weight_decay=ogd_weight_decay,
-        )
-    elif method == "sm_rls":
-        sm_updater = ShermanMorrisonHeadUpdater(
-            model=model,
-            lambda_init=sm_lambda_init,
-            forgetting_factor=sm_forgetting_factor,
-            full_head_regularization_mult=sm_full_head_regularization_mult,
-            error_clip=sm_error_clip,
-            max_last_layer_update_norm=sm_max_last_layer_update_norm,
-            max_first_layer_update_norm=sm_max_first_layer_update_norm,
-            anchor_decay_last=sm_anchor_decay_last,
-            anchor_decay_first=sm_anchor_decay_first,
-            device=device,
-        )
-
-    _sync_if_cuda(device)
-    bench_start = _now()
-
-    for idx in sample_indices:
-        if input_source == "random":
-            image_input = torch.randn((3, 128, 128), generator=rng)
-            irradiance_history = torch.randn((4,), generator=rng)
-            target_irradiance = torch.randn((1,), generator=rng)
-        else:
-            if dataset is None:
-                raise ValueError("Dataset must be provided when input_source='dataset'.")
-            image_input, irradiance_history, ghi_clear, target_irradiance, _image_name = dataset[idx]
-
-        total_samples += 1
-        sample_start = _now()
-
-        if method == "baseline":
-            t0 = _now()
-            images = image_input.unsqueeze(0).to(device)
-            hist = irradiance_history.unsqueeze(0).to(device)
-            model.eval()
-            with torch.no_grad():
-                out = model(images, hist)
-                pred = pred_mean(out)
-                _ = _clamp_nonnegative(pred)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t0) * 1000.0)
-
-        elif method == "memo":
-            assert memo is not None
-
-            # Adaptation timing (per-sample episodic reset + K adaptation steps)
-            t_adapt0 = _now()
-            memo.model.load_state_dict(memo._initial_model_state, strict=True)
-            memo.configure_model()
-            memo._adapt_single(image_input, irradiance_history.unsqueeze(0), torch.device(device))
-            _sync_if_cuda(device)
-            adapt_times_ms.append((_now() - t_adapt0) * 1000.0)
-            updates += 1
-
-            # Inference timing on original sample
-            t_inf0 = _now()
-            mean, _var = memo._predict_single(image_input, irradiance_history.unsqueeze(0), torch.device(device))
-            _ = _clamp_nonnegative(mean)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t_inf0) * 1000.0)
-
-        elif method == "note":
-            assert note is not None
-
-            note._buffer_images.append(image_input.detach().cpu())
-            note._buffer_histories.append(irradiance_history.detach().cpu())
-            note._sample_count += 1
-
-            if note._sample_count % note.update_every_x == 0:
-                t_adapt0 = _now()
-                note._adapt_from_buffer(torch.device(device))
-                _sync_if_cuda(device)
-                adapt_times_ms.append((_now() - t_adapt0) * 1000.0)
-                updates += 1
-
-            t_inf0 = _now()
-            mean, _var = note._predict_single(image_input, irradiance_history, torch.device(device))
-            _ = _clamp_nonnegative(mean)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t_inf0) * 1000.0)
-
-        elif method == "paper_ogd":
-            assert optimizer is not None and loss_fn is not None
-
-            t_inf0 = _now()
-            mean_raw, _ = infer_one(model, image_input, irradiance_history, device)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t_inf0) * 1000.0)
-
-            oldest = reveal_after_horizon(
-                causal_queue,
-                horizon_steps,
-                {
-                    "image": image_input,
-                    "history": irradiance_history,
-                    "gt": target_irradiance.unsqueeze(0),
-                    "raw_pred": float(mean_raw.detach().cpu().view(-1)[0].item()),
-                },
-            )
-            if oldest is not None:
-                delayed_gt = float(oldest["gt"].view(-1)[0].item())
-                delayed_abs_error = abs(float(oldest["raw_pred"]) - delayed_gt)
-                scope = algorithm1_scope(delayed_abs_error, ogd_t1, ogd_t2)
-
-                if scope != "none":
-                    t_adapt0 = _now()
-                    ogd_step(
-                        model=model,
-                        optimizer=optimizer,
-                        scope=scope,
-                        loss_fn=loss_fn,
-                        image=oldest["image"],
-                        history=oldest["history"],
-                        gt=oldest["gt"],
-                        device=device,
-                    )
-                    _sync_if_cuda(device)
-                    adapt_times_ms.append((_now() - t_adapt0) * 1000.0)
-                    updates += 1
-
-        elif method == "sliding":
-            assert optimizer is not None and loss_fn is not None
-
-            t_inf0 = _now()
-            _, _ = infer_one(model, image_input, irradiance_history, device)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t_inf0) * 1000.0)
-
-            oldest = reveal_after_horizon(
-                causal_queue,
-                horizon_steps,
-                {
-                    "image": image_input,
-                    "history": irradiance_history,
-                    "gt": target_irradiance.unsqueeze(0),
-                },
-            )
-            if oldest is not None:
-                adapt_buffer.append(oldest)
-                if len(adapt_buffer) >= sliding_buffer_size:
-                    t_adapt0 = _now()
-                    sliding_minibatch_step(
-                        model=model,
-                        optimizer=optimizer,
-                        scope=sliding_scope,
-                        loss_fn=loss_fn,
-                        buffer=list(adapt_buffer),
-                        device=device,
-                    )
-                    _sync_if_cuda(device)
-                    adapt_times_ms.append((_now() - t_adapt0) * 1000.0)
-                    updates += 1
-
-        elif method == "sm_rls":
-            assert sm_updater is not None
-
-            t_inf0 = _now()
-            _, _ = infer_one(model, image_input, irradiance_history, device)
-            _sync_if_cuda(device)
-            infer_times_ms.append((_now() - t_inf0) * 1000.0)
-
-            oldest = reveal_after_horizon(
-                causal_queue,
-                horizon_steps,
-                {
-                    "image": image_input,
-                    "history": irradiance_history,
-                    "gt": target_irradiance.unsqueeze(0),
-                },
-            )
-            if oldest is not None:
-                t_adapt0 = _now()
-                sm_updater.update(
-                    model=model,
-                    image=oldest["image"],
-                    history=oldest["history"],
-                    gt=oldest["gt"],
-                    device=device,
-                    scope=sm_update_scope,
-                )
-                _sync_if_cuda(device)
-                adapt_times_ms.append((_now() - t_adapt0) * 1000.0)
-                updates += 1
-
-        else:
-            raise ValueError(f"Unsupported method: {method!r}")
-
-        e2e_times_ms.append((_now() - sample_start) * 1000.0)
-
-    _sync_if_cuda(device)
-    wall_s = _now() - bench_start
-
-    cpu_after = _cpu_mem_snapshot()
-    gpu_mem = _gpu_mem_snapshot(device)
-
-    duty_cycle = float(updates) / float(total_samples) if total_samples > 0 else float("nan")
-    throughput_sps = float(total_samples) / wall_s if wall_s > 0.0 else float("nan")
-
-    return MethodResult(
-        method=method,
-        samples=total_samples,
-        updates=updates,
-        infer_ms=_summarize_ms(infer_times_ms),
-        adapt_ms=_summarize_ms(adapt_times_ms),
-        e2e_ms=_summarize_ms(e2e_times_ms),
-        duty_cycle=duty_cycle,
-        throughput_sps=throughput_sps,
-        cpu_mem_before=cpu_before,
-        cpu_mem_after=cpu_after,
-        gpu_mem=gpu_mem,
-    )
+    if method != "memo" and method != "note":
+        freeze_all(model)
+    with PowerSampler() as ps:
+        ms, t0, t1 = _timed(infer, samples, warmup, cuda)
+        out = {"inference": _summary(ms) | _energy_mj(ps, t0, t1, len(ms), idle_w)}
+        if update is not None:
+            n = max(10, samples // 10) if method == "note" else samples  # a NOTE event is a batch-64 step
+            ms, t0, t1 = _timed(update, n, min(warmup, 5) if method == "note" else warmup, cuda)
+            out["update"] = _summary(ms) | _energy_mj(ps, t0, t1, len(ms), idle_w)
+        out["power_backend"] = ps.backend
+    out["peak_rss_mb"] = _hwm_mb()
+    if cuda:
+        out["peak_cuda_mb"] = torch.cuda.max_memory_allocated() / 2**20
+    out["input_channels"] = c
+    return out
 
 
-def _print_result_table(results: list[MethodResult], device: str) -> None:
-    print("\n=== Edge Benchmark Summary ===")
-    print(
-        "method       samples updates duty   infer_mean  infer_p95  adapt_mean  adapt_p95  " "e2e_mean   e2e_p95   throughput"
-    )
-    for r in results:
-        print(
-            f"{r.method:<12} {r.samples:<7d} {r.updates:<7d} {r.duty_cycle:<6.3f} "
-            f"{_format_ms(r.infer_ms['mean']):>10} {_format_ms(r.infer_ms['p95']):>10} "
-            f"{_format_ms(r.adapt_ms['mean']):>11} {_format_ms(r.adapt_ms['p95']):>10} "
-            f"{_format_ms(r.e2e_ms['mean']):>9} {_format_ms(r.e2e_ms['p95']):>9} "
-            f"{_format_float(r.throughput_sps, 2):>11}"
-        )
-
-    print("\n=== Memory (per method process-level snapshots) ===")
-    print("method       cpu_rss_mb  cpu_hwm_mb  cpu_hwm_delta_mb", end="")
-    if device == "cuda":
-        print("  gpu_peak_alloc_mb  gpu_peak_reserved_mb")
-    else:
-        print("")
-
-    for r in results:
-        hwm_delta = r.cpu_mem_after["hwm_mb"] - r.cpu_mem_before["hwm_mb"]
-        line = (
-            f"{r.method:<12} "
-            f"{_format_float(r.cpu_mem_after['rss_mb'], 2):>10} "
-            f"{_format_float(r.cpu_mem_after['hwm_mb'], 2):>11} "
-            f"{_format_float(hwm_delta, 2):>16}"
-        )
-        if device == "cuda":
-            line += (
-                f" { _format_float(r.gpu_mem['peak_alloc_mb'], 2):>18}"
-                f" { _format_float(r.gpu_mem['peak_reserved_mb'], 2):>21}"
-            )
-        print(line)
+def _run_isolated(*args) -> dict:
+    with mp.get_context("spawn").Pool(1) as pool:
+        return pool.apply(measure, args)
 
 
 @click.command()
-@click.option("--checkpoint", type=click.Path(exists=True, path_type=Path), required=True, help="Path to model checkpoint.")
-@click.option("--dataset-path", type=click.Path(exists=True, path_type=Path), required=False, help="Prepared dataset path.")
-@click.option(
-    "--input-source",
-    type=click.Choice(["dataset", "random"], case_sensitive=False),
-    default="dataset",
-    show_default=True,
-    help="Input source for benchmarking.",
-)
-@click.option("--random-seed", type=int, default=42, show_default=True, help="Random seed used in random input mode.")
-@click.option("--num-samples", type=click.IntRange(min=1), default=512, show_default=True, help="Number of test samples.")
-@click.option("--offset", type=click.IntRange(min=0), default=0, show_default=True, help="Start index in the test split.")
-@click.option(
-    "--methods",
-    type=str,
-    default="baseline,memo,note,paper_ogd,sliding,sm_rls",
-    show_default=True,
-    help="Comma-separated methods: baseline,memo,note,paper_ogd,sliding,sm_rls",
-)
-@click.option("--device", type=click.Choice(["cuda", "cpu"], case_sensitive=False), default="cuda", show_default=True)
-@click.option("--horizon-steps", type=click.IntRange(min=1), default=15, show_default=True)
-# TTA parameters
-@click.option(
-    "--tta-adapt-mode", type=click.Choice(["all", "bn_only"], case_sensitive=False), default="all", show_default=True
-)
-@click.option("--memo-n-augmentations", type=click.IntRange(min=1), default=8, show_default=True)
-@click.option("--memo-niter", type=click.IntRange(min=1), default=1, show_default=True)
-@click.option("--note-update-every-x", type=click.IntRange(min=1), default=64, show_default=True)
-@click.option("--note-niter", type=click.IntRange(min=1), default=1, show_default=True)
-@click.option("--note-use-learned-stats/--note-use-batch-stats", default=True, show_default=True)
-@click.option("--note-bn-momentum", type=float, default=0.1, show_default=True)
-# OGD/sliding parameters
-@click.option("--ogd-t1", type=float, default=0.01, show_default=True)
-@click.option("--ogd-t2", type=float, default=0.1, show_default=True)
-@click.option("--ogd-lr", type=float, default=1e-5, show_default=True)
-@click.option(
-    "--ogd-loss", type=click.Choice(["mse", "huber", "berhu"], case_sensitive=False), default="mse", show_default=True
-)
-@click.option("--ogd-beta1", type=float, default=0.5, show_default=True)
-@click.option("--ogd-beta2", type=float, default=0.975, show_default=True)
-@click.option("--ogd-weight-decay", type=float, default=1e-4, show_default=True)
-@click.option("--sliding-buffer-size", type=click.IntRange(min=1), default=4, show_default=True)
-@click.option(
-    "--sliding-scope",
-    type=click.Choice(["head_only", "head_and_encoder"], case_sensitive=False),
-    default="head_only",
-    show_default=True,
-)
-# SM-RLS parameters
-@click.option("--sm-update-scope", type=click.Choice(["last_layer", "full_head"], case_sensitive=False), default="last_layer")
-@click.option("--sm-lambda-init", type=float, default=1.0, show_default=True)
-@click.option("--sm-forgetting-factor", type=click.FloatRange(min=1e-6, max=1.0), default=1.0, show_default=True)
-@click.option("--sm-full-head-regularization-mult", type=click.FloatRange(min=1.0), default=100.0, show_default=True)
-@click.option("--sm-error-clip", type=click.FloatRange(min=1e-6), default=0.2, show_default=True)
-@click.option("--sm-max-last-layer-update-norm", type=click.FloatRange(min=1e-8), default=0.01, show_default=True)
-@click.option("--sm-max-first-layer-update-norm", type=click.FloatRange(min=1e-8), default=0.002, show_default=True)
-@click.option("--sm-anchor-decay-last", type=click.FloatRange(min=0.0, max=1.0), default=1e-4, show_default=True)
-@click.option("--sm-anchor-decay-first", type=click.FloatRange(min=0.0, max=1.0), default=5e-4, show_default=True)
+@click.option("--checkpoint", type=click.Path(exists=True, path_type=Path), required=True)
+@click.option("--device", type=click.Choice(["cpu", "cuda"]), default="cuda" if torch.cuda.is_available() else "cpu")
+@click.option("--methods", default=",".join(METHODS), show_default=True, help="Comma-separated subset.")
+@click.option("--samples", default=200, show_default=True, help="Timed repetitions per measurement.")
+@click.option("--warmup", default=20, show_default=True)
+@click.option("--threads", type=int, default=None, help="torch CPU threads (default: torch's choice).")
+@click.option("--idle-seconds", default=20.0, show_default=True, help="Idle window for the idle-power baseline.")
+@click.option("--cool-to", default=50.0, show_default=True, help="Chip temperature (C) to wait for before each method.")
+@click.option("--out", type=click.Path(path_type=Path), default=None, help="Write the results as JSON.")
 def main(
     checkpoint: Path,
-    dataset_path: Path | None,
-    input_source: str,
-    random_seed: int,
-    num_samples: int,
-    offset: int,
-    methods: str,
     device: str,
-    horizon_steps: int,
-    tta_adapt_mode: str,
-    memo_n_augmentations: int,
-    memo_niter: int,
-    note_update_every_x: int,
-    note_niter: int,
-    note_use_learned_stats: bool,
-    note_bn_momentum: float,
-    ogd_t1: float,
-    ogd_t2: float,
-    ogd_lr: float,
-    ogd_loss: str,
-    ogd_beta1: float,
-    ogd_beta2: float,
-    ogd_weight_decay: float,
-    sliding_buffer_size: int,
-    sliding_scope: str,
-    sm_update_scope: str,
-    sm_lambda_init: float,
-    sm_forgetting_factor: float,
-    sm_full_head_regularization_mult: float,
-    sm_error_clip: float,
-    sm_max_last_layer_update_norm: float,
-    sm_max_first_layer_update_norm: float,
-    sm_anchor_decay_last: float,
-    sm_anchor_decay_first: float,
+    methods: str,
+    samples: int,
+    warmup: int,
+    threads: int | None,
+    idle_seconds: float,
+    cool_to: float,
+    out: Path | None,
 ) -> None:
-    if device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU.")
-        device = "cpu"
+    chosen = [m.strip() for m in methods.split(",") if m.strip()]
+    if unknown := set(chosen) - set(METHODS):
+        raise click.BadParameter(f"unknown methods {sorted(unknown)}; choose from {METHODS}")
+    cooldown(cool_to, label="before idle baseline")
+    with PowerSampler() as ps:
+        idle_w = ps.idle(idle_seconds)
+        backend = ps.backend
+    print(f"power backend: {backend}; idle {idle_w:.3f} W over {idle_seconds:.0f} s", flush=True)
+    res: dict[str, dict] = {}
+    for m in chosen:
+        start = cooldown(cool_to, label=f"before {m}")
+        print(f"measuring {m} ...", flush=True)
+        res[m] = _run_isolated(m, str(checkpoint), device, samples, warmup, threads, idle_w)
+        res[m]["thermal"] = {"start": start, "end": thermal_state()}
 
-    if ogd_t1 >= ogd_t2:
-        raise click.UsageError(f"--ogd-t1 ({ogd_t1}) must be < --ogd-t2 ({ogd_t2}).")
+    for m, r in res.items():  # per-sample stream cost
+        upd = r.get("update", {}).get("mean", 0.0)
+        if m in RATE:
+            r["per_sample_ms"] = {"all sites": r["inference"]["mean"] + RATE[m] * upd}
+        elif m == "damped" and "head" in res:
+            head = res["head"]["update"]["mean"]
+            r["per_sample_ms"] = {s: r["inference"]["mean"] + ph * head + pe * upd for s, (ph, pe) in DAMPED_MIX.items()}
 
-    requested_methods = [m.strip().lower() for m in methods.split(",") if m.strip()]
-    valid_methods: set[str] = {"baseline", "memo", "note", "paper_ogd", "sliding", "sm_rls"}
-    invalid = [m for m in requested_methods if m not in valid_methods]
-    if invalid:
-        raise click.UsageError(f"Unknown methods: {invalid}. Valid: {sorted(valid_methods)}")
-
-    dataset: Any | None = None
-    if input_source == "dataset":
-        if dataset_path is None:
-            raise click.UsageError("--dataset-path is required when --input-source=dataset.")
-        print(f"Loading dataset from {dataset_path} ...")
-        dataset = load_dataset(dataset_path, split="test")
-        if len(dataset) == 0:
-            raise click.UsageError("Test dataset is empty.")
-
-        max_start = len(dataset) - 1
-        if offset > max_start:
-            raise click.UsageError(f"--offset {offset} exceeds last test index {max_start}.")
-
-        end = min(len(dataset), offset + num_samples)
-        sample_indices = list(range(offset, end))
-    else:
-        sample_indices = list(range(num_samples))
-
+    meta = {
+        "checkpoint": str(checkpoint),
+        "input_channels": next(iter(res.values()))["input_channels"],
+        "device": device,
+        "host": platform.node(),
+        "machine": platform.machine(),
+        "torch": torch.__version__,
+        "threads": threads or torch.get_num_threads(),
+        "samples": samples,
+        "warmup": warmup,
+        "power_backend": backend,
+        "idle_w": idle_w,
+        "cool_to_c": cool_to,
+    }
+    print(f"\n{meta['host']} ({meta['machine']}, {device}, {meta['input_channels']}-channel input, {meta['threads']} threads)")
     print(
-        f"Benchmark config: input_source={input_source} device={device} samples={len(sample_indices)} "
-        f"offset={offset} methods={requested_methods} horizon_steps={horizon_steps}"
+        f"{'method':<32} {'infer ms':>9} {'update ms':>17} {'per-sample ms':>28} {'Tput/s':>7} {'peak RSS MB':>12} {'infer mJ':>9} {'update mJ':>10}"
     )
-
-    results: list[MethodResult] = []
-    for method in requested_methods:
-        print(f"\n--- Benchmarking method={method} ---")
-        result = _benchmark_method(
-            method=method,  # type: ignore[arg-type]
-            checkpoint=checkpoint,
-            dataset=dataset,
-            sample_indices=sample_indices,
-            device=device,
-            input_source=input_source,  # type: ignore[arg-type]
-            random_seed=random_seed,
-            horizon_steps=horizon_steps,
-            tta_adapt_mode=tta_adapt_mode,  # type: ignore[arg-type]
-            memo_n_augmentations=memo_n_augmentations,
-            memo_niter=memo_niter,
-            note_update_every_x=note_update_every_x,
-            note_niter=note_niter,
-            note_use_learned_stats=note_use_learned_stats,
-            note_bn_momentum=note_bn_momentum,
-            ogd_t1=ogd_t1,
-            ogd_t2=ogd_t2,
-            ogd_lr=ogd_lr,
-            ogd_loss_name=ogd_loss,  # type: ignore[arg-type]
-            ogd_beta1=ogd_beta1,
-            ogd_beta2=ogd_beta2,
-            ogd_weight_decay=ogd_weight_decay,
-            sliding_buffer_size=sliding_buffer_size,
-            sliding_scope=sliding_scope,  # type: ignore[arg-type]
-            sm_update_scope=sm_update_scope,  # type: ignore[arg-type]
-            sm_lambda_init=sm_lambda_init,
-            sm_forgetting_factor=sm_forgetting_factor,
-            sm_full_head_regularization_mult=sm_full_head_regularization_mult,
-            sm_error_clip=sm_error_clip,
-            sm_max_last_layer_update_norm=sm_max_last_layer_update_norm,
-            sm_max_first_layer_update_norm=sm_max_first_layer_update_norm,
-            sm_anchor_decay_last=sm_anchor_decay_last,
-            sm_anchor_decay_first=sm_anchor_decay_first,
+    for m, r in res.items():
+        u = r.get("update")
+        ups = f"{u['mean']:8.2f} ± {u['std']:6.2f}" if u else f"{'–':>17}"
+        per = r.get("per_sample_ms", {})
+        pers = " / ".join(f"{v:.1f}" for v in per.values()) if per else "–"
+        tput = f"{1e3 / next(iter(per.values())):7.2f}" if len(per) == 1 else f"{'mix':>7}" if per else f"{'–':>7}"
+        ue = f"{u['energy_mj']:10.1f}" if u else f"{'–':>10}"
+        print(
+            f"{LABEL[m]:<32} {r['inference']['mean']:9.2f} {ups:>17} {pers:>28} {tput} {r['peak_rss_mb']:12.1f} {r['inference']['energy_mj']:9.1f} {ue}"
         )
-        results.append(result)
+    if "damped" in res and "per_sample_ms" in res["damped"]:
+        print("  damped per-sample cost is per site: " + ", ".join(DAMPED_MIX) + " (action mix of tab:ch4-actions)")
 
-    _print_result_table(results, device=device)
-    print("\nAdditional recommendation: use p95/p99 end-to-end latency and update duty cycle as edge-SLA metrics.")
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        clean = json.loads(json.dumps({"meta": meta, "results": res}), parse_constant=lambda _c: None)  # NaN -> null
+        out.write_text(json.dumps(clean, indent=2, ensure_ascii=False))
+        print("wrote", out)
 
 
 if __name__ == "__main__":
