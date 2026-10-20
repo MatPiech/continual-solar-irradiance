@@ -52,8 +52,8 @@ from cirr.evaluation.campaign import (
 from cirr.evaluation.online import DelayedQueueItem, OnlineEvalContext, run_delayed_online_eval
 from cirr.evaluation.printing import print_overall_metrics
 from cirr.evaluation.runner import load_eval_model, resolve_device
-from cirr.models.loading import checkpoint_physics
 from cirr.models.forecaster import Forecaster
+from cirr.models.loading import checkpoint_physics
 from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.ogd import algorithm1_scope, make_regression_loss, ogd_step
 from cirr.training.replay import build_folsom_replay_buffer

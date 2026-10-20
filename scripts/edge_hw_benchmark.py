@@ -25,7 +25,7 @@ Typical use (log to a file -- a run on a Pi is slow enough that losing it hurts)
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext, redirect_stdout
+from contextlib import contextmanager, redirect_stdout, suppress
 import json
 import os
 from pathlib import Path
@@ -40,6 +40,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fl_benchmark import filter_lit_days  # single-sourced: the night-sample filter
+
 from cirr.data.loading import load_dataset
 from cirr.fl.kc_prototypes import (
     DEFAULT_MIN_GHI_CLEAR,
@@ -53,7 +55,6 @@ from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.physics.clear_sky import load_clear_sky_lookup
 from cirr.training.day_loop import predict_day, train_day
 from cirr.utils.dataset_utils import group_indices_by_day
-from fl_benchmark import filter_lit_days  # single-sourced: the night-sample filter
 
 MIB = 1024.0**2
 
@@ -110,10 +111,8 @@ class PowerMeter:
 
     def _loop(self) -> None:
         while not self._stop.wait(0.1):
-            try:
+            with suppress(OSError, ValueError):
                 self.samples.append(sum(int(p.read_text()) for p in self.sensors) * self.scale)
-            except (OSError, ValueError):
-                pass
 
     def __exit__(self, *_exc: Any) -> None:
         self._stop.set()
@@ -138,7 +137,7 @@ def quiet(enabled: bool):
     if not enabled:
         yield
         return
-    with open(os.devnull, "w") as sink, redirect_stdout(sink):
+    with Path(os.devnull).open("w") as sink, redirect_stdout(sink):
         yield
 
 
@@ -221,8 +220,10 @@ def main(
         assert break_even_mbps(1, 0) == float("inf")
         assert median([3.0, 1.0, 2.0]) == 2.0 and median([4.0, 1.0, 2.0, 3.0]) == 2.5
         assert median([]) != median([])  # empty -> NaN, which is never equal to itself
-        print(f"self-test OK | board: {board_name()} | rails: {len(power_sensors())} | "
-              f"cuda: {torch.cuda.is_available()} | peak RSS {rss_mib():.0f} MiB")
+        print(
+            f"self-test OK | board: {board_name()} | rails: {len(power_sensors())} | "
+            f"cuda: {torch.cuda.is_available()} | peak RSS {rss_mib():.0f} MiB"
+        )
         return
     if dataset is None:
         raise click.UsageError("--dataset is required (or pass --self-test).")
@@ -249,9 +250,7 @@ def main(
     print(f"dataset     : {len(available)} lit days ({dropped} night samples dropped), timing {selected[1:]}\n")
 
     model = load_forecaster_from_checkpoint(checkpoint, device=device, use_hparams=True)
-    labeller = make_regime_labeller(
-        regime_label, default_edges(regime_label), DEFAULT_MIN_GHI_CLEAR, elevation_bins
-    )
+    labeller = make_regime_labeller(regime_label, default_edges(regime_label), DEFAULT_MIN_GHI_CLEAR, elevation_bins)
 
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
@@ -273,17 +272,25 @@ def main(
             with timed(row, "t_predict_s", device):
                 _preds, _tgts, day_samples = predict_day(model, ds, indices, device, batch_size, day)
             with timed(row, "t_extract_s", device):
-                client_proto, _stats = extract_day_prototypes(
-                    model, day_samples, device, batch_size, labeller=labeller
-                )
+                client_proto, _stats = extract_day_prototypes(model, day_samples, device, batch_size, labeller=labeller)
             with timed(row, "t_train_s", device):
                 train_day(
-                    model, ds, indices,
-                    lr=adapt_lr, weight_decay=1e-4, max_grad_norm=1.0,
-                    batch_size=batch_size, epochs=adapt_epochs, device=device,
-                    day_samples=day_samples, client_name=day, rng_seed=0,
-                    global_prototypes=global_protos, proto_lambda=proto_lambda,
-                    align_loss="prototypical", align_temperature=align_temperature,
+                    model,
+                    ds,
+                    indices,
+                    lr=adapt_lr,
+                    weight_decay=1e-4,
+                    max_grad_norm=1.0,
+                    batch_size=batch_size,
+                    epochs=adapt_epochs,
+                    device=device,
+                    day_samples=day_samples,
+                    client_name=day,
+                    rng_seed=0,
+                    global_prototypes=global_protos,
+                    proto_lambda=proto_lambda,
+                    align_loss="prototypical",
+                    align_temperature=align_temperature,
                     classify_fn=labeller,
                 )
         row["power_w"] = meter.mean_w
@@ -338,8 +345,10 @@ def main(
         "threads": torch.get_num_threads(),
         "per_day": rows,
         "payload_mib": {
-            "weights_uplink": up_weights / MIB, "weights_round_trip": trip_weights / MIB,
-            "proto_uplink": up_proto / MIB, "proto_round_trip": trip_proto / MIB,
+            "weights_uplink": up_weights / MIB,
+            "weights_round_trip": trip_weights / MIB,
+            "proto_uplink": up_proto / MIB,
+            "proto_round_trip": trip_proto / MIB,
         },
         "aggregation_ms": {k: v * 1e3 for k, v in agg.items()},
         "median_t_extract_s": t_extract,
@@ -348,24 +357,26 @@ def main(
         "bits_saved_per_round_mbit": saved * 8 / 1e6,
         "break_even_mbps": b_star,
         "peak_rss_mib": rss_mib(),
-        "peak_accelerator_mib": (
-            torch.cuda.max_memory_allocated() / MIB if device.startswith("cuda") else 0.0
-        ),
+        "peak_accelerator_mib": (torch.cuda.max_memory_allocated() / MIB if device.startswith("cuda") else 0.0),
     }
 
     print(f"\n  {'':38s}{'full model':>14s}{'prototypes':>14s}")
     print(f"  {'round-trip payload (MiB)':38s}{trip_weights / MIB:14.3f}{trip_proto / MIB:14.3f}")
     print(f"  {'uplink per client (MiB)':38s}{up_weights / MIB:14.3f}{up_proto / MIB:14.3f}")
-    print(f"  {f'aggregation, {clients} clients (ms)':38s}"
-          f"{agg['t_agg_weights_s'] * 1e3:14.3f}{agg['t_agg_proto_s'] * 1e3:14.3f}")
+    print(
+        f"  {f'aggregation, {clients} clients (ms)':38s}"
+        f"{agg['t_agg_weights_s'] * 1e3:14.3f}{agg['t_agg_proto_s'] * 1e3:14.3f}"
+    )
     print(f"  {'prototype extraction (s)':38s}{0.0:14.3f}{t_extract:14.3f}")
     print(f"\n  local training epoch      : {t_train:.2f} s")
     print(f"  saved per round           : {saved * 8 / 1e6:.1f} Mbit")
     print(f"  BREAK-EVEN LINK SPEED     : {b_star:.1f} Mbit/s")
     print(f"  peak RSS / accelerator    : {record['peak_rss_mib']:.0f} / {record['peak_accelerator_mib']:.0f} MiB")
     if mean_power == mean_power:  # not NaN
-        print(f"  round energy              : {mean_power * median([r['t_round_s'] for r in rows]):.1f} J "
-              f"at {mean_power:.2f} W")
+        print(
+            f"  round energy              : {mean_power * median([r['t_round_s'] for r in rows]):.1f} J "
+            f"at {mean_power:.2f} W"
+        )
 
     if out:
         out.parent.mkdir(parents=True, exist_ok=True)

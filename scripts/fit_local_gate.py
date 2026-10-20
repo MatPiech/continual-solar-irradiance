@@ -110,22 +110,22 @@ def main(
     gate.alert_threshold = float(np.nanpercentile(alert_statistic(a_ts, a_scores), 99))
     print(f"frame threshold {gate.threshold:.4f} | alert threshold {gate.alert_threshold:.4f}")
 
-    meta = dict(
-        design="docs/CH4_ADMISSIBILITY.md §5",
-        threshold=gate.threshold,
-        alert_threshold=gate.alert_threshold,
-        cells=int(cells.sum()),
-        n_bank=len(bank_idx),
-        n_norm=len(norm_idx),
-        n_threshold=len(thr_idx),
-        alert_calibration_days=len(alert_days),
-        percentile=99.0,
-        window_minutes=30,
-        checkpoint=str(checkpoint),
-        checkpoint_sha256=sha256_file(checkpoint),
-        git_commit=git_commit(),
-        seed=seed,
-    )
+    meta = {
+        "design": "docs/CH4_ADMISSIBILITY.md §5",
+        "threshold": gate.threshold,
+        "alert_threshold": gate.alert_threshold,
+        "cells": int(cells.sum()),
+        "n_bank": len(bank_idx),
+        "n_norm": len(norm_idx),
+        "n_threshold": len(thr_idx),
+        "alert_calibration_days": len(alert_days),
+        "percentile": 99.0,
+        "window_minutes": 30,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "git_commit": git_commit(),
+        "seed": seed,
+    }
     gate.save(out_dir / "local_gate.npz", **meta)
 
     # --- the 2016 stream, clean and with the synthetic faults ------------------------

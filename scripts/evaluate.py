@@ -49,7 +49,7 @@ from cirr.evaluation.campaign import SOURCE_CHECKPOINT, CampaignData, load_campa
 from cirr.evaluation.online import OnlineEvalResult
 from cirr.evaluation.printing import print_metrics_header, print_overall_metrics
 from cirr.models.forecaster import Forecaster
-from cirr.models.loading import checkpoint_physics, load_forecaster_from_checkpoint
+from cirr.models.loading import load_forecaster_from_checkpoint
 from cirr.physics.clear_sky import DEFAULT_MIN_GHI_CLEAR
 from cirr.training.replay import build_folsom_replay_buffer
 from cirr.tta import MEMOReg, NOTEReg
@@ -817,9 +817,7 @@ def main(
     # Load dataset and determine days to evaluate
     # ------------------------------------------------------------------
     print(f"Loading dataset from {dataset_path}...")
-    data: CampaignData = load_campaign_days(
-        dataset_path, start_day, num_days, min_ghi_clear, physics=checkpoint_physics(checkpoint)
-    )
+    data: CampaignData = load_campaign_days(dataset_path, start_day, num_days, min_ghi_clear)
     test_dataset, day_index_map, days_to_eval = data.dataset, data.day_map, data.days
     print(
         f"{data.site}: {len(data.days)} days, {data.n_samples} lit samples "

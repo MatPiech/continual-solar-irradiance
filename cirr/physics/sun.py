@@ -32,20 +32,47 @@ import pvlib
 SITES: dict[str, dict] = {
     # Fitted on the 1520 crop (results/sun_camera/folsom_params.txt): 88 % inliers,
     # median 0.8 px at 128.  Paper values were 165 deg / 0.48 on the full 1536 frame.
-    "folsom": {"lat": 38.642, "lon": -121.148, "tz": "US/Pacific",
-               "offset": 163.72, "focal": 0.5044, "mirror": 1, "cx": 0.4937, "cy": 0.4822,
-               "k3": 0.0, "clock": (0.0, 0.0)},
+    "folsom": {
+        "lat": 38.642,
+        "lon": -121.148,
+        "tz": "US/Pacific",
+        "offset": 163.72,
+        "focal": 0.5044,
+        "mirror": 1,
+        "cx": 0.4937,
+        "cy": 0.4822,
+        "k3": 0.0,
+        "clock": (0.0, 0.0),
+    },
     # Polish sites (results/sun_camera/*_params.txt): the lens needs k3 and the image
     # clock is ~70 min off in one DST regime; only the difference between regimes is
     # identifiable, a constant clock bias is absorbed by ``offset``.
     # Poznan: 81.5 % inliers, median 0.85 px at 128.
-    "poznan": {"lat": 52.4031, "lon": 16.9539, "tz": "Europe/Warsaw",
-               "offset": 297.39, "focal": 0.6596, "mirror": 1, "cx": 0.5397, "cy": 0.4128,
-               "k3": -0.0824, "clock": (0.0, 68.3)},
+    "poznan": {
+        "lat": 52.4031,
+        "lon": 16.9539,
+        "tz": "Europe/Warsaw",
+        "offset": 297.39,
+        "focal": 0.6596,
+        "mirror": 1,
+        "cx": 0.5397,
+        "cy": 0.4128,
+        "k3": -0.0824,
+        "clock": (0.0, 68.3),
+    },
     # Karpicko: 80.0 % inliers, median 0.79 px at 128.
-    "karpicko": {"lat": 52.1294, "lon": 16.1231, "tz": "Europe/Warsaw",
-                 "offset": 197.60, "focal": 0.6251, "mirror": 1, "cx": 0.4417, "cy": 0.4771,
-                 "k3": -0.0574, "clock": (-70.2, 0.0)},
+    "karpicko": {
+        "lat": 52.1294,
+        "lon": 16.1231,
+        "tz": "Europe/Warsaw",
+        "offset": 197.60,
+        "focal": 0.6251,
+        "mirror": 1,
+        "cx": 0.4417,
+        "cy": 0.4771,
+        "k3": -0.0574,
+        "clock": (-70.2, 0.0),
+    },
 }
 
 
